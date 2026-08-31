@@ -481,7 +481,7 @@ def t_korean_pdf():
                       "Dates": [dt.date(2026, 8, 3)]}]}
     text = pymupdf.open(stream=ir.render_invoices_pdf([inv])[0],
                         filetype="pdf")[0].get_text()
-    for needed in ["수민", "북클럽", "어머니"]:
+    for needed in ["수민", "독서반", "어머니"]:
         assert needed in text, f"{needed!r} lost in the PDF"
     assert "KS ACADEMIA PREP" in text, "Latin broken by the CJK font"
     assert "Upper-Sec Science" in text, "mixed-script line broken"

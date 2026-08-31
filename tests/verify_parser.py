@@ -66,7 +66,7 @@ def t_month_year_inference():
 
 
 def t_name_normalising():
-    a = sp.normalise_name("  Kwak   Jun ")
+    a = sp.normalise_name("  Nam   Jihoon ")
     b = sp.normalise_name("Nam Jihoon")
     assert a == b, f"{a!r} != {b!r}"
     assert sp.looks_like_name("Nam Jihoon"), "rejected a real name"
@@ -150,7 +150,7 @@ def t_parse_schedule():
     assert out["month"] == 8, out["month"]
     assert out["session_count"] >= 2, f"only {out['session_count']} sessions"
     subjects = {s.get("class_name") or s.get("subject") for s in out["sessions"]}
-    assert any("Econs" in str(x) for x in subjects), subjects
+    assert any("Chem" in str(x) for x in subjects), subjects
     assert any("Maths" in str(x) for x in subjects), subjects
     return (f"{out['session_count']} sessions, "
             f"{out['unique_student_count']} students, "
@@ -169,10 +169,10 @@ def t_dates_resolved():
 
 def t_times_resolved():
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
-    econs = [s for s in out["sessions"]
-             if "Econs" in str(s.get("class_name") or s.get("subject"))][0]
-    assert econs.get("start_time") == dt.time(9, 0), econs.get("start_time")
-    assert econs.get("end_time") == dt.time(11, 0), econs.get("end_time")
+    chem = [s for s in out["sessions"]
+             if "Chem" in str(s.get("class_name") or s.get("subject"))][0]
+    assert chem.get("start_time") == dt.time(9, 0), chem.get("start_time")
+    assert chem.get("end_time") == dt.time(11, 0), chem.get("end_time")
     return "9am-11am read off the class cell"
 
 
