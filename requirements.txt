@@ -11,10 +11,6 @@ openpyxl==3.1.5
 # back to the local SQLite file, but required by every deployment.
 psycopg2-binary==2.9.12
 
-# The sign-in gate. The host's own private-app setting still served the
-# running app on its internal path, so access control lives in the app.
-streamlit-authenticator==0.4.2
-
 # Renders invoices to PDF without a browser, which is what makes invoice
 # export work on a host that cannot install Chromium. Pure Python -- it
 # pulls in reportlab and nothing outside pip -- so there is deliberately no
