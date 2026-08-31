@@ -9,6 +9,7 @@ import importlib
 import importlib.metadata as md
 import io
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -307,6 +308,65 @@ def t_zip_unique_names():
     return f"duplicate students kept apart: {names}"
 
 
+def t_login_gate_runs_first():
+    """The gate must come before anything reads or draws student data.
+
+    A structural check on the source rather than a behavioural one: the order
+    of these two calls is the whole security property, and it would be easy
+    to move the login below some innocent-looking setup and never notice.
+    """
+    source = (PROJECT / "app.py").read_text(encoding="utf-8")
+    gate = source.index("auth.require_login()")
+    init = source.index("db.initialise_database()")
+    assert gate < init, "login gate runs after the database is opened"
+    # Nothing may be rendered above it either.
+    above = source[:gate]
+    for drawn in ["st.dataframe", "st.table", "st.write(", "st.tabs", "st.radio"]:
+        assert drawn not in above, f"{drawn} renders before the login gate"
+    return "require_login precedes database access and all rendering"
+
+
+def t_login_fails_closed():
+    """Missing or empty credentials must refuse everyone, not admit everyone."""
+    import auth
+    import inspect
+    src = inspect.getsource(auth.require_login)
+    assert "_configuration_error" in src, "no configuration guard at all"
+    for guard in ['"auth" not in st.secrets', "cookie_key", "usernames"]:
+        assert guard in src, f"missing guard: {guard}"
+    assert "auto_hash=False" in src, (
+        "auto_hash must be off or the stored bcrypt hash gets hashed again "
+        "and nobody can sign in"
+    )
+    return "refuses to open without valid [auth] secrets"
+
+
+def t_no_credentials_in_repo():
+    """No password or hash may be committed."""
+    import subprocess
+    tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
+                             cwd=str(PROJECT)).stdout.split()
+    assert "\\.streamlit/secrets.toml" not in tracked, "secrets.toml is tracked"
+    assert ".streamlit/secrets.toml" not in tracked, "secrets.toml is tracked"
+    # A real bcrypt hash, not merely the "$2b$" prefix: the documentation and
+    # this file both contain placeholders like "$2b$12$....." on purpose, and
+    # matching the prefix alone would fail on its own examples forever.
+    real_hash = re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
+    bad = []
+    for rel in tracked:
+        path = PROJECT / rel
+        if path.suffix not in {".py", ".toml", ".txt", ".bat", ".html", ".json"}:
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if real_hash.search(body):
+            bad.append(rel)
+    assert not bad, f"bcrypt hash committed in: {bad}"
+    return f"{len(tracked)} tracked files, no real hashes or secrets among them"
+
+
 def t_korean_pdf():
     """Korean names must survive into the PDF, not become vertical bars."""
     import invoice_render as ir
@@ -403,6 +463,9 @@ for name, fn in [
     ("format dispatch", t_dispatch),
     ("zip in every format", t_zip_all_formats),
     ("duplicate filenames handled", t_zip_unique_names),
+    ("login gate runs before any data", t_login_gate_runs_first),
+    ("login fails closed if misconfigured", t_login_fails_closed),
+    ("no credentials committed to the repo", t_no_credentials_in_repo),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

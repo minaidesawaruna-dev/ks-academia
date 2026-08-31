@@ -30,6 +30,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+import auth
 import db
 import schedule_backfill
 import schedule_parser
@@ -52,7 +53,17 @@ st.set_page_config(
     page_title="KS Academia",
     page_icon=_APP_ICON if (ASSETS_DIR / "ks_icon.png").exists() else "📘",
     layout="wide",
+    # The sidebar exists only to hold "signed in as" and the sign-out button,
+    # so it starts out of the way rather than taking a column from the
+    # timetable grid.
+    initial_sidebar_state="collapsed",
 )
+
+# Before the database is touched and before a single student's name is drawn.
+# The host's own private-app setting was found to still serve the running app
+# on its internal path, so the gate has to be here rather than delegated.
+_authenticator = auth.require_login()
+auth.logout_button(_authenticator)
 
 db.initialise_database()
 
