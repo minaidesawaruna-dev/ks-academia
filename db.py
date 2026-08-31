@@ -406,8 +406,59 @@ class ScheduleImport(Base):
     )
 
 
+def _schema_is_current() -> bool:
+    """Whether every table and column the app expects is already in place.
+
+    ``initialise_database`` is cheap against a local SQLite file and ruinous
+    against a remote Postgres: ``create_all``'s reflection plus the column
+    inspections guarding each migration come to over fifteen hundred round
+    trips. Beside the database that is six seconds; across an ocean -- the
+    app is hosted in the United States and the database is in Singapore -- it
+    is minutes. And it runs on *every* rerun, because Streamlit re-executes
+    the script from the top on every interaction, so the app appeared to hang
+    on every click.
+
+    ``get_multi_columns`` reflects the whole schema in three queries. If
+    nothing is missing there is, by definition, no table to create and no
+    column to add, and all of that work can be skipped.
+
+    Nullability is checked too, not just presence: one of the migrations
+    below rebuilds ``invoice_items`` when ``session_id`` is still NOT NULL,
+    and a check that only counted column names would skip it.
+    """
+    try:
+        reflected = inspect(engine).get_multi_columns()
+    except Exception:
+        # Reflection is an optimisation, not the source of truth. If it
+        # cannot be done, fall through to the slow, careful path.
+        return False
+
+    actual: dict[str, dict[str, Any]] = {
+        key[1]: {column["name"]: column for column in columns}
+        for key, columns in reflected.items()
+    }
+    for table in Base.metadata.sorted_tables:
+        present = actual.get(table.name)
+        if present is None:
+            return False
+        for column in table.columns:
+            found = present.get(column.name)
+            if found is None:
+                return False
+            if column.nullable and not found.get("nullable", True):
+                return False
+    return True
+
+
 def initialise_database():
-    """Create missing tables and apply the prototype's small SQLite upgrade."""
+    """Create missing tables and apply the prototype's small SQLite upgrade.
+
+    Returns immediately when the schema already matches, which on a remote
+    database is the difference between a page that loads and one that looks
+    like it has hung. See ``_schema_is_current``.
+    """
+    if _schema_is_current():
+        return
 
     Base.metadata.create_all(engine)
 

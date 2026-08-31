@@ -65,7 +65,20 @@ st.set_page_config(
 _authenticator = auth.require_login()
 auth.logout_button(_authenticator)
 
-db.initialise_database()
+@st.cache_resource
+def _ensure_database_ready() -> bool:
+    """Check the schema once per process rather than once per click.
+
+    Streamlit re-runs this file from the top on every interaction, so
+    anything at module scope is on the critical path of every button press.
+    Even the cheap version of this check is a few round trips, which is
+    nothing beside the database and noticeable across an ocean.
+    """
+    db.initialise_database()
+    return True
+
+
+_ensure_database_ready()
 
 LESSON_STATUSES = ["Scheduled", "Completed", "Cancelled"]
 
