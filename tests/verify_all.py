@@ -332,8 +332,12 @@ def t_login_fails_closed():
     import inspect
     src = inspect.getsource(auth.require_login)
     assert "_configuration_error" in src, "no configuration guard at all"
-    for guard in ['"auth" not in st.secrets', "cookie_key", "usernames"]:
+    for guard in ["st.secrets", "cookie_key", "usernames"]:
         assert guard in src, f"missing guard: {guard}"
+    # Reading secrets must not be able to throw a traceback at a visitor:
+    # st.secrets raises rather than behaving like an empty mapping when a
+    # deployment has no secrets at all.
+    assert "except Exception" in src, "secrets access is not guarded against raising"
     assert "auto_hash=False" in src, (
         "auto_hash must be off or the stored bcrypt hash gets hashed again "
         "and nobody can sign in"

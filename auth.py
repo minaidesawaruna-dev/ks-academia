@@ -31,6 +31,7 @@ should never be typed into a settings page, a file, or a chat window.
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import streamlit as st
@@ -50,16 +51,17 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _configuration_error(message: str) -> None:
-    """Fail closed, and say what to fix without leaking anything."""
-    st.error(
-        f"KS Academia is not configured for sign-in, so it will not open.\n\n"
-        f"{message}"
-    )
-    st.caption(
-        "Add the details under Settings → Secrets for this app. "
-        "Until then nobody can get in, which is the safe way to be wrong."
-    )
+def _configuration_error(detail: str) -> None:
+    """Fail closed, telling the visitor nothing about why.
+
+    Whoever hits this may well be a stranger who found the URL, so the page
+    says only that the app is unavailable. Which key is missing is a fact
+    about how the deployment is put together, and it goes to the server log,
+    where the person who can actually fix it will look.
+    """
+    print(f"[auth] refusing to start: {detail}", file=sys.stderr)
+    st.error("KS Academia is unavailable.")
+    st.write("Please contact the administrator.")
     st.stop()
 
 
@@ -73,10 +75,19 @@ def require_login() -> stauth.Authenticate:
     on when the configuration looks wrong -- is how an app ends up quietly
     serving 170 students' payment records to the internet.
     """
-    if "auth" not in st.secrets:
+    # Reading st.secrets raises StreamlitSecretNotFoundError when no secrets
+    # exist at all, rather than behaving like an empty mapping -- so a
+    # deployment with nothing configured would show a Python traceback to
+    # whoever opened it instead of the message below. Treat any failure to
+    # read as "not configured", which lands in the same safe place.
+    try:
+        section = st.secrets["auth"] if "auth" in st.secrets else None
+    except Exception:  # noqa: BLE001 - absent, unreadable, malformed: all the same
+        section = None
+    if section is None:
         _configuration_error("No `[auth]` section was found in the app's secrets.")
 
-    config = _plain(st.secrets["auth"])
+    config = _plain(section)
     credentials = config.get("credentials")
     if not credentials or not credentials.get("usernames"):
         _configuration_error(
@@ -127,32 +138,21 @@ def logout_button(authenticator: stauth.Authenticate) -> None:
     Worth having on a shared machine at the front desk: without it the cookie
     keeps whoever logged in last signed in for a month.
     """
-    # Only draw it for a session that actually holds a login. The button
-    # raises if asked to log out someone who was never logged in, and this is
-    # decoration -- it must never be the thing that takes the page down.
-    # Outside a Streamlit run (a test importing this module, a script) there
-    # is no session at all, and st.stop() in require_login does not halt the
-    # way it does in a real run, so execution can reach here unauthenticated.
-    # Drawn unconditionally rather than gated on a session-state flag. When
-    # the session is restored from the cookie instead of the form, neither
-    # `authentication_status` nor `username` is reliably set on the run that
-    # reaches here, and gating on either made the sign-out button vanish for
-    # exactly the people who never see the login screen -- which is everyone,
-    # most mornings.
+    # Two things here are deliberate and easy to "tidy" into breakage:
     #
-    # The try/except is what makes that safe: the button raises when asked to
-    # log out a session that never logged in (a test importing this module, a
-    # bare script), and this is decoration. It must never be the thing that
-    # takes the page down. The real gate is require_login, above.
-    # Note there is no `with st.sidebar:` block around this: logout() already
-    # calls st.sidebar.button internally when told location="sidebar", and
-    # wrapping it nests the sidebar inside itself.
+    # There is no `with st.sidebar:` wrapper, because logout(location=
+    # "sidebar") already calls st.sidebar.button internally; wrapping it
+    # nests the sidebar inside itself and renders nothing at all.
     #
-    # The library's own logout is used rather than a hand-rolled button
-    # because deleting the cookie is the part that actually signs someone
-    # out, and its cookie controller does that correctly. Clearing session
-    # state alone achieves nothing -- the cookie simply signs them straight
-    # back in on the rerun.
+    # The library's logout is used rather than a hand-rolled button, because
+    # dropping the cookie is what actually signs someone out and its cookie
+    # controller does that properly. Clearing session state alone achieves
+    # nothing -- the cookie signs them straight back in on the next rerun.
+    #
+    # The try/except keeps a decorative button from being able to take the
+    # page down; logout raises if there is no session, which happens when a
+    # test imports this module outside a Streamlit run. The real gate is
+    # require_login, above.
     name = st.session_state.get("name") or st.session_state.get("username")
     if name:
         st.sidebar.caption(f"Signed in as {name}")
