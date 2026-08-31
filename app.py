@@ -62,8 +62,8 @@ st.set_page_config(
 # Before the database is touched and before a single student's name is drawn.
 # The host's own private-app setting was found to still serve the running app
 # on its internal path, so the gate has to be here rather than delegated.
-auth.require_login()
-auth.logout_button()
+_authenticator = auth.require_login()
+auth.logout_button(_authenticator)
 
 db.initialise_database()
 

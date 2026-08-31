@@ -328,25 +328,21 @@ def t_login_gate_runs_first():
 
 def t_login_fails_closed():
     """Missing or empty credentials must refuse everyone, not admit everyone."""
-    import inspect
-
     import auth
+    import inspect
     src = inspect.getsource(auth.require_login)
     assert "_configuration_error" in src, "no configuration guard at all"
-    # An empty or absent allowlist must admit nobody, not everybody. Google
-    # says who you are; it does not say who is allowed.
-    assert "if not allowed:" in src, "empty allowlist is not treated as a failure"
-    assert "not in allowed" in src, "the allowlist is never actually checked"
-    assert "st.login" in src, "no sign-in is offered"
-
-    allow_src = inspect.getsource(auth._allowed_emails)
-    assert "except Exception" in allow_src, (
-        "reading secrets is not guarded; st.secrets raises rather than "
-        "coming back empty when a deployment has none"
+    for guard in ["st.secrets", "cookie_key", "usernames"]:
+        assert guard in src, f"missing guard: {guard}"
+    # Reading secrets must not be able to throw a traceback at a visitor:
+    # st.secrets raises rather than behaving like an empty mapping when a
+    # deployment has no secrets at all.
+    assert "except Exception" in src, "secrets access is not guarded against raising"
+    assert "auto_hash=False" in src, (
+        "auto_hash must be off or the stored bcrypt hash gets hashed again "
+        "and nobody can sign in"
     )
-    assert "return set()" in allow_src, "unreadable secrets must yield no one"
-    assert ".lower()" in allow_src, "addresses must be compared case-insensitively"
-    return "signed-in but unlisted is refused; misconfiguration admits nobody"
+    return "refuses to open without valid [auth] secrets"
 
 
 def t_no_credentials_in_repo():
