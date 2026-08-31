@@ -21,8 +21,9 @@ prefers images wherever Chromium is actually present and falls back to PDF
 where it is not. Ask ``image_export_available`` and ``pdf_export_available``
 rather than assuming either works.
 
-Everything the academy needs to change -- address, phone, bank -- is in
-``ACADEMY`` below.
+Everything the academy needs to change -- address, phone, bank -- lives in
+the app's secrets under ``[academy]``, not in this file; see
+``_AcademyDetails``.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from typing import Any
 
 __all__ = [
     "ACADEMY",
+    "ACADEMY_FIELDS",
     "render_invoice_html",
     "render_invoices_batch_html",
     "render_invoices_png",
@@ -52,15 +54,85 @@ __all__ = [
     "format_dates",
 ]
 
-ACADEMY = {
-    "name": "KS ACADEMIA PREP",
-    "address": "545 Orchard Road #15-06, Far East Shopping Centre, Singapore 238882",
-    "phone": "+65 8129 8782",
-    "account_name": "KS ACADEMIA PREP",
-    "account_number": "552835464001",
-    "bank": "OCBC (Oversea-Chinese Banking Corporation Limited)",
-    "paynow": "UEN 53291979C",
-}
+ACADEMY_FIELDS = (
+    "name",
+    "address",
+    "phone",
+    "account_name",
+    "account_number",
+    "bank",
+    "paynow",
+)
+
+
+class _AcademyDetails:
+    """The academy's letterhead and bank details, from the app's secrets.
+
+    These used to sit in this file. They are a bank account number and a
+    UEN, and while they are hardly a secret from the parents -- they print on
+    every invoice -- a public repository is a different thing from an
+    invoice. Account numbers left in one get collected by people who collect
+    account numbers.
+
+    Configure them under ``[academy]`` in the app's secrets::
+
+        [academy]
+        name = "..."
+        address = "..."
+        phone = "..."
+        account_name = "..."
+        account_number = "..."
+        bank = "..."
+        paynow = "..."
+
+    Read on first use rather than at import, so that importing this module
+    needs no Streamlit runtime. Missing configuration raises rather than
+    falling back to a placeholder: an invoice that quietly goes to a parent
+    with no way to pay it is worse than one that refuses to render.
+    """
+
+    def __init__(self) -> None:
+        self._values: dict[str, str] | None = None
+
+    def _load(self) -> dict[str, str]:
+        if self._values is not None:
+            return self._values
+        import streamlit as st
+
+        try:
+            section = st.secrets["academy"] if "academy" in st.secrets else None
+        except Exception:  # noqa: BLE001 - absent, unreadable: the same problem
+            section = None
+        if section is None:
+            raise RuntimeError(
+                "The academy's details are not configured. Add an [academy] "
+                "section to the app's secrets with: "
+                + ", ".join(ACADEMY_FIELDS)
+            )
+        values = {field: str(section.get(field, "")).strip() for field in ACADEMY_FIELDS}
+        missing = [field for field, value in values.items() if not value]
+        if missing:
+            raise RuntimeError(
+                "The [academy] section in the app's secrets is missing: "
+                + ", ".join(missing)
+            )
+        self._values = values
+        return values
+
+    def __getitem__(self, key: str) -> str:
+        return self._load()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._load().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._load()
+
+    def keys(self):
+        return self._load().keys()
+
+
+ACADEMY = _AcademyDetails()
 
 # The shield mark cropped out of assets/ks_icon.png (which also carries the
 # "ACADEMIA PREP" wordmark and tagline baked in -- not wanted a second time
