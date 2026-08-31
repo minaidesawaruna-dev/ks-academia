@@ -2245,7 +2245,7 @@ def _just_issued_panel(year: int, month: int) -> None:
     if not batch or tuple(batch.get("period", ())) != (year, month):
         return
     ids = batch.get("ids") or []
-    details = [detail for detail in (db.get_invoice(i) for i in ids) if detail]
+    details = db.get_invoices_detailed(ids)
     if not details:
         return
 
@@ -2631,7 +2631,7 @@ def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
     st.session_state["invoices_just_issued"] = {"period": (year, month), "ids": issued_ids}
     st.session_state.pop("invoice_select_all", None)
 
-    details = [detail for detail in (db.get_invoice(i) for i in issued_ids) if detail]
+    details = db.get_invoices_detailed(issued_ids)
     if not details:
         _rerun()
     token = "_".join(str(d["ID"]) for d in details)

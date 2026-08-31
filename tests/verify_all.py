@@ -394,6 +394,80 @@ def t_no_credentials_in_repo():
     return f"{len(tracked)} tracked files, no real hashes or secrets among them"
 
 
+def t_read_functions_all_run():
+    """Every read-only query must actually execute on the live backend.
+
+    This exists because get_payment_reminders grouped by the invoice's id
+    while selecting the student's name. SQLite allows that and quietly picks
+    a row; Postgres refuses the query outright, so the Reminders tab worked
+    perfectly in development and would have failed on the deployed app.
+
+    Run with DATABASE_URL pointing at Postgres, this catches that whole class
+    of difference. Run without, it still checks nothing raises.
+    """
+    import datetime as dt
+
+    import db
+
+    year, month = 2026, 8
+    teachers = db.get_all_teachers()
+    tid = teachers[0]["ID"] if teachers else 1
+    first = dt.date(year, month, 1)
+    calls = {
+        "get_all_teachers": lambda: db.get_all_teachers(),
+        "get_all_students": lambda: db.get_all_students(),
+        "get_all_classes": lambda: db.get_all_classes(),
+        "get_all_class_rates": lambda: db.get_all_class_rates(),
+        "get_class_rates_for_date": lambda: db.get_class_rates_for_date(
+            [c["ID"] for c in db.get_all_classes()[:5]], first),
+        "get_import_status": lambda: db.get_import_status(year, month),
+        "get_unpriced_classes_for_month": lambda: db.get_unpriced_classes_for_month(year, month),
+        "get_teacher_classes_for_schedule": lambda: db.get_teacher_classes_for_schedule(tid, first),
+        "get_month_timetable": lambda: db.get_month_timetable(tid, year, month),
+        "get_month_attendance": lambda: db.get_month_attendance(tid, year, month),
+        "get_students_in_month": lambda: db.get_students_in_month(year, month),
+        "get_all_student_month_breakdowns": lambda: db.get_all_student_month_breakdowns(year, month),
+        "get_invoices": lambda: db.get_invoices(),
+        "get_invoice_counts": lambda: db.get_invoice_counts(),
+        "get_month_invoice_summary": lambda: db.get_month_invoice_summary(year, month),
+        "get_open_invoice_items_for_month": lambda: db.get_open_invoice_items_for_month(year, month),
+        "get_invoice_payments": lambda: db.get_invoice_payments(year, month),
+        "get_payment_reminders": lambda: db.get_payment_reminders(),
+        "get_teacher_month_stats": lambda: db.get_teacher_month_stats(year, month),
+        "get_teacher_year_trend": lambda: db.get_teacher_year_trend(year, month),
+        "get_credits": lambda: db.get_credits(),
+    }
+    broken = []
+    for name, fn in calls.items():
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001
+            broken.append(f"{name}: {type(exc).__name__}")
+    assert not broken, "; ".join(broken)
+    return f"{len(calls)} read functions run on {db.engine.dialect.name}"
+
+
+def t_batch_matches_single():
+    """get_invoices_detailed must agree with get_invoice, invoice for invoice.
+
+    The batched version exists only for speed. The moment it disagrees with
+    the one-at-a-time path it is a billing bug, so this compares them rather
+    than trusting them.
+    """
+    import db
+
+    ids = [row["ID"] for row in db.get_invoices()][:40]
+    if not ids:
+        return "no invoices to compare"
+    singly = [d for d in (db.get_invoice(i) for i in ids) if d]
+    batched = db.get_invoices_detailed(ids)
+    assert len(singly) == len(batched), f"{len(singly)} vs {len(batched)}"
+    for a, b in zip(singly, batched):
+        for key in a:
+            assert a[key] == b.get(key), f"invoice {a['ID']} differs on {key}"
+    return f"{len(batched)} invoices identical either way"
+
+
 def t_korean_pdf():
     """Korean names must survive into the PDF, not become vertical bars."""
     import invoice_render as ir
@@ -493,6 +567,8 @@ for name, fn in [
     ("login gate runs before any data", t_login_gate_runs_first),
     ("login fails closed if misconfigured", t_login_fails_closed),
     ("no credentials committed to the repo", t_no_credentials_in_repo),
+    ("every read query runs on this backend", t_read_functions_all_run),
+    ("batched invoices match single", t_batch_matches_single),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

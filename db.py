@@ -2598,6 +2598,114 @@ def get_invoice(invoice_id):
         }
 
 
+def get_invoices_detailed(invoice_ids):
+    """Several invoices in full, in a fixed number of queries rather than per invoice.
+
+    ``get_invoice`` costs four round trips, and the bulk paths -- rendering a
+    month's invoices to files, or listing what was just issued -- ask for one
+    invoice at a time. Thirty of them is a hundred and twenty round trips:
+    under a second beside the database, and the better part of half a minute
+    across an ocean, which is what the deployment actually is.
+
+    Everything an *issued* invoice needs is fetched up front and grouped in
+    Python, so the cost stops growing with the number of invoices. Issued is
+    the case that matters here: its items carry their own frozen figures, so
+    no rates or lessons have to be looked up at all.
+
+    An invoice that is still open falls back to ``get_invoice``'s own path,
+    one at a time. Drafts are read singly in the interface, the arithmetic
+    for them is considerably more delicate -- credits are apportioned against
+    charges -- and there is nothing to be gained by duplicating it here.
+
+    Returns the same dictionaries as ``[get_invoice(i) for i in ids]``, in the
+    order asked for, skipping ids that do not exist.
+    """
+    ids = [int(i) for i in invoice_ids]
+    if not ids:
+        return []
+
+    with SessionLocal() as session:
+        invoices = {
+            invoice.id: invoice
+            for invoice in session.scalars(
+                select(Invoice).where(Invoice.id.in_(ids))
+            ).all()
+        }
+        if not invoices:
+            return []
+
+        students = {
+            student.id: student
+            for student in session.scalars(
+                select(Student).where(
+                    Student.id.in_({inv.student_id for inv in invoices.values()})
+                )
+            ).all()
+        }
+        parent_ids = {
+            student.parent_id for student in students.values() if student.parent_id
+        }
+        parents = {
+            parent.id: parent
+            for parent in (
+                session.scalars(select(Parent).where(Parent.id.in_(parent_ids))).all()
+                if parent_ids else []
+            )
+        }
+
+        items_by_invoice: dict[int, list] = {}
+        for item in session.scalars(
+            select(InvoiceItem).where(InvoiceItem.invoice_id.in_(invoices))
+        ).all():
+            items_by_invoice.setdefault(item.invoice_id, []).append(item)
+
+        credits_by_invoice: dict[int, list] = {}
+        for credit in session.scalars(
+            select(Credit).where(Credit.invoice_id.in_(invoices))
+        ).all():
+            credits_by_invoice.setdefault(credit.invoice_id, []).append(credit)
+
+        detailed = []
+        for invoice_id in ids:
+            invoice = invoices.get(invoice_id)
+            if invoice is None:
+                continue
+            student = students.get(invoice.student_id)
+            parent = (
+                parents.get(student.parent_id)
+                if student and student.parent_id
+                else None
+            )
+
+            if invoice.status == "Issued":
+                lines = _group_invoice_items(
+                    invoice, items_by_invoice.get(invoice_id, []), {}, {}, {}, {}
+                )
+                lines += _group_credits(
+                    (credit, float(credit.amount or 0))
+                    for credit in credits_by_invoice.get(invoice_id, [])
+                )
+            else:
+                lines = _invoice_lines(session, invoice)
+                charges = round(sum(line["Amount"] for line in lines), 2)
+                lines += _open_credit_lines(session, invoice.student_id, charges)
+
+            detailed.append(
+                {
+                    "ID": invoice.id,
+                    "Number": invoice.invoice_number,
+                    "Student": student.full_name if student else "",
+                    "Parent": parent.name if parent else "",
+                    "Phone": parent.phone if parent else "",
+                    "Status": invoice.status,
+                    "Issued": invoice.issued_on,
+                    "Lines": lines,
+                    "Total": round(sum(line["Amount"] for line in lines), 2),
+                }
+            )
+        return detailed
+
+
 def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
     """Freeze only the classes on an open invoice that fall in one month.
 
@@ -3196,7 +3304,13 @@ def get_payment_reminders(today=None):
                 Invoice.status == "Issued",
                 InvoiceItem.session_date <= cutoff,
             )
-            .group_by(Invoice.id)
+            # Both primary keys, not just the invoice's. Postgres will let
+            # the other columns of a table ride along on that table's grouped
+            # primary key, but the student's name is not covered by grouping
+            # on the invoice, and it rejects the query outright. SQLite waves
+            # it through and picks a row, which is why this only failed once
+            # the app was on a real database.
+            .group_by(Invoice.id, Student.id)
             # Anything still owing, which takes in part payments as well as
             # invoices nobody has paid a cent of.
             .having(
