@@ -20,3 +20,4 @@ __pycache__/
 # compares against it.
 tests/_artifacts/*
 !tests/_artifacts/before.png
+secrets-to-paste.txt
