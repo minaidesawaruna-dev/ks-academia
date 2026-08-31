@@ -1,0 +1,18 @@
+[server]
+# Excel schedule uploads are the main way classes enter the system; the
+# default 200MB cap is far more than a teacher's spreadsheet needs.
+maxUploadSize = 10
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide the "Deploy" button and the developer hamburger menu. The admins are
+# using this as an application, not editing it, and those controls only
+# offer them ways to break or be confused by it.
+toolbarMode = "minimal"
+showErrorDetails = false
+
+[theme]
+base = "light"
+primaryColor = "#1f4e79"

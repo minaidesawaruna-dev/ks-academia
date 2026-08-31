@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap');
+:root {
+  --ink:#1c2331; --muted:#6b7488; --line:#e3e6ee; --band:#f7f8fc; --paper:#fff;
+  --online:#0b6e99; --recording:#6742e0; --cancelled:#b8352b; --partial:#a15c00;
+  --note:#b7791f;
+}
+* { box-sizing:border-box; }
+html { height:auto; }
+body { margin:0; height:auto; overflow:hidden;
+  background:var(--paper); color:var(--ink);
+  font-family:'IBM Plex Sans',system-ui,-apple-system,sans-serif; }
+.legend { display:flex; gap:8px; align-items:center; padding:6px 2px 9px;
+  font-size:11px; color:var(--muted); }
+.legend .hint { margin-left:auto; }
+.key { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }
+.scroll { overflow-x:auto; overflow-y:hidden; padding-bottom:6px;
+  border:1px solid var(--line); border-radius:6px; }
+.grid { display:grid; position:relative; }
+.corner,.dayhead { position:sticky; top:0; z-index:6; background:var(--paper);
+  border-bottom:1px solid var(--line); padding:8px 10px; }
+.corner { left:0; z-index:8; border-right:1px solid var(--line); }
+.dayhead { border-left:1px solid var(--line); }
+.dnum { font-size:17px; font-weight:600; }
+.ddow { font-family:'IBM Plex Mono',monospace; font-size:10px; letter-spacing:.12em;
+  color:var(--muted); margin-left:6px; }
+.timecell { position:sticky; left:0; z-index:4; background:var(--paper);
+  border-right:1px solid var(--line); border-top:1px solid var(--line);
+  font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted);
+  /* The row is 14px tall, so the label needs a line box that fits inside it
+     or the text is clipped by the row below. */
+  line-height:1; padding:2px 8px 0 0; text-align:right; }
+.timecell.half,.slot.half { border-top-style:dotted; }
+.timecell.quarter,.slot.quarter { border-top-color:transparent; }
+.slot { border-top:1px solid var(--line); border-left:1px solid var(--line); }
+.slot.band { background:var(--band); }
+.daylayer { position:relative; z-index:2; pointer-events:none; }
+.card { position:absolute; pointer-events:auto; padding:6px 8px 7px 9px;
+  border:1px solid var(--line); border-left:3px solid var(--tint,#8a93a6);
+  border-radius:4px; background:var(--wash,#fff); overflow:hidden; cursor:pointer;
+  box-shadow:0 1px 2px rgba(28,35,49,.05); transition:box-shadow .12s,transform .12s; }
+.card:hover { box-shadow:0 3px 10px rgba(28,35,49,.16); }
+.card.selected { outline:2px solid var(--ink); outline-offset:-1px; }
+.card.off { opacity:.55; }
+.cname { font-size:12.5px; font-weight:600; line-height:1.25; }
+.ctime { font-family:'IBM Plex Mono',monospace; font-size:10px; color:var(--muted); }
+.names { margin-top:5px; display:flex; flex-wrap:wrap; gap:3px; }
+.n { font-size:10px; line-height:1.6; padding:0 5px; border-radius:3px;
+  border:1px solid transparent; white-space:nowrap; color:var(--muted);
+  background:rgba(107,116,136,.10); }
+/* Online: solid fill, filled dot. Recording: hollow with a dashed edge and a
+   play mark. Different shape as well as different hue, so the two are still
+   apart at a glance or in greyscale. */
+.n.online { color:#fff; background:var(--online); border-color:var(--online);
+  font-weight:500; }
+.n.online::before { content:"\25CF  "; }
+.n.recording { color:var(--recording); background:transparent;
+  border:1px dashed var(--recording); font-weight:500; }
+.n.recording::before { content:"\25B6  "; }
+.n.cancelled { color:var(--cancelled); background:transparent;
+  border:1px solid var(--cancelled); text-decoration:line-through; }
+.n.online.recording { color:#fff; background:var(--recording);
+  border:1px dashed var(--recording); }
+.n.noted { box-shadow:inset 0 -2px 0 var(--note); }
+.n.owing { outline:1px dotted var(--cancelled); outline-offset:1px; }
+.flag { display:inline-block; font-size:10px; color:var(--note); margin-left:4px;
+  border:1px solid var(--note); border-radius:3px; padding:0 4px; }
+.flag.unpaid { color:var(--cancelled); border-color:var(--cancelled); }
+.notebox { margin-top:5px; font-size:10px; color:var(--note);
+  background:rgba(183,121,31,.08); border-radius:3px; padding:3px 5px;
+  white-space:pre-wrap; }
+.empty { padding:26px 12px; color:var(--muted); font-size:13px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const SLOT = 15, H = 14, DAYW = 216, TIMEW = 62;
+// Cards are positioned by exact minute rather than snapped to a slot, so a
+// lesson can start at 13:07 and still sit where it belongs.
+const PX_PER_MIN = H / SLOT;
+const DOW = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+let state = { lessons: [], selected: null, signature: null };
+
+function esc(s){ return String(s == null ? "" : s).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function mins(t){ const p = String(t).split(":").map(Number); return p[0]*60 + (p[1]||0); }
+
+/* Blend the class colour towards white and return an opaque value, so the
+   banded rows behind a card cannot show through it. */
+function wash(hex){
+  const h = String(hex || "").replace("#", "");
+  if (h.length !== 6) return "#ffffff";
+  const part = i => parseInt(h.slice(i, i + 2), 16);
+  const mix = c => Math.round(c + (255 - c) * 0.88);
+  return `rgb(${mix(part(0))},${mix(part(2))},${mix(part(4))})`;
+}
+
+function lanes(items){
+  const ends = [], out = new Map();
+  items.slice().sort((a,b) => mins(a.start) - mins(b.start)).forEach(it => {
+    const s = mins(it.start), e = mins(it.end);
+    let placed = false;
+    for (let i = 0; i < ends.length; i++){
+      if (s >= ends[i]) { out.set(it.id, i); ends[i] = e; placed = true; break; }
+    }
+    if (!placed) { out.set(it.id, ends.length); ends.push(e); }
+  });
+  return { lane: out, total: Math.max(1, ends.length) };
+}
+
+function render(){
+  const root = document.getElementById("root");
+  const lessons = state.lessons;
+  if (!lessons.length){
+    root.innerHTML = '<div class="empty">Nothing scheduled this month yet.</div>';
+    frameHeight(); return;
+  }
+
+  const byDate = new Map();
+  lessons.forEach(l => { if (!byDate.has(l.date)) byDate.set(l.date, []); byDate.get(l.date).push(l); });
+  const dates = [...byDate.keys()].sort();
+
+  // The axis always covers 09:00-21:00, and stretches further if a class
+  // falls outside it, so the shape of the day is the same every month.
+  const DAY_OPEN = 9 * 60, DAY_CLOSE = 21 * 60;
+  let lo = DAY_OPEN, hi = DAY_CLOSE;
+  lessons.forEach(l => { lo = Math.min(lo, mins(l.start)); hi = Math.max(hi, mins(l.end)); });
+  lo -= lo % 60;                       // start the axis on a whole hour
+  if (hi % 60) hi += 60 - (hi % 60);   // and end on one
+  // One extra row so the closing hour gets a label of its own.
+  const rows = Math.max(1, Math.ceil((hi - lo) / SLOT)) + 1;
+
+  const info = new Map();
+  dates.forEach(d => info.set(d, lanes(byDate.get(d))));
+  const cols = [TIMEW + "px"].concat(dates.map(d => (DAYW * info.get(d).total) + "px"));
+
+  let h = '<div class="legend">' +
+    '<span class="n">In class</span>' +
+    '<span class="n online">Online</span>' +
+    '<span class="n recording">Recording</span>' +
+    '<span class="n cancelled">Cancelled</span>' +
+    '<span class="n owing">Unpaid</span>' +
+    '<span class="hint">Click a class to edit it</span></div>';
+
+  h += '<div class="scroll"><div class="grid" style="grid-template-columns:' + cols.join(" ") +
+       ';grid-template-rows:38px repeat(' + rows + ',' + H + 'px)">';
+  h += '<div class="corner" style="grid-column:1;grid-row:1"></div>';
+
+  dates.forEach((d,i) => {
+    const dt = new Date(d + "T00:00:00");
+    h += '<div class="dayhead" style="grid-column:' + (i+2) + ';grid-row:1">' +
+         '<span class="dnum">' + dt.getDate() + '</span><span class="ddow">' +
+         DOW[(dt.getDay()+6)%7].toUpperCase() + '</span></div>';
+  });
+
+  for (let r = 0; r < rows; r++){
+    const m = lo + r*SLOT, past = m % 60;
+    const rule = past === 0 ? "" : (past === 30 ? " half" : " quarter");
+    const label = past === 0 ? String(Math.floor(m/60)).padStart(2,"0") + ":00" : "";
+    h += '<div class="timecell' + rule + '" style="grid-column:1;grid-row:' + (r+2) + '">' + label + '</div>';
+    const band = Math.floor(m/60) % 2 ? " band" : "";
+    for (let c = 0; c < dates.length; c++){
+      h += '<div class="slot' + rule + band + '" style="grid-column:' + (c+2) + ';grid-row:' + (r+2) + '"></div>';
+    }
+  }
+
+  dates.forEach((d,i) => {
+    const inf = info.get(d);
+    h += '<div class="daylayer" style="grid-column:' + (i+2) +
+         ';grid-row:2/span ' + rows + '">';
+    byDate.get(d).forEach(l => {
+      const top = (mins(l.start) - lo) * PX_PER_MIN;
+      const height = Math.max(18, (mins(l.end) - mins(l.start)) * PX_PER_MIN);
+      const lane = inf.lane.get(l.id), width = 100 / inf.total;
+      const tint = l.colour || "#8a93a6";
+
+      const chips = (l.marked || []).map(s => {
+        let cls = [];
+        if (s.cancelled) cls.push("cancelled");
+        if (s.online) cls.push("online");
+        if (s.recording) cls.push("recording");
+        if (s.note) cls.push("noted");
+        if (s.unpaid && !s.cancelled) cls.push("owing");
+        const label = [s.online && "online", s.recording && "recording",
+                       s.cancelled && "cancelled", s.unpaid && "unpaid"]
+                      .filter(Boolean).join(", ");
+        const tip = s.name + (label ? " — " + label : "") + (s.note ? " — " + s.note : "");
+        return '<span class="n ' + cls.join(" ") + '" title="' + esc(tip) + '">' +
+               esc(s.name) + '</span>';
+      }).join("");
+
+      const flags = (l.note ? '<span class="flag">note</span>' : "") +
+                    (l.class_note ? '<span class="flag">subject note</span>' : "") +
+                    (l.unpaid ? '<span class="flag unpaid">' + l.unpaid + ' unpaid</span>' : "");
+      const noteBox = l.note ? '<div class="notebox">' + esc(l.note) + '</div>' : "";
+
+      h += '<div class="card' + (l.cancelled ? " off" : "") +
+        (String(state.selected) === String(l.id) ? " selected" : "") +
+        '" data-id="' + esc(l.id) + '" style="top:' + top.toFixed(1) +
+        'px;height:' + height.toFixed(1) + 'px;left:calc(' + (lane*width) +
+        '% + 4px);width:calc(' + width + '% - 8px);--tint:' + esc(tint) +
+        ';--wash:' + wash(tint) + '">' +
+        '<div class="cname">' + esc(l.class_name) + flags + '</div>' +
+        '<div class="ctime">' + esc(l.start) + '&ndash;' + esc(l.end) + ' &middot; ' +
+        l.students + ' students</div>' + noteBox +
+        '<div class="names">' + chips + '</div></div>';
+    });
+    h += '</div>';
+  });
+
+  h += '</div></div>';
+  root.innerHTML = h;
+  frameHeight();
+}
+
+document.addEventListener("click", e => {
+  const card = e.target.closest(".card");
+  if (!card) return;
+  state.selected = card.dataset.id;
+  render();
+  // Nonce makes each click a distinct value, so clicking the same lesson twice
+  // still reaches Python instead of being dropped as an unchanged value.
+  Streamlit.setComponentValue({ lesson_id: Number(card.dataset.id), nonce: Date.now() });
+});
+
+const Streamlit = {
+  setComponentReady(){ window.parent.postMessage(
+    { isStreamlitMessage:true, type:"streamlit:componentReady", apiVersion:1 }, "*"); },
+  setFrameHeight(h){ window.parent.postMessage(
+    { isStreamlitMessage:true, type:"streamlit:setFrameHeight", height:h }, "*"); },
+  setComponentValue(v){ window.parent.postMessage(
+    { isStreamlitMessage:true, type:"streamlit:setComponentValue", value:v, dataType:"json" }, "*"); },
+};
+
+let lastHeight = 0;
+function frameHeight(){
+  // Measure the body, not documentElement: the <html> element stretches to
+  // whatever height the iframe was given, so measuring it makes each report
+  // larger than the last and the frame grows without limit.
+  const h = document.body.scrollHeight + 4;
+  if (Math.abs(h - lastHeight) < 2) return;
+  lastHeight = h;
+  Streamlit.setFrameHeight(h);
+}
+
+window.addEventListener("message", event => {
+  if (!event.data || event.data.type !== "streamlit:render") return;
+  const args = event.data.args || {};
+  // Streamlit re-sends render on every height report; rebuilding each time
+  // destroys the element mid-click, so only rebuild when the data changed.
+  const signature = JSON.stringify([args.lessons, args.selected]);
+  if (signature === state.signature) { frameHeight(); return; }
+  state.signature = signature;
+  state.lessons = args.lessons || [];
+  if (args.selected != null) state.selected = args.selected;
+  render();
+});
+
+Streamlit.setComponentReady();
+frameHeight();
+</script>
+</body>
+</html>

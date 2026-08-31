@@ -1,0 +1,22 @@
+# The live database never belongs in the repo -- it holds real student names
+# and payment records, and the deployed app reads Postgres, not this file.
+ks_academia.db
+ks_academia.db-shm
+ks_academia.db-wal
+backup_*.db
+
+# Local secrets. DATABASE_URL and any password live in the host's secrets
+# manager, never in version control.
+.streamlit/secrets.toml
+.env
+
+.venv/
+__pycache__/
+*.pyc
+
+# Test artifacts are regenerated on every run, and the migration dry-run's
+# target is a complete copy of the real database -- student names, invoices,
+# payments. Only the reference render is kept, because the pixel-diff test
+# compares against it.
+tests/_artifacts/*
+!tests/_artifacts/before.png

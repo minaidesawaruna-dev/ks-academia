@@ -1,0 +1,25 @@
+# Pinned to what the app was developed and tested against, so that a deploy
+# does not silently pick up a new major of pandas or streamlit and break the
+# grid or the invoice layout weeks after it last worked.
+streamlit==1.61.1
+pandas==3.0.5
+altair==6.2.2
+SQLAlchemy==2.0.52
+openpyxl==3.1.5
+
+# Postgres driver. Unused when DATABASE_URL is left unset and the app falls
+# back to the local SQLite file, but required by every deployment.
+psycopg2-binary==2.9.12
+
+# Renders invoices to PDF without a browser, which is what makes invoice
+# export work on a host that cannot install Chromium. Pure Python -- it
+# pulls in reportlab and nothing outside pip -- so there is deliberately no
+# packages.txt in this project.
+xhtml2pdf==0.2.17
+
+# Only used for PNG invoice export, and only where a Chromium is actually
+# installed alongside it -- which the deployed host has no way to do. Kept
+# because it is what makes the nicer, inline-previewing images locally; the
+# app checks at runtime and falls back to PDF when the browser is absent, so
+# this being unusable on the host is not an error.
+playwright==1.62.0
