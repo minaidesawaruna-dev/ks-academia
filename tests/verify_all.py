@@ -25,6 +25,29 @@ sys.path.insert(0, str(PROJECT))
 
 results: list[tuple[str, bool, str]] = []
 
+# Importing app.py runs the sign-in gate, which refuses to proceed without
+# credentials -- correctly. So the suite needs some, and must not depend on
+# whatever happens to be on this machine: a fresh clone has no secrets file.
+# A throwaway one is written here and removed afterwards, unless the developer
+# already has a real one, which is left alone.
+_SECRETS = PROJECT / ".streamlit" / "secrets.toml"
+_SECRETS_WAS_OURS = not _SECRETS.exists()
+if _SECRETS_WAS_OURS:
+    import streamlit_authenticator as _stauth
+
+    _SECRETS.parent.mkdir(exist_ok=True)
+    _SECRETS.write_text(
+        "# Written by tests/verify_all.py and deleted again on exit.\n"
+        "[auth]\n"
+        'cookie_name = "ks_academia_auth"\n'
+        f'cookie_key = "{os.urandom(16).hex()}"\n'
+        "cookie_expiry_days = 30\n\n"
+        "[auth.credentials.usernames.verify]\n"
+        'name = "Verification Run"\n'
+        f'password = "{_stauth.Hasher.hash("not-a-real-password")}"\n',
+        encoding="utf-8",
+    )
+
 
 def check(name, fn):
     try:
@@ -475,6 +498,9 @@ for name, fn in [
     ("image render unchanged", t_png_unchanged),
 ]:
     check(name, fn)
+
+if _SECRETS_WAS_OURS:
+    _SECRETS.unlink(missing_ok=True)
 
 width = max(len(n) for n, _, _ in results)
 failed = 0

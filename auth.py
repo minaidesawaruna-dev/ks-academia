@@ -63,6 +63,12 @@ def _configuration_error(detail: str) -> None:
     st.error("KS Academia is unavailable.")
     st.write("Please contact the administrator.")
     st.stop()
+    # Unreachable inside a real Streamlit run, where st.stop() raises. Outside
+    # one -- a test importing this module, a bare script -- st.stop() does not
+    # halt, and execution would carry on into code that assumes a valid
+    # configuration and fail later with something misleading. Stopping has to
+    # mean stopping in both.
+    raise RuntimeError(f"sign-in is not configured: {detail}")
 
 
 def require_login() -> stauth.Authenticate:
