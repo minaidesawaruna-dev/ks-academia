@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import getpass
 import re
+import secrets
 import sys
 
 import streamlit_authenticator as stauth
@@ -48,15 +49,35 @@ def main() -> int:
     hashed = stauth.Hasher.hash(password)
     del password
 
+    first = input("\nIs this the first user for this app? [y/N]: ").strip().lower()
+
     print()
-    print("Paste this into Settings -> Secrets for the app:")
+    print("=" * 68)
+    print("Paste this into Settings -> Secrets for the app on Streamlit:")
+    print("=" * 68)
     print()
+    if first.startswith("y"):
+        print('DATABASE_URL = "PUT-YOUR-NEON-POOLED-URL-HERE"')
+        print()
+        print("[auth]")
+        print('cookie_name = "ks_academia_auth"')
+        # Signs the "stay signed in" cookie. Anyone holding it could mint a
+        # cookie for any user, so it is generated here rather than being a
+        # memorable string, and it belongs only in the secrets page.
+        print(f'cookie_key = "{secrets.token_urlsafe(32)}"')
+        print("cookie_expiry_days = 30")
+        print()
+    else:
+        print("(adding to the existing [auth] block -- keep the cookie_key")
+        print(" you already have, changing it signs everybody out)")
+        print()
     print(f"[auth.credentials.usernames.{username}]")
     print(f'name = "{display}"')
     print(f'password = "{hashed}"')
     print()
-    print("The hash is safe to paste. The password is not -- do not send it")
-    print("to anyone, and do not put it in a chat window.")
+    print("=" * 68)
+    print("The hash above is safe to paste. The password is not -- do not")
+    print("send it to anyone, and do not put it in a chat window.")
     return 0
 
 
