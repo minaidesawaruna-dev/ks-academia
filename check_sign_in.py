@@ -61,7 +61,8 @@ def main() -> int:
 
     if config.get("DATABASE_URL", "").startswith("postgresql://"):
         pooled = "-pooler" in config["DATABASE_URL"]
-        print(f"{OK} DATABASE_URL is set{'' if pooled else ' (but is NOT the -pooler one)'}.")
+        note = "" if pooled else " (but is NOT the -pooler one)"
+        print(f"{OK} DATABASE_URL is set{note}.")
     else:
         print(f"{BAD} DATABASE_URL is missing or does not start with postgresql://")
         print("         Without it the app opens an empty database.")
@@ -108,7 +109,8 @@ def main() -> int:
 
     print("The settings look right. Now test the password itself.")
     print()
-    username = input(f"Which username? [{sorted(users)[0]}]: ").strip() or sorted(users)[0]
+    default = sorted(users)[0]
+    username = input(f"Which username? [{default}]: ").strip() or default
     if username not in users:
         print(f"{BAD} '{username}' is not in the list above.")
         print("         Usernames are case sensitive -- type it exactly.")

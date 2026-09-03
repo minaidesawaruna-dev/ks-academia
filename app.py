@@ -72,7 +72,7 @@ def _ensure_database_ready() -> bool:
     Streamlit re-runs this file from the top on every interaction, so
     anything at module scope is on the critical path of every button press.
     Even the cheap version of this check is a few round trips, which is
-    nothing beside the database and noticeable across an ocean.
+    nothing beside the database and noticeable from another region.
     """
     db.initialise_database()
     return True

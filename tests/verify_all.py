@@ -198,7 +198,8 @@ def t_migrate_copy():
             a = sc.execute(select(func.count()).select_from(table)).scalar()
             b = tc.execute(select(func.count()).select_from(table)).scalar()
             assert a == b, f"{table.name}: {a} != {b}"
-    return f"{total} rows across {len(db.Base.metadata.sorted_tables)} tables, FKs enforced"
+    tables = len(db.Base.metadata.sorted_tables)
+    return f"{total} rows across {tables} tables, FKs enforced"
 
 
 # ------------------------------------------------------------ 6. invoice render
@@ -432,16 +433,20 @@ def t_read_functions_all_run():
         "get_class_rates_for_date": lambda: db.get_class_rates_for_date(
             [c["ID"] for c in db.get_all_classes()[:5]], first),
         "get_import_status": lambda: db.get_import_status(year, month),
-        "get_unpriced_classes_for_month": lambda: db.get_unpriced_classes_for_month(year, month),
-        "get_teacher_classes_for_schedule": lambda: db.get_teacher_classes_for_schedule(tid, first),
+        "get_unpriced_classes_for_month":
+            lambda: db.get_unpriced_classes_for_month(year, month),
+        "get_teacher_classes_for_schedule":
+            lambda: db.get_teacher_classes_for_schedule(tid, first),
         "get_month_timetable": lambda: db.get_month_timetable(tid, year, month),
         "get_month_attendance": lambda: db.get_month_attendance(tid, year, month),
         "get_students_in_month": lambda: db.get_students_in_month(year, month),
-        "get_all_student_month_breakdowns": lambda: db.get_all_student_month_breakdowns(year, month),
+        "get_all_student_month_breakdowns":
+            lambda: db.get_all_student_month_breakdowns(year, month),
         "get_invoices": lambda: db.get_invoices(),
         "get_invoice_counts": lambda: db.get_invoice_counts(),
         "get_month_invoice_summary": lambda: db.get_month_invoice_summary(year, month),
-        "get_open_invoice_items_for_month": lambda: db.get_open_invoice_items_for_month(year, month),
+        "get_open_invoice_items_for_month":
+            lambda: db.get_open_invoice_items_for_month(year, month),
         "get_invoice_payments": lambda: db.get_invoice_payments(year, month),
         "get_payment_reminders": lambda: db.get_payment_reminders(),
         "get_teacher_month_stats": lambda: db.get_teacher_month_stats(year, month),

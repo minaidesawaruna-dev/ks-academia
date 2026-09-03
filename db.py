@@ -412,11 +412,12 @@ def _schema_is_current() -> bool:
     ``initialise_database`` is cheap against a local SQLite file and ruinous
     against a remote Postgres: ``create_all``'s reflection plus the column
     inspections guarding each migration come to over fifteen hundred round
-    trips. Beside the database that is six seconds; across an ocean -- the
-    app is hosted in the United States and the database is in Singapore -- it
-    is minutes. And it runs on *every* rerun, because Streamlit re-executes
-    the script from the top on every interaction, so the app appeared to hang
-    on every click.
+    trips. Sitting beside the database that is six seconds, measured. The
+    database is in ap-southeast-1 and the host is not, so each of those
+    trips costs far more there, and the total ran into minutes. It also ran
+    on *every* rerun, because Streamlit re-executes the script from the top
+    on each interaction -- so the deployed app appeared to hang on every
+    click, which is how this was found.
 
     ``get_multi_columns`` reflects the whole schema in three queries. If
     nothing is missing there is, by definition, no table to create and no
@@ -2605,7 +2606,8 @@ def get_invoices_detailed(invoice_ids):
     month's invoices to files, or listing what was just issued -- ask for one
     invoice at a time. Thirty of them is a hundred and twenty round trips:
     under a second beside the database, and the better part of half a minute
-    across an ocean, which is what the deployment actually is.
+    from a host that is not in the same region, which is what the
+    deployment actually is.
 
     Everything an *issued* invoice needs is fetched up front and grouped in
     Python, so the cost stops growing with the number of invoices. Issued is

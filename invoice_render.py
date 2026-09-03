@@ -15,10 +15,11 @@ Chromium is a heavy thing to ask of a host, though, and the free tier this is
 deployed to has no way to install one. So there is a third renderer,
 ``render_invoices_pdf``, which drives xhtml2pdf -- pure Python, with no system
 libraries behind it at all, so it runs anywhere pip does. It carries its own
-cut-down template, because that engine understands far less CSS than a browser. PDFs are the lesser option for KakaoTalk --
-they arrive as an attachment rather than previewing inline -- so the app
-prefers images wherever Chromium is actually present and falls back to PDF
-where it is not. Ask ``image_export_available`` and ``pdf_export_available``
+cut-down template, because that engine understands far less CSS than a
+browser. PDFs are the lesser option for KakaoTalk -- they arrive as an
+attachment rather than previewing inline -- so the app prefers images
+wherever Chromium is actually present and falls back to PDF where it is
+not. Ask ``image_export_available`` and ``pdf_export_available``
 rather than assuming either works.
 
 Everything the academy needs to change -- address, phone, bank -- lives in
@@ -109,7 +110,10 @@ class _AcademyDetails:
                 "section to the app's secrets with: "
                 + ", ".join(ACADEMY_FIELDS)
             )
-        values = {field: str(section.get(field, "")).strip() for field in ACADEMY_FIELDS}
+        values = {
+            field: str(section.get(field, "")).strip()
+            for field in ACADEMY_FIELDS
+        }
         missing = [field for field, value in values.items() if not value]
         if missing:
             raise RuntimeError(
@@ -124,12 +128,6 @@ class _AcademyDetails:
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._load().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self._load()
-
-    def keys(self):
-        return self._load().keys()
 
 
 ACADEMY = _AcademyDetails()
