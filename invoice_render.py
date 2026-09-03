@@ -548,7 +548,12 @@ _PDF_STYLE = """
 body { font-family: Helvetica; font-size: 9pt; color: #1a2233; }
 table { width: 100%; border-collapse: collapse; }
 td, th { vertical-align: top; }
-.hd td { padding: 0 0 8pt 0; border-bottom: 2pt solid #1f3864; }
+/* The rule under the letterhead is a row of its own, for the same reason
+   as the one above the total: three cells each carrying their own bottom
+   border meet with visible notches where the columns abut, and one
+   continuous border does not. */
+.hd td { padding: 0 0 8pt 0; }
+.hdrule td { border-top: 2pt solid #1f3864; padding: 0; font-size: 2pt; }
 .logo { width: 34pt; }
 .logo img { width: 30pt; height: 30pt; }
 .brand { font-size: 17pt; font-weight: bold; color: #1f3864; }
@@ -568,7 +573,14 @@ td, th { vertical-align: top; }
 .items td.mid, .items th.mid { text-align: center; }
 .items td.right, .items th.right { text-align: right; }
 .credit td { color: #1f6f43; font-style: italic; }
-.total td { border-bottom: none; border-top: 1.5pt solid #1f3864;
+/* The rule above the total is its own row rather than a border on the total
+   itself. This engine ignores padding-top on a cell that carries a border,
+   so the line was drawn straight through "Total (SGD)" -- raising the
+   padding changed nothing at all. An empty row wearing the border puts the
+   line where it belongs and leaves the figures clear of it. */
+.rulerow td { border-top: 1.5pt solid #1f3864; border-bottom: none;
+  padding: 0; font-size: 2pt; }
+.total td { border-bottom: none; border-top: none;
   font-size: 10.5pt; font-weight: bold; padding-top: 8pt; }
 .payhd { margin-top: 20pt; padding-bottom: 4pt; font-size: 7.5pt;
   color: #7b8598; font-weight: bold; }
@@ -638,7 +650,9 @@ def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
   <td class="ttl" style="width:31%"><div class="big">INVOICE</div>
     <div class="meta"><span>Date</span> {issued:%d %b %Y}<br/>
     <span>Invoice no</span> {('#' + str(number)) if number else '-'}</div></td>
-</tr></table>
+</tr>
+<tr class="hdrule"><td colspan="{3 if _LOGO_DATA_URI else 2}">&nbsp;</td></tr>
+</table>
 {draft}
 <table><tr><td class="label">BILLED TO</td></tr>
 <tr><td class="who">{_cjk_spans(html.escape(invoice.get('Student', '')))}</td></tr>
@@ -648,6 +662,7 @@ def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
 <th style="width:26%">DATES</th><th class="mid" style="width:20%">UNIT PRICE</th>
 <th class="right" style="width:18%">AMOUNT (SGD)</th></tr>
 {rows}
+<tr class="rulerow"><td colspan="5">&nbsp;</td></tr>
 <tr class="total"><td colspan="4" class="right">Total (SGD)</td>
 <td class="right">{_money(invoice.get('Total', 0))}</td></tr>
 </table>
