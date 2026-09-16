@@ -406,6 +406,38 @@ class ScheduleImport(Base):
     )
 
 
+class LessonHistory(Base):
+    """One student at one past lesson, kept for analysis only.
+
+    Deliberately a table of its own, with names rather than links. Importing a
+    year already billed elsewhere into the timetable would put every one of
+    those lessons on a student's open invoice, a click away from being sent
+    to a parent a second time. Nothing that bills, schedules or reminds ever
+    reads this table; only the retention analysis does.
+    """
+
+    __tablename__ = "lesson_history"
+    __table_args__ = (
+        UniqueConstraint(
+            "teacher_name", "lesson_date", "start_time", "student_name",
+            name="uq_history_lesson_student",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    teacher_name = Column(String(100), nullable=False)
+    class_name = Column(String(150), nullable=False)
+    lesson_date = Column(Date, nullable=False)
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+    student_name = Column(String(100), nullable=False)
+    status = Column(String(20), nullable=False)
+    source = Column(String(200), nullable=True)
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+
 def _schema_is_current() -> bool:
     """Whether every table and column the app expects is already in place.
 
@@ -3897,3 +3929,180 @@ def get_unpriced_classes_for_month(year, month):
         for bucket in unpriced.values():
             bucket["Hours"] = round(bucket["Hours"], 2)
         return sorted(unpriced.values(), key=lambda item: (item["Teacher"], item["Class"]))
+
+
+# ---------------------------------------------------------------------------
+# Lessons for analysis
+# ---------------------------------------------------------------------------
+
+
+def save_lesson_history(teacher_name, sessions, source=None):
+    """Keep a parsed workbook's lessons for analysis, apart from anything billed.
+
+    ``sessions`` is a parser preview's sessions. Saving the same workbook again
+    updates what changed rather than adding it twice: a lesson is one teacher,
+    date, start time and student. A teacher name matching an existing one up
+    to capitals reuses that spelling, so one teacher's history stays together.
+    """
+    teacher_name = " ".join(str(teacher_name or "").split())[:100]
+    if not teacher_name:
+        return {"status": "no_teacher"}
+    source = (source or "")[:200] or None  # Postgres rejects an over-long value outright
+
+    incoming = {}
+    for lesson in sessions:
+        for attendance in lesson["attendance"]:
+            student = " ".join(attendance["student_name"].split())[:100]
+            if not student:
+                continue
+            incoming[(lesson["date"], lesson["start_time"], student.casefold())] = {
+                "class_name": lesson["class_name"][:150],
+                "lesson_date": lesson["date"],
+                "start_time": lesson["start_time"],
+                "end_time": lesson["end_time"],
+                "student_name": student,
+                "status": attendance["status"][:20],
+            }
+
+    with SessionLocal() as session:
+        known = session.scalar(
+            select(LessonHistory.teacher_name)
+            .where(func.lower(LessonHistory.teacher_name) == teacher_name.lower())
+            .limit(1)
+        )
+        teacher_name = known or teacher_name
+        existing = {
+            (row.lesson_date, row.start_time, row.student_name.casefold()): row
+            for row in session.scalars(
+                select(LessonHistory).where(LessonHistory.teacher_name == teacher_name)
+            )
+        }
+        added = updated = unchanged = 0
+        for key, values in incoming.items():
+            row = existing.get(key)
+            if row is None:
+                session.add(LessonHistory(teacher_name=teacher_name, source=source, **values))
+                added += 1
+            elif any(getattr(row, field) != value for field, value in values.items()):
+                for field, value in values.items():
+                    setattr(row, field, value)
+                row.source = source
+                updated += 1
+            else:
+                unchanged += 1
+        session.commit()
+    return {"status": "saved", "teacher": teacher_name, "added": added,
+            "updated": updated, "unchanged": unchanged}
+
+
+def get_lesson_history_summary():
+    """One row per teacher with past schedules on file."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(
+                LessonHistory.teacher_name,
+                func.count(LessonHistory.id),
+                func.count(distinct(LessonHistory.student_name)),
+                func.min(LessonHistory.lesson_date),
+                func.max(LessonHistory.lesson_date),
+            )
+            .group_by(LessonHistory.teacher_name)
+            .order_by(LessonHistory.teacher_name)
+        ).all()
+    return [
+        {"Teacher": teacher, "Student-lessons": lessons, "Students": students,
+         "From": _as_day(first), "To": _as_day(last)}
+        for teacher, lessons, students, first, last in rows
+    ]
+
+
+def delete_lesson_history(teacher_name):
+    """Remove one teacher's past schedules. Touches nothing billed; returns rows removed."""
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(LessonHistory).where(LessonHistory.teacher_name == teacher_name)
+        ).all()
+        for row in rows:
+            session.delete(row)
+        session.commit()
+    return len(rows)
+
+
+def _lesson_condition(is_online, has_recording, is_cancelled):
+    # The parser's precedence: a cancellation outranks everything, then a recording.
+    if is_cancelled:
+        return "Cancelled"
+    if has_recording:
+        return "Recording"
+    return "Online" if is_online else "Attending"
+
+
+def get_analysis_lessons(today=None):
+    """Every past lesson for the retention analysis, one row per student per lesson.
+
+    ``app`` is what the timetable holds; ``history`` is past schedules kept for
+    analysis. Cancelled classes and anything still in the future are left
+    out. Overlap between the two is resolved by ``retention.combine``.
+    """
+    today = today or date.today()
+    with SessionLocal() as session:
+        app_rows = session.execute(
+            select(
+                Teacher.name,
+                AcademyClass.name,
+                ClassSession.session_date,
+                ClassSession.start_time,
+                ClassSession.end_time,
+                Student.full_name,
+                SessionAttendance.is_online,
+                SessionAttendance.has_recording,
+                SessionAttendance.is_cancelled,
+            )
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
+            .join(Teacher, ClassSession.teacher_id == Teacher.id)
+            .join(Student, SessionAttendance.student_id == Student.id)
+            .where(ClassSession.session_date <= today, ClassSession.status != "Cancelled")
+        ).all()
+        history_rows = session.execute(
+            select(
+                LessonHistory.teacher_name,
+                LessonHistory.class_name,
+                LessonHistory.lesson_date,
+                LessonHistory.start_time,
+                LessonHistory.end_time,
+                LessonHistory.student_name,
+                LessonHistory.status,
+            ).where(LessonHistory.lesson_date <= today)
+        ).all()
+    return {
+        "app": [
+            {"teacher": teacher, "class_name": class_name, "date": _as_day(when),
+             "start": start, "end": end, "student": student,
+             "status": _lesson_condition(online, recording, cancelled)}
+            for teacher, class_name, when, start, end, student, online, recording, cancelled
+            in app_rows
+        ],
+        "history": [
+            {"teacher": teacher, "class_name": class_name, "date": _as_day(when),
+             "start": start, "end": end, "student": student, "status": status}
+            for teacher, class_name, when, start, end, student, status in history_rows
+        ],
+    }
+
+
+def get_analysis_data_version():
+    """A cheap fingerprint that changes whenever the lessons behind the analysis do."""
+    # One round trip: this runs on every visit to the retention view.
+    with SessionLocal() as session:
+        row = session.execute(
+            select(
+                select(func.count(SessionAttendance.id)).scalar_subquery(),
+                select(func.max(SessionAttendance.id)).scalar_subquery(),
+                select(func.count(ClassSession.id)).scalar_subquery(),
+                select(func.max(ClassSession.id)).scalar_subquery(),
+                select(func.count(LessonHistory.id)).scalar_subquery(),
+                select(func.max(LessonHistory.id)).scalar_subquery(),
+            )
+        ).one()
+    return tuple(int(value or 0) for value in row)

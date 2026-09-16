@@ -9,7 +9,8 @@ Seven tabs:
 * **Timetable** — the month grid, for one-off manual fixes.
 * **Invoices** — bill students for a month's unbilled classes.
 * **Payments** — record what parents have actually paid, in full or in part.
-* **Data** — earnings, hours and student counts per teacher, by month.
+* **Data** — earnings per teacher by month; student retention, with who is at
+  risk of not coming back; and past schedules kept for analysis only.
 * **Reminders** — students overdue on payment.
 
 A *subject* is what a teacher teaches — its rate and colour. A *class* is one
@@ -32,6 +33,7 @@ import streamlit as st
 
 import auth
 import db
+import retention
 import schedule_backfill
 import schedule_parser
 from schedule_parser import UNNAMED_CLASS
@@ -401,12 +403,13 @@ def _import_detail(preview: dict) -> None:
     # A class the sheet never named. Worth its own callout rather than being
     # left to the warnings list -- it imports under a placeholder, and only
     # the person holding the spreadsheet can say what it should be called.
-    unnamed = [item for item in sessions if item["class_name"] == UNNAMED_CLASS]
+    unnamed = [item for item in sessions if item["class_name"].startswith(UNNAMED_CLASS)]
     if unnamed:
         st.warning(
             f"**{len(unnamed)} class(es) have no subject name in the sheet.** "
-            "They will import as "
-            f"\u201c{UNNAMED_CLASS}\u201d. The subject belongs on the line "
+            "Each imports under a placeholder named for its student or weekly "
+            f"slot, such as \u201c{UNNAMED_CLASS} \u00b7 Sun 11:30\u201d, "
+            "unless named below. The subject belongs on the line "
             "above the time range \u2014 add it in Excel and upload again, or "
             "rename the subject afterwards on the Teachers screen."
         )
@@ -667,15 +670,15 @@ def _import_upload_panel() -> None:
             "that existing student under a different spelling, or a new one."
         )
         for index, candidate in enumerate(match_candidates):
-            reason_text = (
-                "same name, tagged differently"
-                if candidate["reason"] == "tag"
-                else "similar spelling"
-            )
+            reason_text = {
+                "tag": "same name, tagged differently",
+                "grade": "same name, with a grade written in front",
+            }.get(candidate["reason"], "similar spelling")
             choice = st.radio(
                 f"'{candidate['parsed_name']}' — {reason_text} to existing "
                 f"student '{candidate['existing_name']}'",
                 ["New / different person", f"Same as '{candidate['existing_name']}'"],
+                index=1 if candidate.get("likely_same") else 0,
                 horizontal=True,
                 key=f"import_match_{generation}_{index}",
             )
@@ -691,44 +694,41 @@ def _import_upload_panel() -> None:
         # placeholder, because only the person holding the spreadsheet knows
         # what it should be called, and editing Excel and re-uploading just to
         # supply one word is a poor trade.
-        unnamed = [
-            item for item in preview["sessions"]
-            if item["class_name"] == UNNAMED_CLASS
-        ]
-        if unnamed:
-            st.markdown(f"**Give the unnamed class a subject ({len(unnamed)})**")
-            when = ", ".join(
-                sorted(
-                    f"{item['date']:%d %b} {item['start_time']:%H:%M}"
-                    for item in unnamed
-                )
+        unnamed_groups: dict[str, list[dict]] = {}
+        for item in preview["sessions"]:
+            if item["class_name"].startswith(UNNAMED_CLASS):
+                unnamed_groups.setdefault(item["class_name"], []).append(item)
+        named_unnamed: dict[str, str] = {}
+        if unnamed_groups:
+            lesson_count = sum(len(items) for items in unnamed_groups.values())
+            st.markdown(
+                f"**Give the unnamed classes a subject ({len(unnamed_groups)} "
+                f"class(es), {lesson_count} lesson(s))**"
             )
             st.caption(
-                f"The sheet has a time and a roster but no subject above them "
-                f"— {when}. Leave it blank to import as "
-                f"“{UNNAMED_CLASS}” and rename it later."
+                "The sheet has a time and a roster but no subject above them. "
+                "Lessons are grouped by their student, or by weekly slot when "
+                "several students share one. Give two groups the same name to "
+                "make them one class; leave a box blank to keep the placeholder "
+                "and rename it later."
             )
-            if len(unnamed) > 1:
-                st.warning(
-                    f"All {len(unnamed)} would take this one name, which merges "
-                    "them into a single subject. If they are different classes, "
-                    "name them in the sheet instead."
-                )
-            for item in sorted(unnamed, key=lambda x: (x["date"], x["start_time"])):
+            for placeholder, items in sorted(unnamed_groups.items()):
+                items.sort(key=lambda x: (x["date"], x["start_time"]))
+                students = sorted({a["student_name"] for x in items for a in x["attendance"]})
+                cells = ", ".join(x["cell"] for x in items[:4])
                 st.caption(
-                    f"• **{item['cell']}** — {item['date']:%d %b %Y} "
-                    f"{item['start_time']:%H:%M}–{item['end_time']:%H:%M} — "
-                    + (", ".join(a["student_name"] for a in item["attendance"])
-                       or "nobody listed")
+                    f"**{placeholder}** — {len(items)} lesson(s), "
+                    f"{items[0]['date']:%d %b %Y} to {items[-1]['date']:%d %b %Y}, "
+                    f"{cells}{' …' if len(items) > 4 else ''} — "
+                    + (", ".join(students) or "nobody listed")
                 )
-            typed = st.text_input(
-                "Subject name",
-                key=f"import_unnamed_{generation}",
-                placeholder="e.g. Upper-Sec Science",
-            ).strip()
-            named_unnamed = typed or ""
-        else:
-            named_unnamed = ""
+                typed = st.text_input(
+                    f"Subject for {placeholder}",
+                    key=f"import_unnamed_{generation}_{placeholder}",
+                    placeholder="e.g. Upper-Sec Science",
+                ).strip()
+                if typed:
+                    named_unnamed[placeholder] = typed
 
 
         merged_into: dict[str, str] = {}
@@ -758,8 +758,7 @@ def _import_upload_panel() -> None:
         # into, and a newly named class under the name just typed, rather than
         # under the spelling being retired.
         settled = dict(merged_into)
-        if named_unnamed:
-            settled[UNNAMED_CLASS] = named_unnamed
+        settled.update(named_unnamed)
         effective = [
             {**item, "class_name": settled.get(item["class_name"], item["class_name"])}
             for item in preview["sessions"]
@@ -2920,8 +2919,304 @@ def payments_tab() -> None:
     _paid_list(paid, year, month)
 
 
+@st.cache_data(show_spinner="Reading every lesson…", max_entries=4)
+def _retention_report(version: tuple, today: dt.date) -> dict:
+    """The retention report for one state of the data.
+
+    ``version`` changes whenever lessons are added, edited or removed, and
+    ``today`` once a day, so the model refits when there is something new to
+    learn from rather than on every click in the tab.
+    """
+    sources = db.get_analysis_lessons(today)
+    lessons, counts = retention.combine(sources["app"], sources["history"])
+    report = retention.retention_report(lessons, today)
+    report["sources"] = counts
+    return report
+
+
+_EFFECTS = ["Raises the chance of leaving", "Lowers it", "No clear effect"]
+
+
+def _retention_view() -> None:
+    st.caption(
+        "Who stops coming, and who looks likely to next — learned from every past "
+        "lesson in the app plus any past schedules added under **Past schedules**, "
+        "which are kept for analysis only and never billed."
+    )
+    report = _retention_report(db.get_analysis_data_version(), dt.date.today())
+    if not report["enough"]:
+        st.info(report["message"])
+        return
+
+    validation = report["validation"]
+    columns = st.columns(4)
+    columns[0].metric(
+        "Students observed", f"{report['students']:,}",
+        help=f"{report['first_month']} to {report['last_month']}. The month in "
+        "progress is left out until it ends.",
+    )
+    columns[1].metric(
+        "Current students", f"{report['current']:,}",
+        help=f"Had a lesson in {report['last_month']} or the month before. Grade 12 "
+        "students finishing school are left out.",
+    )
+    columns[2].metric(
+        "Expected not to return", f"{report['expected_leavers']:.0f}",
+        help="Every current student's chance of not coming back, added up.",
+    )
+    columns[3].metric(
+        "Model check", f"{validation['auc']:.2f}" if validation else "—",
+        help="On months the model had not seen: how often it ranked a student who "
+        "left above one who stayed. 0.50 is guessing, 1.00 is perfect.",
+    )
+
+    st.markdown("#### How long students stay")
+    # Stop the curve where fewer than ten students are still followed: past
+    # that, one student more or less swings it, and a long flat tail invites
+    # reading more into it than a handful of students can carry.
+    line = (
+        alt.Chart(pd.DataFrame([point for point in report["km"] if point["at_risk"] >= 10]))
+        .mark_line(interpolate="step-after", strokeWidth=2, color="#2a78d6")
+        .encode(
+            x=alt.X("month:Q", title="Months since first lesson", axis=alt.Axis(tickMinStep=1)),
+            y=alt.Y("retained:Q", title="Still enrolled", axis=alt.Axis(format="%"),
+                    scale=alt.Scale(domain=[0, 1])),
+            tooltip=[
+                alt.Tooltip("month:Q", title="Months"),
+                alt.Tooltip("retained:Q", title="Still enrolled", format=".0%"),
+                alt.Tooltip("at_risk:Q", title="Students still observed"),
+            ],
+        )
+    )
+    half = (
+        alt.Chart(pd.DataFrame({"y": [0.5]}))
+        .mark_rule(strokeDash=[4, 4], color="#8a8985")
+        .encode(y="y:Q")
+    )
+    st.altair_chart((line + half).properties(height=280), width="stretch")
+    median = report["median_months"]
+    st.caption(
+        (f"Half of students have left by month {median}. " if median else
+         "More than half of students are still enrolled at the longest stay observed. ")
+        + f"Leaving means no lesson for {report['grace_months']} months and never "
+        "coming back. Grade 12 students whose last lesson is in May or June have "
+        "finished school and are not counted as leaving."
+    )
+
+    st.markdown("#### What goes with leaving")
+    drivers = pd.DataFrame(report["drivers"])
+    drivers["effect"] = [
+        _EFFECTS[0] if low > 1 else _EFFECTS[1] if high < 1 else _EFFECTS[2]
+        for low, high in zip(drivers["low"], drivers["high"])
+    ]
+    colours = alt.Scale(domain=_EFFECTS, range=["#eb6834", "#2a78d6", "#8a8985"])
+    factor = alt.Y("label:N", title=None,
+                   sort=alt.EncodingSortField("odds_ratio", order="descending"))
+    ranges = alt.Chart(drivers).mark_rule(strokeWidth=2).encode(
+        y=factor,
+        x=alt.X("low:Q", scale=alt.Scale(type="log"),
+                title="Odds of not coming back (1 = no effect, log scale)"),
+        x2="high:Q",
+        color=alt.Color("effect:N", scale=colours, legend=alt.Legend(title=None, orient="top")),
+    )
+    points = alt.Chart(drivers).mark_circle(size=80, opacity=1).encode(
+        y=factor,
+        x="odds_ratio:Q",
+        color=alt.Color("effect:N", scale=colours, legend=alt.Legend(title=None, orient="top")),
+        tooltip=[
+            alt.Tooltip("label:N", title="Factor"),
+            alt.Tooltip("per:N", title="Per"),
+            alt.Tooltip("odds_ratio:Q", title="Odds ratio", format=".2f"),
+            alt.Tooltip("low:Q", title="Range from", format=".2f"),
+            alt.Tooltip("high:Q", title="Range to", format=".2f"),
+        ],
+    )
+    no_effect = alt.Chart(pd.DataFrame({"x": [1.0]})).mark_rule(color="#52514e").encode(x="x:Q")
+    st.altair_chart(
+        (ranges + points + no_effect).properties(height=34 * len(drivers)), width="stretch"
+    )
+    st.caption(
+        "Each dot is how much a factor changes the odds of not coming back, with the "
+        "others held level; the line is a rough 95% range. Shares are per 25 "
+        "percentage points — hover a dot for its unit."
+    )
+    if validation:
+        st.caption(
+            f"Checked on months it hadn't seen: fitted on lessons up to "
+            f"{validation['trained_through']}, then tested on {validation['tested_from']}–"
+            f"{validation['tested_to']}. It ranked a student who left above one who stayed "
+            f"{validation['auc']:.0%} of the time, and the riskiest fifth of students "
+            f"included {validation['captured_top_fifth']:.0%} of the "
+            f"{validation['test_leavers']} who left."
+        )
+    else:
+        st.caption("Not enough later data yet to check the model on months it hasn't seen.")
+
+    st.markdown("#### Most at risk of not coming back")
+    if report["at_risk"]:
+        st.dataframe(
+            [
+                {
+                    "Student": row["student"],
+                    "Teacher": ", ".join(row["teachers"]),
+                    "Months with us": row["months"],
+                    "Last lessons": f"{row['lessons']} in {row['last_month']}",
+                    "Usual per month": row["usual"],
+                    "Chance of not returning": f"{row['risk']:.0%}",
+                    "Why": ", ".join(row["reasons"]) or "—",
+                }
+                for row in report["at_risk"]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        st.caption(
+            "A chance, not a verdict. The reasons are what raises each student's odds "
+            "most compared with a typical student."
+        )
+    else:
+        st.caption("No current students to score.")
+    if report["graduating"]:
+        st.caption(f"{report['graduating']} Grade 12 student(s) finishing school are left out.")
+
+    with st.expander("How this works"):
+        sources = report["sources"]
+        st.markdown(
+            f"- **Data:** {sources['app']:,} student-lessons from the app and "
+            f"{sources['history']:,} from past schedules "
+            f"({sources['history_already_in_app']:,} more were already in the app and "
+            f"counted once), {report['first_month']} to {report['last_month']}.\n"
+            "- **Each row is one student in one month they came**, described only by "
+            "what was known by then — lessons that month against their usual, "
+            "recordings, online, cancellations, one-to-one share, grade, months enrolled "
+            "— and whether they came back.\n"
+            f"- **Leaving** means no lesson for {report['grace_months']} months and never "
+            f"coming back. The last {report['grace_months']} months can't be judged yet, "
+            "so they are scored but not learned from.\n"
+            "- **The model** is a monthly survival model: logistic regression on "
+            "student-months, lightly regularised. It refits whenever lessons change.\n"
+            "- **Its strongest signal is a student who has already started to drift** "
+            "— fewer lessons than usual — so it is best at catching a drop-off early, "
+            "not a student who stops without warning.\n"
+            "- **A gap in a teacher's records is not students leaving**: a month is "
+            "only judged when that teacher's schedule carries on after it.\n"
+            "- **Students are matched across teachers by name**, and grade is read from "
+            "class names (G11, Y5…), so a class without one counts as grade unknown."
+        )
+
+
+def _history_view() -> None:
+    st.caption(
+        "Past schedules kept for analysis only — for months already billed outside the "
+        "app. They never create classes, invoices or reminders. Adding the same "
+        "workbook again updates it rather than doubling it."
+    )
+    summary = db.get_lesson_history_summary()
+    if summary:
+        st.dataframe(summary, width="stretch", hide_index=True)
+        with st.expander("Remove a teacher's past schedules"):
+            teacher = st.selectbox(
+                "Teacher", [row["Teacher"] for row in summary], key="history_remove_teacher"
+            )
+            sure = st.checkbox(
+                "Remove them — nothing billed is touched", key="history_remove_sure"
+            )
+            if st.button("Remove", disabled=not sure, key="history_remove"):
+                removed = db.delete_lesson_history(teacher)
+                _retention_report.clear()
+                _flash(f"Removed {removed:,} past student-lessons for {teacher}.")
+                st.rerun()
+
+    st.markdown("#### Add a teacher's workbook")
+    upload = st.file_uploader("Excel schedule (.xlsx)", type=["xlsx"], key="history_file")
+    if upload is None:
+        return
+    stem = Path(upload.name).stem
+    cut = stem.lower().find("schedule")
+    columns = st.columns([2, 1])
+    teacher = columns[0].text_input(
+        "Teacher",
+        value=(stem[:cut] if cut > 0 else stem).strip(" -_"),
+        key=f"history_teacher_{upload.file_id}",
+    )
+    year = columns[1].number_input(
+        "Year, for sheets that name none",
+        min_value=2015,
+        max_value=dt.date.today().year + 1,
+        value=dt.date.today().year,
+        step=1,
+        key="history_year",
+    )
+    file_bytes = upload.getvalue()
+    try:
+        sheets = schedule_parser.get_sheet_names(file_bytes)
+    except Exception as error:  # a corrupt or non-Excel file
+        st.error(f"Could not read that workbook: {error}")
+        return
+    chosen = st.multiselect(
+        "Worksheets", sheets, default=sheets, key=f"history_sheets_{upload.file_id}"
+    )
+    fingerprint = (upload.file_id, tuple(sorted(chosen)), int(year))
+    if st.button("Read workbook", key="history_parse", disabled=not chosen):
+        with st.spinner("Reading the workbook…"):
+            st.session_state["history_preview"] = (
+                fingerprint,
+                schedule_parser.parse_workbook(file_bytes, chosen, int(year)),
+            )
+    stored = st.session_state.get("history_preview")
+    if not stored or stored[0] != fingerprint:
+        return
+    preview = stored[1]
+    sessions = preview["sessions"]
+    if not sessions:
+        st.warning("No lessons found in those worksheets.")
+        return
+
+    dates = sorted(item["date"] for item in sessions)
+    st.markdown(
+        f"**{len(sessions):,} lessons**, "
+        f"{sum(len(item['attendance']) for item in sessions):,} student-lessons, "
+        f"{preview['unique_student_count']} students, "
+        f"{dates[0]:%b %Y} to {dates[-1]:%b %Y}."
+    )
+    if preview["sheet_summaries"]:
+        st.dataframe(preview["sheet_summaries"], width="stretch", hide_index=True)
+    if preview["warning_count"]:
+        with st.expander(f"{preview['warning_count']} warning(s) — worth a look"):
+            texts = [item["text"] for item in preview["warnings"]] + [
+                warning["text"] for item in sessions for warning in item["warnings"]
+            ]
+            st.text("\n".join(texts[:300]))
+    if st.button(
+        "Add to past schedules", type="primary", key="history_save",
+        disabled=not teacher.strip(),
+    ):
+        result = db.save_lesson_history(teacher, sessions, source=upload.name)
+        _retention_report.clear()
+        st.session_state.pop("history_preview", None)
+        _flash(
+            f"Past schedules for {result['teacher']}: {result['added']:,} student-lessons "
+            f"added, {result['updated']:,} updated, {result['unchanged']:,} already on "
+            "file. Nothing was billed."
+        )
+        st.rerun()
+
+
 def data_tab() -> None:
     st.subheader("Data")
+    view = st.radio(
+        "View",
+        ["Invoiced", "Student retention", "Past schedules"],
+        horizontal=True,
+        key="data_view",
+        label_visibility="collapsed",
+    )
+    if view == "Student retention":
+        _retention_view()
+        return
+    if view == "Past schedules":
+        _history_view()
+        return
     st.caption(
         "Money here is what was actually invoiced — read off the issued "
         "invoices, so it never moves when a rate is changed later. A month "

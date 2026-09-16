@@ -148,6 +148,16 @@ def suggest_class_renames(
     return collisions
 
 
+def _without_grade(name: str) -> str:
+    """A name with any grade written in front of it removed: "G5 Sohee" -> "Sohee".
+
+    A name that is nothing but a grade is left whole; reduced to "" it would
+    match every other such name.
+    """
+    stripped = re.sub(r"^(?:g|y|gr\.?|grade)\s?\d{1,2}\b[\s.:\-]*", "", name.strip(), flags=re.I)
+    return stripped or name.strip()
+
+
 def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Parsed names that might already be an existing student under a
     different spelling, tag, or capitalisation -- flagged for a human
@@ -175,11 +185,17 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
             continue
         bare_new = _bare(name)
         best: dict[str, Any] | None = None
+        grade_matches = 0
         for item in existing:
             existing_name = item["Name"]
             bare_existing = _bare(existing_name)
             if bare_existing == bare_new:
                 reason, ratio = "tag", 1.0
+            elif _without_grade(bare_existing) == _without_grade(bare_new):
+                # A student imported as "G5 Sohee" before the parser learned
+                # to take a grade off the front of a name, now read as "Sohee".
+                reason, ratio = "grade", 1.0
+                grade_matches += 1
             else:
                 ratio = difflib.SequenceMatcher(None, bare_new, bare_existing).ratio()
                 if ratio < MERGE_THRESHOLD:
@@ -196,6 +212,10 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                     "existing_tag": _suffix(existing_name) or None,
                 }
         if best:
+            # Only a grade apart, and from one student only: that student
+            # already has this name's invoices, so saying "new person" by
+            # default would bill every one of those classes again.
+            best["likely_same"] = best["reason"] == "grade" and grade_matches == 1
             candidates.append(best)
 
     candidates.sort(key=lambda item: -item["similarity"])
