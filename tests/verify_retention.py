@@ -224,6 +224,26 @@ def t_a_student_who_came_back_is_not_at_risk():
     return "a student seen this month drops off the list and out of the expected count"
 
 
+def t_month_by_month():
+    """The academy's own calendar: who was taught, who was new, who went.
+
+    Recent months carry no share, because a student who has simply not been
+    in for a few weeks cannot yet be told from one who has left, and a line
+    falling to zero at the right-hand edge would read as good news.
+    """
+    lessons = monthly("Nam Jihoon", 2025, 1, 3) + monthly("Seo Yerin", 2025, 2, 5)
+    rows = rt.student_months(lessons, dt.date(2025, 6, 30))
+    latest = rt.month_index(dt.date(2025, 6, 30))
+    months = {row["label"]: row for row in rt.by_month(rows, latest)}
+    assert months["Jan 2025"]["active"] == 1 and months["Jan 2025"]["joined"] == 1, months
+    assert months["Feb 2025"]["active"] == 2 and months["Feb 2025"]["joined"] == 1, months
+    assert months["Mar 2025"]["left"] == 1, months["Mar 2025"]
+    assert months["Mar 2025"]["left_share"] == 0.5, months["Mar 2025"]
+    assert months["Apr 2025"]["settled"] and not months["May 2025"]["settled"], months
+    assert not months["Jun 2025"]["settled"], months["Jun 2025"]
+    return "months counted in the academy's calendar; the unsettled ones marked"
+
+
 def t_too_little_data():
     report = rt.retention_report(monthly("Nam Jihoon", 2025, 1, 3), dt.date(2025, 12, 31))
     assert not report["enough"] and "Past schedules" in report["message"], report
@@ -286,6 +306,7 @@ for name, fn in [
     ("features as defined", t_features),
     ("planted effect recovered", t_report_finds_planted_effect),
     ("a student who came back is not at risk", t_a_student_who_came_back_is_not_at_risk),
+    ("month by month", t_month_by_month),
     ("too little data", t_too_little_data),
     ("past-schedules store", t_history_store),
     ("app wins over past schedules", t_combine_prefers_app),

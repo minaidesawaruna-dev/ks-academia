@@ -192,6 +192,39 @@ def student_months(lessons: list[dict], today: dt.date) -> list[dict[str, Any]]:
     return rows
 
 
+def by_month(rows: list[dict], latest: int) -> list[dict[str, Any]]:
+    """Each calendar month: who came, who was new, and who did not come back.
+
+    The curve elsewhere counts months since a student's first lesson, which
+    answers "how long do students stay" and cannot answer "is it getting
+    worse". This does: one row per calendar month, in the academy's own time.
+
+    A month is only ``settled`` once ``GRACE_MONTHS`` have passed after it,
+    since before that a quiet student cannot be told from one who left. The
+    unsettled months are still returned -- their attendance is real -- but
+    their leaver count is the floor, not the figure, and the screen says so.
+    """
+    counts: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        month = counts.setdefault(row["month"], {
+            "month": row["month"], "label": month_label(row["month"]),
+            "active": 0, "joined": 0, "left": 0, "unknown": 0, "settled": True,
+        })
+        month["active"] += 1
+        month["joined"] += row["features"]["first_month"] == 1.0
+        if row["label"] == 1:
+            month["left"] += 1
+        elif row["label"] is None:
+            month["unknown"] += 1
+    out = []
+    for month in sorted(counts):
+        item = counts[month]
+        item["settled"] = month <= latest - GRACE_MONTHS
+        item["left_share"] = item["left"] / item["active"] if item["active"] else 0.0
+        out.append(item)
+    return out
+
+
 def _lesson_key(row: dict) -> tuple:
     return (row["teacher"].casefold(), row["date"], row["start"], row["class_name"].casefold())
 
@@ -383,6 +416,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
     )
 
     latest = month_index(as_of)
+    months = by_month(rows, latest)
     recent = [row for row in last_rows if row["label"] is None and row["month"] >= latest - 1]
     current = [row for row in recent if not row["graduating"]]
     # The month in progress is kept out of the model, because halfway through
@@ -430,6 +464,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
         "came_back": len(current) - len(waiting),
         "graduating": len(recent) - len(current),
         "expected_leavers": expected,
+        "months": months,
         "km": curve,
         "median_months": median,
         "drivers": odds_ratios(model),

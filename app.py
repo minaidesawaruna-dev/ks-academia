@@ -3018,6 +3018,45 @@ def _retention_view() -> None:
         "left above one who stayed. 0.50 is guessing, 1.00 is perfect.",
     )
 
+    st.markdown("#### Month by month")
+    # The curve below counts months since a student's first lesson, which
+    # answers "how long do they stay" and cannot answer "is it getting
+    # worse". This is the academy's own calendar: who was taught, and what
+    # share of them never came back.
+    months = pd.DataFrame(report["months"])
+    order = list(months["label"])
+    shared = alt.X("label:N", sort=order, title=None)
+    tips = [alt.Tooltip("label:N", title="Month"),
+            alt.Tooltip("active:Q", title="Students taught"),
+            alt.Tooltip("joined:Q", title="New that month"),
+            alt.Tooltip("left:Q", title="Never came back")]
+    taught = alt.Chart(months).mark_bar(color="#cfe2f3").encode(
+        x=shared,
+        y=alt.Y("active:Q", title="Students taught"),
+        tooltip=tips,
+    )
+    # Only the settled months carry a share: until two months have passed, a
+    # quiet student cannot be told from one who has gone, and a line dropping
+    # to zero at the right-hand edge would read as good news.
+    share = alt.Chart(months[months["settled"]]).mark_line(
+        point=True, color="#eb6834", strokeWidth=2).encode(
+        x=shared,
+        y=alt.Y("left_share:Q", title="Share who never came back",
+                axis=alt.Axis(format="%")),
+        tooltip=tips + [alt.Tooltip("left_share:Q", title="Share", format=".1%")],
+    )
+    st.altair_chart(
+        alt.layer(taught, share).resolve_scale(y="independent"), width="stretch"
+    )
+    unsettled = [row["label"] for row in report["months"] if not row["settled"]]
+    st.caption(
+        "Bars are students taught that month; the line is the share of them who "
+        "never came back."
+        + (f" {' and '.join(unsettled)} have no line yet — a student who has "
+           "simply not been in for a few weeks cannot be told from one who has "
+           "left until two months have passed." if unsettled else "")
+    )
+
     st.markdown("#### How long students stay")
     # Stop the curve where fewer than ten students are still followed: past
     # that, one student more or less swings it, and a long flat tail invites
