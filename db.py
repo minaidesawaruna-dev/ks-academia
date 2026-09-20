@@ -1814,6 +1814,39 @@ def get_student_usage(student_id):
         }
 
 
+def get_student_usage_many(student_ids):
+    """The same figures as ``get_student_usage``, for a whole screen at once.
+
+    Three grouped queries rather than three per student. The Students screen
+    draws 25 rows, and asking per row cost a hundred round trips to a
+    database on the other side of the Pacific -- twenty seconds of staring at
+    a spinner for figures that take one pass to collect.
+    """
+    ids = [int(value) for value in student_ids]
+    blank = {"subjects": 0, "classes": 0, "invoices": 0}
+    if not ids:
+        return {}
+
+    usage = {student_id: dict(blank) for student_id in ids}
+    with SessionLocal() as session:
+        for field, column, source, extra in (
+            ("subjects", Enrolment.student_id, Enrolment, None),
+            ("classes", SessionAttendance.student_id, SessionAttendance, None),
+            ("invoices", Invoice.student_id, Invoice, Invoice.status == "Issued"),
+        ):
+            query = (
+                select(column, func.count())
+                .select_from(source)
+                .where(column.in_(ids))
+                .group_by(column)
+            )
+            if extra is not None:
+                query = query.where(extra)
+            for student_id, count in session.execute(query).all():
+                usage[student_id][field] = int(count or 0)
+    return usage
+
+
 def remove_student(student_id):
     """Delete a student, their enrolments, attendance and any draft billing.
 
@@ -2907,6 +2940,20 @@ def get_student_credit_total(student_id):
             )
             or 0.0
         )
+
+
+def get_student_credit_totals(student_ids):
+    """What each of these students is owed, in one query rather than one each."""
+    ids = [int(value) for value in student_ids]
+    if not ids:
+        return {}
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Credit.student_id, func.coalesce(func.sum(Credit.amount), 0.0))
+            .where(Credit.student_id.in_(ids), Credit.status == "Open")
+            .group_by(Credit.student_id)
+        ).all()
+    return {student_id: float(total or 0.0) for student_id, total in rows}
 
 
 def count_billed_cancellations():

@@ -1146,10 +1146,13 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     class_name = class_lessons[0]["Class"]
 
     st.markdown(f"###### {class_name} — {calendar.month_name[month]} {year}")
+    # One query for the month's rosters, not two per class listed: the
+    # Timetable screen already reads them this way, and a busy subject here
+    # was thirty round trips to a database an ocean away.
+    rosters = db.get_month_attendance(teacher_id, year, month)
     for lesson in class_lessons:
-        detail = db.get_timetable_session(lesson["ID"])
         tagged = []
-        for row in (detail["Attendance"] if detail else []):
+        for row in rosters.get(lesson["ID"], []):
             condition = _condition_of(row)
             tagged.append(
                 row["student_name"]
@@ -1319,6 +1322,12 @@ def students_tab() -> None:
     # buttons, so a whole academy's worth of them is thousands of widgets and
     # several seconds before anything appears. Searching is the fast path.
     page = shown[:STUDENT_ROWS]
+    # Both of these are collected for the whole page in one pass, because
+    # Streamlit builds every expander's body whether or not it is open: asking
+    # per row turned this screen into a hundred round trips to Neon.
+    page_ids = [item["ID"] for item in page]
+    credit_waiting = db.get_student_credit_totals(page_ids)
+    usage_by_student = db.get_student_usage_many(page_ids)
     if len(shown) > len(page):
         st.info(
             f"Showing the first {len(page)} of {len(shown)} — type a name "
@@ -1350,7 +1359,7 @@ def students_tab() -> None:
                     width="stretch",
                     hide_index=True,
                 )
-                owed = db.get_student_credit_total(item["ID"])
+                owed = credit_waiting.get(item["ID"], 0.0)
                 figures = st.columns(2) if owed else [st]
                 figures[0].metric(
                     f"Total for {calendar.month_name[month]} {year}",
@@ -1403,7 +1412,9 @@ def students_tab() -> None:
                 else:
                     st.warning("Enter a name first.")
 
-            usage = db.get_student_usage(item["ID"])
+            usage = usage_by_student.get(
+                item["ID"], {"subjects": 0, "classes": 0, "invoices": 0}
+            )
             with buttons[1].popover("Delete"):
                 st.write(f"**Delete {item['Name']}?**")
                 if usage["invoices"]:

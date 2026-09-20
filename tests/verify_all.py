@@ -495,6 +495,10 @@ def t_read_functions_all_run():
         "get_teacher_month_stats": lambda: db.get_teacher_month_stats(year, month),
         "get_teacher_year_trend": lambda: db.get_teacher_year_trend(year, month),
         "get_credits": lambda: db.get_credits(),
+        "get_student_credit_totals": lambda: db.get_student_credit_totals(
+            [s["ID"] for s in db.get_all_students()[:25]]),
+        "get_student_usage_many": lambda: db.get_student_usage_many(
+            [s["ID"] for s in db.get_all_students()[:25]]),
     }
     broken = []
     for name, fn in calls.items():
@@ -525,6 +529,32 @@ def t_batch_matches_single():
         for key in a:
             assert a[key] == b.get(key), f"invoice {a['ID']} differs on {key}"
     return f"{len(batched)} invoices identical either way"
+
+
+def t_student_batch_matches_single():
+    """The Students screen's figures must not change by being fetched together.
+
+    One row's worth of figures used to cost four queries, so a screen of 25
+    students cost a hundred round trips. They are collected in one pass now,
+    which is only worth doing if it says exactly the same thing.
+    """
+    import db
+
+    ids = [row["ID"] for row in db.get_all_students()][:30]
+    if not ids:
+        return "no students to compare"
+    usage = db.get_student_usage_many(ids)
+    credits = db.get_student_credit_totals(ids)
+    for student_id in ids:
+        assert usage.get(student_id) == db.get_student_usage(student_id), (
+            f"usage differs for student {student_id}"
+        )
+        assert abs(credits.get(student_id, 0.0)
+                   - db.get_student_credit_total(student_id)) < 0.005, (
+            f"credit differs for student {student_id}"
+        )
+    assert db.get_student_usage_many([]) == {} and db.get_student_credit_totals([]) == {}
+    return f"{len(ids)} students' figures identical either way"
 
 
 def t_korean_pdf():
@@ -638,6 +668,7 @@ for name, fn in [
     ("no credentials committed to the repo", t_no_credentials_in_repo),
     ("every read query runs on this backend", t_read_functions_all_run),
     ("batched invoices match single", t_batch_matches_single),
+    ("batched student figures match single", t_student_batch_matches_single),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),
