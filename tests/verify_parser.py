@@ -441,6 +441,16 @@ def t_roster_lines():
     return "commas split, but not a surname from its name; grades and notes taken off names"
 
 
+def t_standard_rate_by_grade():
+    """The academy charges by the grade in the subject's name."""
+    cases = {"G9 Science": 60.0, "G10 Add Math_A": 60.0, "Y4 ACSI Chemi": 60.0,
+             "G11 Econs HL": 65.0, "G12(Y6) Econs SL": 65.0, "Y5 Chemi SL": 65.0,
+             "Grade 7 Eng": 60.0, "Basic Eng": None, "Inter-Mid Eng 북클럽": None}
+    for name, want in cases.items():
+        assert sp.standard_rate(name) == want, (name, sp.standard_rate(name))
+    return "Grade 10 and below $60/h, above $65/h, no grade no price"
+
+
 def t_status_stays_with_student():
     def read(text):
         return [(e["name"], e["status"], e.get("note")) for e in sp.parse_cell(text)["entries"]]
@@ -664,6 +674,7 @@ for name, fn in [
     ("lesson under the time axis", t_late_lesson_below_axis),
     ("'6pm7.30pm' joined times", t_joined_times),
     ("ONLINE day labels", t_online_day_label),
+    ("standard rate by grade", t_standard_rate_by_grade),
     ("status stays with its student", t_status_stays_with_student),
 ]:
     check(name, fn)

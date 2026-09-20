@@ -572,6 +572,40 @@ def t_long_names_fit_their_columns():
     return "long teacher, student and class names trimmed to fit"
 
 
+def t_import_prices_by_grade():
+    """An imported class arrives at the academy's price for its grade.
+
+    Grade 10 and below is $60/h, above it $65/h. A subject whose name says
+    no grade has no standard price and must stay on the placeholder, which
+    billing refuses to issue at -- better a prompt than a figure nobody chose.
+    """
+    import tempfile
+
+    script = (
+        "import datetime as dt, db, schedule_backfill;"
+        "db.initialise_database();"
+        "db.create_teacher('Teacher A');"
+        "teacher = db.get_all_teachers()[0]['ID'];"
+        "lesson = lambda name, day: {'class_name': name, 'date': dt.date(2026, 8, day),"
+        "  'start_time': dt.time(9), 'end_time': dt.time(11), 'warnings': [],"
+        "  'attendance': [{'student_name': 'Seo Yerin', 'status': 'Attending'}]};"
+        "preview = {'sessions': [lesson('G9 Science', 3), lesson('G12 Econs HL', 4),"
+        "                        lesson('Basic Eng', 5)], 'name_reviews': []};"
+        "schedule_backfill.backfill(preview, teacher);"
+        "rates = {row['Class']: row['Hourly Rate'] for row in db.get_all_class_rates()};"
+        "print(rates.get('G9 Science'), rates.get('G12 Econs HL'), rates.get('Basic Eng'))"
+    )
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "rates.db").replace("\\", "/")
+        result = run(["-c", script], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-400:]
+        junior, senior, unnamed = result.stdout.split()
+        assert float(junior) == 60.0, f"G9 priced at {junior}"
+        assert float(senior) == 65.0, f"G12 priced at {senior}"
+        assert float(unnamed) == 1.0, f"a subject with no grade priced at {unnamed}"
+    return "G9 at $60/h, G12 at $65/h, a gradeless subject left unpriced"
+
+
 def t_student_batch_matches_single():
     """The Students screen's figures must not change by being fetched together.
 
@@ -711,6 +745,7 @@ for name, fn in [
     ("batched invoices match single", t_batch_matches_single),
     ("batched student figures match single", t_student_batch_matches_single),
     ("long names fit their columns", t_long_names_fit_their_columns),
+    ("import prices by grade", t_import_prices_by_grade),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

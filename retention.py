@@ -33,14 +33,13 @@ from __future__ import annotations
 import calendar
 import datetime as dt
 import math
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from schedule_parser import CANCELLED, ONLINE, RECORDING, normalise_name
+from schedule_parser import CANCELLED, ONLINE, RECORDING, grade_of, normalise_name
 
 GRACE_MONTHS = 2
 RIDGE = 1.0
@@ -68,19 +67,6 @@ FEATURES = [
     ("summer", "June or July", 1.0, "yes vs no", "summer months", "term time"),
 ]
 FEATURE_KEYS = [feature[0] for feature in FEATURES]
-
-_GRADE_RE = re.compile(r"(?i)(?<![a-z])g(?:rade)?\s?(\d{1,2})(?!\d)")
-_IB_YEAR_RE = re.compile(r"(?i)(?<![a-z])y(\d)(?!\d)")
-_IB_YEAR_GRADE = {3: 9, 4: 10, 5: 11, 6: 12}
-
-
-def grade_of(class_name: str) -> int | None:
-    """The school grade a class name gives: "G11 Econs HL" -> 11, "Y3(G9) ACSI" -> 9."""
-    match = _GRADE_RE.search(class_name or "")
-    if match and 1 <= int(match.group(1)) <= 13:
-        return int(match.group(1))
-    match = _IB_YEAR_RE.search(class_name or "")
-    return _IB_YEAR_GRADE.get(int(match.group(1))) if match else None
 
 
 def month_index(day: dt.date) -> int:

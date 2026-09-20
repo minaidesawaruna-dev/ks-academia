@@ -28,7 +28,7 @@ from collections import defaultdict
 from typing import Any
 
 import db
-from schedule_parser import MERGE_THRESHOLD, _bare, _suffix
+from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, standard_rate
 
 __all__ = [
     "backfill",
@@ -395,10 +395,16 @@ def backfill(
         start_at = 0
         if class_id is None:
             first = class_sessions[0]
+            # The academy's price follows the grade in the subject's name, so
+            # a class that says what grade it teaches arrives priced. One that
+            # does not -- "Basic Eng", a class the sheet never named -- stays
+            # on the placeholder, which billing refuses to issue at, so
+            # somebody has to choose the figure rather than inherit one.
+            standard = standard_rate(class_name)
             outcome = db.create_class_and_first_session(
                 name=class_name,
                 teacher_id=teacher_id,
-                hourly_rate=max(hourly_rate, 0.01),
+                hourly_rate=max(standard or hourly_rate, 0.01),
                 display_color=PALETTE[index % len(PALETTE)],
                 student_ids=roster,
                 session_date=first["date"],

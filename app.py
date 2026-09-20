@@ -950,8 +950,16 @@ def _bulk_rate_section(
                 f"{calendar.month_name[starts.month]} {starts.year}"
             )
         who = f" ({item['Teacher']})" if show_teacher and item.get("Teacher") else ""
+        # What the grade in the subject's name says it costs, when that
+        # differs from what it is on now: the price is a rule, and a screen
+        # that knows the rule should say so rather than leave it to memory.
+        standard = schedule_parser.standard_rate(item["Class"])
+        suggestion = (
+            f" — standard ${standard:,.2f}/h"
+            if standard and abs((month_rate or 0) - standard) > 0.005 else ""
+        )
         checked = st.checkbox(
-            f"{item['Class']}{who} — {rate_text}, {item['Sessions']} session(s)",
+            f"{item['Class']}{who} — {rate_text}, {item['Sessions']} session(s){suggestion}",
             key=f"bulk_rate_pick_{scope}_{class_id}",
         )
         if checked:
@@ -964,6 +972,29 @@ def _bulk_rate_section(
         "New hourly rate ($) for the selected subjects",
         min_value=0.0, step=1.0, key=f"bulk_rate_value_{base}",
     )
+    by_grade = {
+        class_id: schedule_parser.standard_rate(name)
+        for class_id, name in {item["Class ID"]: item["Class"] for item in subjects}.items()
+        if class_id in selected_ids and schedule_parser.standard_rate(name)
+    }
+    if by_grade and st.button(
+        f"Or apply the standard rate by grade to {len(by_grade)} of them "
+        f"(${schedule_parser.JUNIOR_RATE:,.0f}/h to Grade 10 and below, "
+        f"${schedule_parser.SENIOR_RATE:,.0f}/h above)",
+        key=f"bulk_rate_standard_{scope}",
+        width="stretch",
+    ):
+        done = 0
+        for class_id, rate in by_grade.items():
+            if _save_subject_rate(class_id, month_start, rate) in ("created", "updated"):
+                done += 1
+            st.session_state.pop(f"bulk_rate_pick_{scope}_{class_id}", None)
+        st.session_state.pop(f"bulk_rate_all_{scope}", None)
+        if done:
+            st.session_state[f"bulk_rate_gen_{base}"] = generation + 1
+            _flash(f"Priced {done} subject(s) by grade, from "
+                   f"{calendar.month_name[month]} {year} onward.")
+            _rerun()
     if columns[1].button(
         f"Apply to {len(selected_ids)} selected",
         type="primary",

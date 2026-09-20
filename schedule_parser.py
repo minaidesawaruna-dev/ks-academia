@@ -680,6 +680,38 @@ def _is_time_line(line: str) -> bool:
     return remainder == ""
 
 
+# The grade a class name carries, and what the academy charges for it.
+_GRADE_RE = re.compile(r"(?i)(?<![a-z])g(?:rade)?\s?(\d{1,2})(?!\d)")
+_IB_YEAR_RE = re.compile(r"(?i)(?<![a-z])y(\d)(?!\d)")
+_IB_YEAR_GRADE = {3: 9, 4: 10, 5: 11, 6: 12}
+JUNIOR_RATE = 60.0     # Grade 10 and below
+SENIOR_RATE = 65.0     # Grade 11 and above
+
+
+def grade_of(class_name: str) -> int | None:
+    """The school grade a class name gives: "G11 Econs HL" -> 11, "Y3(G9) ACSI" -> 9."""
+    match = _GRADE_RE.search(class_name or "")
+    if match and 1 <= int(match.group(1)) <= 13:
+        return int(match.group(1))
+    match = _IB_YEAR_RE.search(class_name or "")
+    return _IB_YEAR_GRADE.get(int(match.group(1))) if match else None
+
+
+def standard_rate(class_name: str) -> float | None:
+    """The academy's price for a class, from the grade in its name.
+
+    Grade 10 and below is charged at ``JUNIOR_RATE``, Grade 11 and above at
+    ``SENIOR_RATE``. A name with no grade in it -- "Basic Eng", a class the
+    sheet never named -- has no standard price, and ``None`` keeps it on the
+    placeholder so somebody has to choose one rather than have a figure
+    nobody picked go out on an invoice.
+    """
+    grade = grade_of(class_name)
+    if grade is None:
+        return None
+    return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
+
+
 def status_from_line(line: str) -> tuple[str | None, str]:
     """Return ``(status, leftover_text)`` for a possible status label line."""
     for status, pattern in STATUS_PATTERNS:
