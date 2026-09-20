@@ -2946,6 +2946,10 @@ def _retention_report(version: tuple, today: dt.date) -> dict:
 
 
 _EFFECTS = ["Raises the chance of leaving", "Lowers it", "No clear effect"]
+# How much wider than its own bottom a factor's range may run before it is
+# telling nobody anything: a hundredfold. "No clear effect" is a finding and
+# stays; "somewhere between a twenty-thousandth and thirty" is not.
+_UNCLEAR_SPREAD = 100.0
 
 
 def _retention_view() -> None:
@@ -3015,7 +3019,21 @@ def _retention_view() -> None:
     )
 
     st.markdown("#### What goes with leaving")
-    drivers = pd.DataFrame(report["drivers"])
+    # A factor the data cannot pin down at all — a range running from a
+    # twenty-thousandth to thirty — is not a finding, and on a log scale one
+    # of them stretches the axis across seven decades and squashes every
+    # factor that does say something into a thumbnail. Left out until there
+    # are enough leavers to place it, and named below so it is not hidden.
+    telling = [item for item in report["drivers"]
+               if item["high"] <= item["low"] * _UNCLEAR_SPREAD]
+    unplaced = [item["label"] for item in report["drivers"] if item not in telling]
+    if not telling:
+        st.info(
+            "No factor can be placed yet — every one of them has a range too "
+            "wide to mean anything. Add past schedules and this fills in."
+        )
+        return
+    drivers = pd.DataFrame(telling)
     drivers["effect"] = [
         _EFFECTS[0] if low > 1 else _EFFECTS[1] if high < 1 else _EFFECTS[2]
         for low, high in zip(drivers["low"], drivers["high"])
@@ -3054,6 +3072,8 @@ def _retention_view() -> None:
         "Each dot is how much a factor changes the odds of not coming back, with the "
         "others held level; the line is a rough 95% range. Shares are per 25 "
         "percentage points — hover a dot for its unit."
+        + (f" Left out for now, with too few leavers to place them: "
+           f"{', '.join(unplaced).lower()}." if unplaced else "")
     )
     if validation:
         st.caption(
