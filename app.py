@@ -3373,34 +3373,32 @@ def data_tab() -> None:
     columns[1].metric("Hours taught", f"{snapshot['Hours'].sum():,.2f}")
     columns[2].metric("Teachers", len(snapshot))
 
-    st.altair_chart(
-        alt.Chart(snapshot)
-        .mark_arc(innerRadius=60)
-        .encode(
-            theta=alt.Theta("Invoiced:Q"),
-            color=alt.Color("Teacher:N", legend=alt.Legend(title="Teacher")),
-            tooltip=tooltip,
-        ),
-        width="stretch",
-    )
-
-    columns = st.columns(2)
-    for column, field, heading in (
-        (columns[0], "Hours", "Hours taught"),
-        (columns[1], "Students", "Unique students"),
-    ):
-        with column:
-            st.markdown(f"##### {heading}")
-            st.altair_chart(
-                alt.Chart(snapshot)
-                .mark_bar()
-                .encode(
-                    x=alt.X("Teacher:N", sort="-y", title=None),
-                    y=alt.Y(f"{field}:Q", title=None),
-                    tooltip=tooltip,
-                ),
-                width="stretch",
+    # Bars along the ground, longest first, rather than a pie: a name reads
+    # the same whether there are two teachers or forty, where slices become
+    # slivers and a colour key you have to look things up in. Height grows
+    # with the roster so nothing is squeezed.
+    def _by_teacher(field: str, heading: str, money: bool = False) -> None:
+        st.markdown(f"##### {heading}")
+        st.altair_chart(
+            alt.Chart(snapshot)
+            .mark_bar(color="#2a78d6")
+            .encode(
+                y=alt.Y("Teacher:N", sort="-x", title=None,
+                        axis=alt.Axis(labelLimit=0)),
+                x=alt.X(f"{field}:Q", title=None,
+                        axis=alt.Axis(format="$,.0f") if money else alt.Axis()),
+                tooltip=tooltip,
             )
+            .properties(height=max(120, 26 * len(snapshot))),
+            width="stretch",
+        )
+
+    _by_teacher("Invoiced", "Invoiced", money=True)
+    columns = st.columns(2)
+    with columns[0]:
+        _by_teacher("Hours", "Hours taught")
+    with columns[1]:
+        _by_teacher("Students", "Unique students")
 
     st.dataframe(
         [
