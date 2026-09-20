@@ -2983,6 +2983,73 @@ _EFFECTS = ["Raises the chance of leaving", "Lowers it", "No clear effect"]
 _UNCLEAR_SPREAD = 100.0
 
 
+def _drivers_chart(report: dict) -> None:
+    """The model's own reading of what goes with leaving.
+
+    Kept off the page and in here because its strongest factor is nearly
+    circular -- a month with one lesson is usually a student's last -- and
+    because a factor held level against eleven others is easy to misread.
+    The counted version above says the useful part without the caveats.
+    """
+    st.markdown("**What goes with leaving**")
+    # A factor the data cannot pin down at all — a range running from a
+    # twenty-thousandth to thirty — is not a finding, and on a log scale one
+    # of them stretches the axis across seven decades and squashes every
+    # factor that does say something into a thumbnail. Left out until there
+    # are enough leavers to place it, and named below so it is not hidden.
+    telling = [item for item in report["drivers"]
+               if item["high"] <= item["low"] * _UNCLEAR_SPREAD]
+    unplaced = [item["label"] for item in report["drivers"] if item not in telling]
+    if not telling:
+        st.markdown(
+            "No factor can be placed yet — every one of them has a range too "
+            "wide to mean anything. Add past schedules and this fills in."
+        )
+        return
+    drivers = pd.DataFrame(telling)
+    drivers["effect"] = [
+        _EFFECTS[0] if low > 1 else _EFFECTS[1] if high < 1 else _EFFECTS[2]
+        for low, high in zip(drivers["low"], drivers["high"])
+    ]
+    colours = alt.Scale(domain=_EFFECTS, range=["#eb6834", "#2a78d6", "#8a8985"])
+    # Vega-Lite clips labels at 180px by default, which on a narrow window left
+    # every factor reading "Months with the …" and the key "Raises the chance
+    # of leav…". A chart nobody can read is worse than a narrower plot.
+    legend = alt.Legend(title=None, orient="top", labelLimit=0)
+    factor = alt.Y("label:N", title=None, axis=alt.Axis(labelLimit=0),
+                   sort=alt.EncodingSortField("odds_ratio", order="descending"))
+    ranges = alt.Chart(drivers).mark_rule(strokeWidth=2).encode(
+        y=factor,
+        x=alt.X("low:Q", scale=alt.Scale(type="log"),
+                title="Odds of not coming back (1 = no effect, log scale)"),
+        x2="high:Q",
+        color=alt.Color("effect:N", scale=colours, legend=legend),
+    )
+    points = alt.Chart(drivers).mark_circle(size=80, opacity=1).encode(
+        y=factor,
+        x="odds_ratio:Q",
+        color=alt.Color("effect:N", scale=colours, legend=legend),
+        tooltip=[
+            alt.Tooltip("label:N", title="Factor"),
+            alt.Tooltip("per:N", title="Per"),
+            alt.Tooltip("odds_ratio:Q", title="Odds ratio", format=".2f"),
+            alt.Tooltip("low:Q", title="Range from", format=".2f"),
+            alt.Tooltip("high:Q", title="Range to", format=".2f"),
+        ],
+    )
+    no_effect = alt.Chart(pd.DataFrame({"x": [1.0]})).mark_rule(color="#52514e").encode(x="x:Q")
+    st.altair_chart(
+        (ranges + points + no_effect).properties(height=34 * len(drivers)), width="stretch"
+    )
+    st.caption(
+        "Each dot is how much a factor changes the odds of not coming back, with the "
+        "others held level; the line is a rough 95% range. Shares are per 25 "
+        "percentage points — hover a dot for its unit."
+        + (f" Left out for now, with too few leavers to place them: "
+           f"{', '.join(unplaced).lower()}." if unplaced else "")
+    )
+
+
 def _retention_view() -> None:
     st.caption(
         "Who stops coming, and who looks likely to next — learned from every past "
@@ -3090,62 +3157,28 @@ def _retention_view() -> None:
         "finished school and are not counted as leaving."
     )
 
-    st.markdown("#### What goes with leaving")
-    # A factor the data cannot pin down at all — a range running from a
-    # twenty-thousandth to thirty — is not a finding, and on a log scale one
-    # of them stretches the axis across seven decades and squashes every
-    # factor that does say something into a thumbnail. Left out until there
-    # are enough leavers to place it, and named below so it is not hidden.
-    telling = [item for item in report["drivers"]
-               if item["high"] <= item["low"] * _UNCLEAR_SPREAD]
-    unplaced = [item["label"] for item in report["drivers"] if item not in telling]
-    if not telling:
-        st.info(
-            "No factor can be placed yet — every one of them has a range too "
-            "wide to mean anything. Add past schedules and this fills in."
-        )
-        return
-    drivers = pd.DataFrame(telling)
-    drivers["effect"] = [
-        _EFFECTS[0] if low > 1 else _EFFECTS[1] if high < 1 else _EFFECTS[2]
-        for low, high in zip(drivers["low"], drivers["high"])
-    ]
-    colours = alt.Scale(domain=_EFFECTS, range=["#eb6834", "#2a78d6", "#8a8985"])
-    # Vega-Lite clips labels at 180px by default, which on a narrow window left
-    # every factor reading "Months with the …" and the key "Raises the chance
-    # of leav…". A chart nobody can read is worse than a narrower plot.
-    legend = alt.Legend(title=None, orient="top", labelLimit=0)
-    factor = alt.Y("label:N", title=None, axis=alt.Axis(labelLimit=0),
-                   sort=alt.EncodingSortField("odds_ratio", order="descending"))
-    ranges = alt.Chart(drivers).mark_rule(strokeWidth=2).encode(
-        y=factor,
-        x=alt.X("low:Q", scale=alt.Scale(type="log"),
-                title="Odds of not coming back (1 = no effect, log scale)"),
-        x2="high:Q",
-        color=alt.Color("effect:N", scale=colours, legend=legend),
-    )
-    points = alt.Chart(drivers).mark_circle(size=80, opacity=1).encode(
-        y=factor,
-        x="odds_ratio:Q",
-        color=alt.Color("effect:N", scale=colours, legend=legend),
-        tooltip=[
-            alt.Tooltip("label:N", title="Factor"),
-            alt.Tooltip("per:N", title="Per"),
-            alt.Tooltip("odds_ratio:Q", title="Odds ratio", format=".2f"),
-            alt.Tooltip("low:Q", title="Range from", format=".2f"),
-            alt.Tooltip("high:Q", title="Range to", format=".2f"),
-        ],
-    )
-    no_effect = alt.Chart(pd.DataFrame({"x": [1.0]})).mark_rule(color="#52514e").encode(x="x:Q")
+    st.markdown("#### When a student is drifting")
+    drift = pd.DataFrame(report["by_lessons"])
     st.altair_chart(
-        (ranges + points + no_effect).properties(height=34 * len(drivers)), width="stretch"
+        alt.Chart(drift)
+        .mark_bar(color="#eb6834")
+        .encode(
+            x=alt.X("label:N", sort=list(drift["label"]), title="Lessons that month"),
+            y=alt.Y("share:Q", title="Was their last month", axis=alt.Axis(format="%")),
+            tooltip=[alt.Tooltip("label:N", title="Lessons that month"),
+                     alt.Tooltip("months:Q", title="Student-months"),
+                     alt.Tooltip("last:Q", title="Never came back"),
+                     alt.Tooltip("share:Q", title="Share", format=".1%")],
+        )
+        .properties(height=220),
+        width="stretch",
     )
+    thin, thick = report["by_lessons"][0], report["by_lessons"][-1]
     st.caption(
-        "Each dot is how much a factor changes the odds of not coming back, with the "
-        "others held level; the line is a rough 95% range. Shares are per 25 "
-        "percentage points — hover a dot for its unit."
-        + (f" Left out for now, with too few leavers to place them: "
-           f"{', '.join(unplaced).lower()}." if unplaced else "")
+        f"Counted, not modelled: a month with {thin['label']} lesson was a student's "
+        f"last {thin['share']:.0%} of the time ({thin['last']} of {thin['months']}), "
+        f"against {thick['share']:.0%} for {thick['label']} lessons. A student whose "
+        "lessons thin out is the one to ring."
     )
     if validation:
         st.caption(
@@ -3169,6 +3202,11 @@ def _retention_view() -> None:
                     "Months with us": row["months"],
                     "Last lessons": f"{row['lessons']} in {row['last_month']}",
                     "Usual per month": row["usual"],
+                    "Last seen": (
+                        f"{row['last_seen']:%d %b} "
+                        f"({(dt.date.today() - row['last_seen']).days} days ago)"
+                        if row["last_seen"] else "—"
+                    ),
                     "Chance of not returning": f"{row['risk']:.0%}",
                     "Why": ", ".join(row["reasons"]) or "—",
                 }
@@ -3192,6 +3230,7 @@ def _retention_view() -> None:
         st.caption(f"{report['graduating']} Grade 12 student(s) finishing school are left out.")
 
     with st.expander("How this works"):
+        _drivers_chart(report)
         sources = report["sources"]
         st.markdown(
             f"- **Data:** {sources['app']:,} student-lessons from the app and "
@@ -3410,7 +3449,13 @@ def data_tab() -> None:
     columns = st.columns(3)
     columns[0].metric("Invoiced", f"${snapshot['Invoiced'].sum():,.2f}")
     columns[1].metric("Hours taught", f"{snapshot['Hours'].sum():,.2f}")
-    columns[2].metric("Teachers", len(snapshot))
+    hours = float(snapshot["Hours"].sum())
+    columns[2].metric(
+        "Per teaching hour",
+        f"${snapshot['Invoiced'].sum() / hours:,.0f}" if hours else "—",
+        help="Invoiced divided by hours taught. A class of six earns six "
+             "students' rates in one hour of a teacher's time.",
+    )
 
     # Bars along the ground, longest first, rather than a pie: a name reads
     # the same whether there are two teachers or forty, where slices become
@@ -3433,11 +3478,6 @@ def data_tab() -> None:
         )
 
     _by_teacher("Invoiced", "Invoiced", money=True)
-    columns = st.columns(2)
-    with columns[0]:
-        _by_teacher("Hours", "Hours taught")
-    with columns[1]:
-        _by_teacher("Students", "Unique students")
 
     st.dataframe(
         [

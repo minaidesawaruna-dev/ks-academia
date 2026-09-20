@@ -225,6 +225,29 @@ def by_month(rows: list[dict], latest: int) -> list[dict[str, Any]]:
     return out
 
 
+def by_lessons(rows: list[dict], most: int = 5) -> list[dict[str, Any]]:
+    """How often a month with so many lessons turned out to be a student's last.
+
+    Plain counting, no model: the one thing on the page a person can act on
+    without taking anything on trust.
+    """
+    buckets: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if row["label"] is None:
+            continue
+        count = min(int(row["attended"]), most)
+        bucket = buckets.setdefault(count, {"lessons": count, "months": 0, "last": 0})
+        bucket["months"] += 1
+        bucket["last"] += row["label"]
+    out = []
+    for count in sorted(buckets):
+        bucket = buckets[count]
+        bucket["share"] = bucket["last"] / bucket["months"] if bucket["months"] else 0.0
+        bucket["label"] = f"{count}+" if count == most else str(count)
+        out.append(bucket)
+    return out
+
+
 def _lesson_key(row: dict) -> tuple:
     return (row["teacher"].casefold(), row["date"], row["start"], row["class_name"].casefold())
 
@@ -430,6 +453,15 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
         if lesson["date"] > as_of and lesson["status"] != CANCELLED
     }
     waiting = [row for row in current if row["key"] not in came_back]
+    # When each of them was last in, so the screen can say how long it has
+    # been rather than only which month it was.
+    last_seen: dict[str, dt.date] = {}
+    for lesson in lessons:
+        if lesson["status"] == CANCELLED:
+            continue
+        key = normalise_name(lesson["student"])
+        if lesson["date"] > last_seen.get(key, dt.date.min):
+            last_seen[key] = lesson["date"]
     at_risk = []
     expected = 0.0
     if waiting:
@@ -450,6 +482,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
                 "last_month": month_label(row["month"]),
                 "lessons": row["attended"],
                 "usual": round(row["usual"], 1),
+                "last_seen": last_seen.get(row["key"]),
                 "risk": float(risk[index]),
                 "reasons": reasons,
             })
@@ -465,6 +498,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
         "graduating": len(recent) - len(current),
         "expected_leavers": expected,
         "months": months,
+        "by_lessons": by_lessons(labelled),
         "km": curve,
         "median_months": median,
         "drivers": odds_ratios(model),
