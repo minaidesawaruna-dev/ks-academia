@@ -685,8 +685,22 @@ def initialise_database():
     backfill_invoice_payments()
 
 
+def _fit(value, column):
+    """A value trimmed to the column it is going into.
+
+    Postgres refuses an over-long value outright where SQLite quietly stores
+    it, so a class name 700 characters long out of somebody's spreadsheet
+    would fail the whole import on the deployed app while every local test
+    passed. Trimmed here, before the duplicate checks, so a name and its
+    trimmed twin cannot both be written and collide.
+    """
+    text = str(value or "").strip()
+    limit = getattr(column.type, "length", None)
+    return text[:limit] if limit else text
+
+
 def create_teacher(name):
-    cleaned_name = name.strip()
+    cleaned_name = _fit(name, Teacher.name)
     if not cleaned_name:
         return False
 
@@ -731,7 +745,7 @@ def update_teacher_status(teacher_id, is_active):
 
 
 def update_teacher_name(teacher_id, new_name):
-    cleaned_name = new_name.strip()
+    cleaned_name = _fit(new_name, Teacher.name)
     if not cleaned_name:
         return "invalid"
 
@@ -757,8 +771,8 @@ def update_teacher_name(teacher_id, new_name):
 def _get_or_create_parent(session, name, phone):
     """Return a matching parent, or create one inside the current transaction."""
 
-    cleaned_name = name.strip()
-    cleaned_phone = phone.strip()
+    cleaned_name = _fit(name, Parent.name)
+    cleaned_phone = _fit(phone, Parent.phone)
     if not cleaned_name or not cleaned_phone:
         return None
 
@@ -780,7 +794,7 @@ def _get_or_create_parent(session, name, phone):
 
 
 def create_student(full_name, parent_name, parent_phone):
-    cleaned_name = full_name.strip()
+    cleaned_name = _fit(full_name, Student.full_name)
     if not cleaned_name:
         return "invalid"
 
@@ -805,7 +819,7 @@ def create_student(full_name, parent_name, parent_phone):
 def create_quick_student(full_name):
     """Create a student name from Scheduling; family details can be added later."""
 
-    cleaned_name = full_name.strip()
+    cleaned_name = _fit(full_name, Student.full_name)
     if not cleaned_name:
         return "invalid"
 
@@ -866,7 +880,7 @@ def get_all_students():
 
 
 def update_student(student_id, new_name, parent_name, parent_phone):
-    cleaned_name = new_name.strip()
+    cleaned_name = _fit(new_name, Student.full_name)
     if not cleaned_name:
         return "invalid"
 
@@ -1305,7 +1319,7 @@ def update_scheduling_class(
 ):
     """Update a reusable class and start a new price period when required."""
 
-    cleaned_name = name.strip()
+    cleaned_name = _fit(name, AcademyClass.name)
     if (
         not cleaned_name
         or hourly_rate <= 0
@@ -1427,7 +1441,7 @@ def create_class_and_first_session(
 ):
     """Create a reusable class and its first timetable slot in one transaction."""
 
-    cleaned_name = name.strip()
+    cleaned_name = _fit(name, AcademyClass.name)
     if (
         not cleaned_name
         or hourly_rate <= 0
@@ -2838,8 +2852,11 @@ def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
             hours = _class_hours(lesson)
             hourly = _rate_lookup(rate_index, lesson.class_id, lesson.session_date)
             item.invoice_id = target.id
-            item.class_name = academy_class.name if academy_class else ""
-            item.teacher_name = teacher.name if teacher else ""
+            # A class name may be longer than the line it is frozen onto.
+            item.class_name = _fit(academy_class.name if academy_class else "",
+                                   InvoiceItem.class_name)
+            item.teacher_name = _fit(teacher.name if teacher else "",
+                                     InvoiceItem.teacher_name)
             item.teacher_id = lesson.teacher_id
             item.session_date = lesson.session_date
             item.hours = hours

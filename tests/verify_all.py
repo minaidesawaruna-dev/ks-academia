@@ -531,6 +531,47 @@ def t_batch_matches_single():
     return f"{len(batched)} invoices identical either way"
 
 
+def t_long_names_fit_their_columns():
+    """A name out of a spreadsheet must fit the column it is stored in.
+
+    Postgres rejects an over-long value outright; SQLite keeps it. A teacher
+    who writes a paragraph where the subject goes would therefore import
+    fine in testing and break the deployed app, so the trimming is checked
+    against the columns themselves, in a throwaway database.
+    """
+    import tempfile
+
+    script = (
+        "import db;"
+        "long_name = 'Very Long Name ' * 60;"
+        "db.initialise_database();"
+        "assert db.create_teacher(long_name) is True;"
+        "assert db.create_quick_student(long_name) == 'created';"
+        "teacher = db.get_all_teachers()[0];"
+        "student = db.get_all_students()[0];"
+        "outcome = db.create_class_and_first_session("
+        "    name=long_name, teacher_id=teacher['ID'], hourly_rate=65,"
+        "    display_color='#2a78d6', student_ids=[student['ID']],"
+        "    session_date=__import__('datetime').date(2026, 8, 3),"
+        "    start_time=__import__('datetime').time(9),"
+        "    end_time=__import__('datetime').time(11), status='Completed', note='',"
+        "    attendance_rows=[{'student_id': student['ID'], 'is_online': False,"
+        "                      'has_recording': False, 'is_cancelled': False, 'note': ''}]);"
+        "academy_class = db.get_all_classes()[0];"
+        "limits = {c.name: c.type.length for m in (db.Teacher, db.Student, db.AcademyClass)"
+        "          for c in m.__table__.columns if getattr(c.type, 'length', None)};"
+        "print(outcome, len(teacher['Name']) <= limits['name'],"
+        "      len(student['Name']) <= limits['full_name'],"
+        "      len(academy_class['Class']) <= limits['name'])"
+    )
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "fit.db").replace("\\", "/")
+        result = run(["-c", script], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-400:]
+        assert result.stdout.split() == ["created", "True", "True", "True"], result.stdout
+    return "long teacher, student and class names trimmed to fit"
+
+
 def t_student_batch_matches_single():
     """The Students screen's figures must not change by being fetched together.
 
@@ -669,6 +710,7 @@ for name, fn in [
     ("every read query runs on this backend", t_read_functions_all_run),
     ("batched invoices match single", t_batch_matches_single),
     ("batched student figures match single", t_student_batch_matches_single),
+    ("long names fit their columns", t_long_names_fit_their_columns),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),
