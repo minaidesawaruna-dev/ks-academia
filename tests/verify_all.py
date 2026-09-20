@@ -380,6 +380,49 @@ def t_login_fails_closed():
     return "refuses to open without valid [auth] secrets"
 
 
+def t_login_cookie_read_from_browser():
+    """The stay-signed-in cookie must be read even when the host hides it.
+
+    Streamlit Community Cloud strips cookies before a request reaches the
+    app, so the library's header-based lookup finds nothing there and every
+    visit starts at the sign-in form. The gate falls back to the browser-side
+    component. Here the headers are empty (bare mode) and a stub stands in
+    for the component, so this exercises exactly the deployed path -- and
+    checks that the fallback still rejects a forged or expired cookie.
+    """
+    import time
+    import types
+    import jwt
+    import auth
+    import inspect
+
+    src = inspect.getsource(auth.require_login)
+    assert "_read_cookie_from_browser" in src, "cookie fallback is not wired in"
+
+    # 32+ bytes, or PyJWT warns about a short HMAC key on every run.
+    key = "verification-only-key-" + "x" * 32
+    other = "some-other-key-" + "y" * 32
+    good = jwt.encode({"username": "ada", "exp_date": time.time() + 3600},
+                      key, algorithm="HS256")
+    stale = jwt.encode({"username": "ada", "exp_date": time.time() - 1},
+                       key, algorithm="HS256")
+    forged = jwt.encode({"username": "ada", "exp_date": time.time() + 3600},
+                        other, algorithm="HS256")
+
+    def model_with(value):
+        manager = types.SimpleNamespace(get=lambda name: value if name == "c" else None)
+        return types.SimpleNamespace(cookie_name="c", cookie_key=key,
+                                     cookie_manager=manager)
+
+    got = auth._read_cookie_from_browser(model_with(good))()
+    assert got and got["username"] == "ada", f"valid cookie rejected: {got!r}"
+    assert auth._read_cookie_from_browser(model_with(stale))() is None, "expired cookie accepted"
+    assert auth._read_cookie_from_browser(model_with(forged))() is None, "forged cookie accepted"
+    assert auth._read_cookie_from_browser(model_with(None))() is None, "no cookie but signed in"
+    assert auth._read_cookie_from_browser(model_with("not a token"))() is None, "garbage accepted"
+    return "cookie read via the browser component; stale, forged and absent cookies refused"
+
+
 def t_no_credentials_in_repo():
     """No password or hash may be committed."""
     import subprocess
@@ -591,6 +634,7 @@ for name, fn in [
     ("duplicate filenames handled", t_zip_unique_names),
     ("login gate runs before any data", t_login_gate_runs_first),
     ("login fails closed if misconfigured", t_login_fails_closed),
+    ("login cookie read via the browser", t_login_cookie_read_from_browser),
     ("no credentials committed to the repo", t_no_credentials_in_repo),
     ("every read query runs on this backend", t_read_functions_all_run),
     ("batched invoices match single", t_batch_matches_single),

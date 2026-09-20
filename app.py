@@ -3010,19 +3010,23 @@ def _retention_view() -> None:
         for low, high in zip(drivers["low"], drivers["high"])
     ]
     colours = alt.Scale(domain=_EFFECTS, range=["#eb6834", "#2a78d6", "#8a8985"])
-    factor = alt.Y("label:N", title=None,
+    # Vega-Lite clips labels at 180px by default, which on a narrow window left
+    # every factor reading "Months with the …" and the key "Raises the chance
+    # of leav…". A chart nobody can read is worse than a narrower plot.
+    legend = alt.Legend(title=None, orient="top", labelLimit=0)
+    factor = alt.Y("label:N", title=None, axis=alt.Axis(labelLimit=0),
                    sort=alt.EncodingSortField("odds_ratio", order="descending"))
     ranges = alt.Chart(drivers).mark_rule(strokeWidth=2).encode(
         y=factor,
         x=alt.X("low:Q", scale=alt.Scale(type="log"),
                 title="Odds of not coming back (1 = no effect, log scale)"),
         x2="high:Q",
-        color=alt.Color("effect:N", scale=colours, legend=alt.Legend(title=None, orient="top")),
+        color=alt.Color("effect:N", scale=colours, legend=legend),
     )
     points = alt.Chart(drivers).mark_circle(size=80, opacity=1).encode(
         y=factor,
         x="odds_ratio:Q",
-        color=alt.Color("effect:N", scale=colours, legend=alt.Legend(title=None, orient="top")),
+        color=alt.Color("effect:N", scale=colours, legend=legend),
         tooltip=[
             alt.Tooltip("label:N", title="Factor"),
             alt.Tooltip("per:N", title="Per"),

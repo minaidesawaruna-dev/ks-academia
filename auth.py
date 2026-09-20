@@ -32,14 +32,70 @@ should never be typed into a settings page, a file, or a chat window.
 from __future__ import annotations
 
 import sys
-from typing import Any
+import time
+from typing import Any, Callable
 
+import jwt
 import streamlit as st
 import streamlit_authenticator as stauth
 
 
 COOKIE_NAME_DEFAULT = "ks_academia_auth"
 COOKIE_EXPIRY_DAYS_DEFAULT = 30.0
+
+
+def _read_cookie_from_browser(model: Any) -> Callable[[], Any]:
+    """Build a replacement for the library's cookie lookup that asks the browser.
+
+    streamlit-authenticator 0.4 reads the "stay signed in" cookie out of
+    ``st.context.cookies`` -- the headers of the request that opened the
+    page. That works on a laptop. It does not work on Streamlit Community
+    Cloud, whose proxy strips cookies before the request reaches the app, so
+    the cookie the library set the day before is never seen again and every
+    admin is asked to sign in on every visit. The library's *setting* of the
+    cookie still works, because that goes through a small JavaScript
+    component in the page; only the reading was moved to the headers.
+
+    So: read the headers first, which is free and correct locally, and when
+    they carry nothing ask that same component, which reads the cookie in the
+    browser and sends it back. The validation that follows is the library's
+    own -- signature checked with the secret key, expiry compared to now --
+    so a forged or stale cookie still fails.
+
+    The component answers on the run *after* it is drawn, which is why the
+    library sleeps briefly before deciding nobody is signed in; nothing here
+    changes that. ``model`` is the library's CookieModel; only its cookie
+    name, secret key and component are used.
+    """
+
+    def get_cookie() -> Any:
+        if st.session_state.get("logout"):
+            return False
+        token = None
+        try:
+            token = st.context.cookies.get(model.cookie_name)
+        except Exception:  # noqa: BLE001 - no request context, e.g. in a test
+            token = None
+        if not token:
+            try:
+                token = model.cookie_manager.get(model.cookie_name)
+            except Exception:  # noqa: BLE001 - component not ready or absent
+                token = None
+        if not token:
+            return None
+        try:
+            decoded = jwt.decode(token, model.cookie_key, algorithms=["HS256"])
+        except jwt.PyJWTError:
+            return None
+        if (
+            isinstance(decoded, dict)
+            and "username" in decoded
+            and float(decoded.get("exp_date", 0)) > time.time()
+        ):
+            return decoded
+        return None
+
+    return get_cookie
 
 
 def _plain(value: Any) -> Any:
@@ -116,6 +172,17 @@ def require_login() -> stauth.Authenticate:
         # would hash the hash and nobody would ever be able to sign in.
         auto_hash=False,
     )
+
+    # Without this, the deployed app forgets everyone between visits: the
+    # host never lets the library see the cookie it set. See the helper.
+    # Reaching into the library's internals is the price of fixing it from
+    # out here, so a version that moves them costs only the convenience of
+    # staying signed in -- never the ability to sign in at all.
+    try:
+        cookie_model = authenticator.cookie_controller.cookie_model
+        cookie_model.get_cookie = _read_cookie_from_browser(cookie_model)
+    except AttributeError as error:  # a streamlit-authenticator that is put together differently
+        print(f"[auth] stay-signed-in is off: {error}", file=sys.stderr)
 
     authenticator.login(
         location="main",

@@ -15,6 +15,11 @@ psycopg2-binary==2.9.12
 # running app on its internal path, so access control lives in the app.
 streamlit-authenticator==0.4.2
 
+# Comes with streamlit-authenticator, and pinned here as well because auth.py
+# checks the stay-signed-in cookie itself -- the host hides that cookie from
+# the library, so the gate reads and validates it through the browser instead.
+PyJWT==2.13.0
+
 # Renders invoices to PDF without a browser, which is what makes invoice
 # export work on a host that cannot install Chromium. Pure Python -- it
 # pulls in reportlab and nothing outside pip -- so there is deliberately no
