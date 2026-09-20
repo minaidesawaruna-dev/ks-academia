@@ -2977,7 +2977,9 @@ def _retention_view() -> None:
     )
     columns[2].metric(
         "Expected not to return", f"{report['expected_leavers']:.0f}",
-        help="Every current student's chance of not coming back, added up.",
+        help="Added up over the current students who have not been in yet this "
+        f"month. The {report['came_back']} who already have are left out — they "
+        "have come back, whatever the model made of their last full month.",
     )
     columns[3].metric(
         "Model check", f"{validation['auc']:.2f}" if validation else "—",
@@ -3108,9 +3110,14 @@ def _retention_view() -> None:
         st.caption(
             "A chance, not a verdict. The reasons are what raises each student's odds "
             "most compared with a typical student."
+            + (f" {report['came_back']} student(s) have already been in this month "
+               "and are not listed." if report["came_back"] else "")
         )
     else:
-        st.caption("No current students to score.")
+        st.caption(
+            f"Every current student has already been in this month."
+            if report["came_back"] else "No current students to score."
+        )
     if report["graduating"]:
         st.caption(f"{report['graduating']} Grade 12 student(s) finishing school are left out.")
 

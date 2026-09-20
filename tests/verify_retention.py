@@ -194,6 +194,36 @@ def t_report_finds_planted_effect():
             f"AUC {validation['auc']:.2f}")
 
 
+def t_a_student_who_came_back_is_not_at_risk():
+    """Somebody who sat in class this month is not "likely not to come back".
+
+    The month in progress is kept out of the model, because halfway through it
+    everyone looks as if they came to half their usual lessons. It is still
+    evidence that a student came back, and a list naming students who were in
+    on Tuesday is a list nobody reads twice.
+    """
+    lessons = _simulated()
+    today = dt.date(2025, 12, 31)
+    as_of = dt.date(2025, 11, 30)
+    report = rt.retention_report(lessons, today)
+    seen_since = {rt.normalise_name(item["student"]) for item in lessons
+                  if item["date"] > as_of and item["status"] != rt.CANCELLED}
+    listed = [row["student"] for row in report["at_risk"]]
+    assert not [name for name in listed if rt.normalise_name(name) in seen_since], listed
+    assert report["came_back"] > 0, "nobody came back in December, so this proves nothing"
+
+    # Now bring the top one back in, and they should drop off the list.
+    top = report["at_risk"][0]["student"]
+    came_in = [lesson(top, dt.date(2025, 12, 9), teacher="Teacher A", hour=9)]
+    after = rt.retention_report(lessons + came_in, today)
+    assert top not in [row["student"] for row in after["at_risk"]], f"{top} came in on 9 Dec"
+    assert after["came_back"] == report["came_back"] + 1, (after["came_back"], report["came_back"])
+    assert after["expected_leavers"] < report["expected_leavers"], (
+        after["expected_leavers"], report["expected_leavers"])
+    assert after["current"] == report["current"], "they are still a current student"
+    return "a student seen this month drops off the list and out of the expected count"
+
+
 def t_too_little_data():
     report = rt.retention_report(monthly("Nam Jihoon", 2025, 1, 3), dt.date(2025, 12, 31))
     assert not report["enough"] and "Past schedules" in report["message"], report
@@ -255,6 +285,7 @@ for name, fn in [
     ("no look-ahead in features", t_no_look_ahead),
     ("features as defined", t_features),
     ("planted effect recovered", t_report_finds_planted_effect),
+    ("a student who came back is not at risk", t_a_student_who_came_back_is_not_at_risk),
     ("too little data", t_too_little_data),
     ("past-schedules store", t_history_store),
     ("app wins over past schedules", t_combine_prefers_app),

@@ -399,15 +399,26 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
     latest = month_index(as_of)
     recent = [row for row in last_rows if row["label"] is None and row["month"] >= latest - 1]
     current = [row for row in recent if not row["graduating"]]
+    # The month in progress is kept out of the model, because halfway through
+    # it everybody looks as though they came to half their usual lessons. It
+    # is still evidence of one thing: a student who sat in class this week has
+    # come back. Naming them as likely to leave is how a list stops being
+    # believed, so they are set aside here and counted separately.
+    came_back = {
+        normalise_name(lesson["student"])
+        for lesson in lessons
+        if lesson["date"] > as_of and lesson["status"] != CANCELLED
+    }
+    waiting = [row for row in current if row["key"] not in came_back]
     at_risk = []
     expected = 0.0
-    if current:
-        X = _matrix(current)
+    if waiting:
+        X = _matrix(waiting)
         risk = model.probability(X)
         pushes = model.contributions(X)
         expected = float(risk.sum())
         for index in np.argsort(-risk)[:AT_RISK_ROWS]:
-            row = current[index]
+            row = waiting[index]
             reasons = [
                 FEATURES[f][4] if X[index, f] > model.mean[f] else FEATURES[f][5]
                 for f in np.argsort(-pushes[index])[:2] if pushes[index, f] > 0.1
@@ -430,6 +441,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
         "labelled": len(labelled),
         "leavers": leavers,
         "current": len(current),
+        "came_back": len(current) - len(waiting),
         "graduating": len(recent) - len(current),
         "expected_leavers": expected,
         "km": curve,
