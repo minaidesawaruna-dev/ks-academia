@@ -3050,6 +3050,33 @@ def _drivers_chart(report: dict) -> None:
     )
 
 
+# A month's share of leavers is drawn only once this many students are on
+# record in it: out of three students, one leaving reads as 33%.
+_CHART_FLOOR = 30
+
+
+def _chartable_months(months: list[dict]) -> tuple[pd.DataFrame, int]:
+    """The months worth charting, with any month missing from the records shown empty.
+
+    Starts from the month after which every month has ``_CHART_FLOOR``
+    students, so a few teachers' older sheets don't fill half the axis with a
+    line swinging between 0% and 50%. Returns the biggest month left out (0
+    when none was). A month with no lessons on record at all is put back as
+    an empty bar rather than skipped, so a gap in the schedules shows as one.
+    """
+    start = next((i for i in range(len(months))
+                  if all(m["active"] >= _CHART_FLOOR for m in months[i:])), 0)
+    thin = max((m["active"] for m in months[:start]), default=0)
+    kept = {m["month"]: m for m in months[start:]}
+    filled = []
+    for index in range(min(kept), max(kept) + 1):
+        filled.append(kept.get(index) or {
+            "month": index, "label": retention.month_label(index), "active": 0,
+            "joined": 0, "left": 0, "unknown": 0, "settled": False, "left_share": 0.0,
+        })
+    return pd.DataFrame(filled), thin
+
+
 def _days_ago(day: dt.date | None) -> str:
     if not day:
         return "—"
@@ -3097,12 +3124,12 @@ def _retention_view() -> None:
     # answers "how long do they stay" and cannot answer "is it getting
     # worse". This is the academy's own calendar: who was taught, and what
     # share of them never came back.
-    months = pd.DataFrame(report["months"])
+    months, thin = _chartable_months(report["months"])
     order = list(months["label"])
     shared = alt.X("label:N", sort=order, title=None)
     tips = [alt.Tooltip("label:N", title="Month"),
             alt.Tooltip("active:Q", title="Students taught"),
-            alt.Tooltip("joined:Q", title="New that month"),
+            alt.Tooltip("joined:Q", title="First on record"),
             alt.Tooltip("left:Q", title="Never came back")]
     taught = alt.Chart(months).mark_bar(color="#cfe2f3").encode(
         x=shared,
@@ -3129,6 +3156,9 @@ def _retention_view() -> None:
         + (f" {' and '.join(unsettled)} have no line yet — a student who has "
            "simply not been in for a few weeks cannot be told from one who has "
            "left until two months have passed." if unsettled else "")
+        + (f" Starts {order[0]}: before then no month has more than {thin} "
+           "students on record, too few for a share to mean anything. Those "
+           "months still count in the model." if thin else "")
     )
 
     st.markdown("#### How long students stay")
@@ -3139,7 +3169,7 @@ def _retention_view() -> None:
         alt.Chart(pd.DataFrame([point for point in report["km"] if point["at_risk"] >= 10]))
         .mark_line(interpolate="step-after", strokeWidth=2, color="#2a78d6")
         .encode(
-            x=alt.X("month:Q", title="Months since first lesson", axis=alt.Axis(tickMinStep=1)),
+            x=alt.X("month:Q", title="Months since first lesson on record", axis=alt.Axis(tickMinStep=1)),
             y=alt.Y("retained:Q", title="Still enrolled", axis=alt.Axis(format="%"),
                     scale=alt.Scale(domain=[0, 1])),
             tooltip=[
@@ -3156,9 +3186,16 @@ def _retention_view() -> None:
     )
     st.altair_chart((line + half).properties(height=280), width="stretch")
     median = report["median_months"]
+    followed = next((point["at_risk"] for point in report["km"]
+                     if point["month"] == median), 0)
     st.caption(
-        (f"Half of students have left by month {median}. " if median else
+        (f"Half of students have left by month {median}"
+         + (f", though only {followed} students are still followed that far, so "
+            "read the right-hand end as a rough guide. " if followed < 50 else ". ")
+         if median else
          "More than half of students are still enrolled at the longest stay observed. ")
+        + "Months count from a student's first lesson on record, so one who "
+        "joined before their teacher's schedules begin is counted from there. "
         + f"Leaving means no lesson for {report['grace_months']} months and never "
         "coming back. Grade 12 students whose last lesson is in May or June have "
         "finished school and are not counted as leaving."
