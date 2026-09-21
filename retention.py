@@ -35,11 +35,19 @@ import datetime as dt
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import numpy as np
 
-from schedule_parser import CANCELLED, ONLINE, RECORDING, grade_of, normalise_name
+import schedule_parser
+from schedule_parser import CANCELLED, ONLINE, RECORDING
+
+# The same few thousand names and class names come round once per lesson, and
+# the report reads each lesson several times over; at twenty times this
+# academy's history, cleaning names up again was half the time it took.
+normalise_name = lru_cache(maxsize=65536)(schedule_parser.normalise_name)
+grade_of = lru_cache(maxsize=4096)(schedule_parser.grade_of)
 
 GRACE_MONTHS = 2
 RIDGE = 1.0

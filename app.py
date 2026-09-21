@@ -3050,6 +3050,13 @@ def _drivers_chart(report: dict) -> None:
     )
 
 
+def _days_ago(day: dt.date | None) -> str:
+    if not day:
+        return "—"
+    days = (dt.date.today() - day).days
+    return f"{day:%d %b} ({days} day{'' if days == 1 else 's'} ago)"
+
+
 def _retention_view() -> None:
     st.caption(
         "Who stops coming, and who looks likely to next — learned from every past "
@@ -3175,8 +3182,9 @@ def _retention_view() -> None:
     )
     thin, thick = report["by_lessons"][0], report["by_lessons"][-1]
     st.caption(
-        f"Counted, not modelled: a month with {thin['label']} lesson was a student's "
-        f"last {thin['share']:.0%} of the time ({thin['last']} of {thin['months']}), "
+        f"Counted, not modelled: a month with {thin['label']} "
+        f"lesson{'' if thin['label'] == '1' else 's'} was a student's "
+        f"last {thin['share']:.0%} of the time ({thin['last']:,} of {thin['months']:,}), "
         f"against {thick['share']:.0%} for {thick['label']} lessons. A student whose "
         "lessons thin out is the one to ring."
     )
@@ -3202,11 +3210,7 @@ def _retention_view() -> None:
                     "Months with us": row["months"],
                     "Last lessons": f"{row['lessons']} in {row['last_month']}",
                     "Usual per month": row["usual"],
-                    "Last seen": (
-                        f"{row['last_seen']:%d %b} "
-                        f"({(dt.date.today() - row['last_seen']).days} days ago)"
-                        if row["last_seen"] else "—"
-                    ),
+                    "Last seen": _days_ago(row["last_seen"]),
                     "Chance of not returning": f"{row['risk']:.0%}",
                     "Why": ", ".join(row["reasons"]) or "—",
                 }
