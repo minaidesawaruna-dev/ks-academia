@@ -3750,6 +3750,11 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
     frozen on it, so a line still reports correctly even if its class was
     later edited or removed. The teacher is matched by the frozen *id*, not
     the frozen name -- a rename must not make an already-paid month vanish.
+
+    ``Lesson hours`` is the teacher's time behind that money: each invoiced
+    lesson once, however many students it was billed to. Dividing by every
+    hour on the timetable instead would count lessons not billed yet as time
+    that earned nothing.
     """
     if not teacher_ids:
         return {}
@@ -3758,8 +3763,11 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
         select(
             InvoiceItem.teacher_id,
             InvoiceItem.session_date,
+            InvoiceItem.session_id,
+            InvoiceItem.class_name,
             func.sum(InvoiceItem.amount),
             func.sum(InvoiceItem.hours),
+            func.max(InvoiceItem.hours),
         )
         .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
         .where(
@@ -3768,11 +3776,17 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
             InvoiceItem.session_date >= first_day,
             InvoiceItem.session_date <= last_day,
         )
-        .group_by(InvoiceItem.teacher_id, InvoiceItem.session_date)
+        .group_by(
+            InvoiceItem.teacher_id,
+            InvoiceItem.session_date,
+            InvoiceItem.session_id,
+            InvoiceItem.class_name,
+        )
     ).all()
 
     buckets: dict[tuple[int, int, int], dict] = {}
-    for teacher_id, when, amount, hours in rows:
+    lessons: dict[tuple[int, int, int], dict] = defaultdict(dict)
+    for teacher_id, when, session_id, class_name, amount, hours, longest in rows:
         if teacher_id is None:
             continue
         when = _as_day(when)
@@ -3782,6 +3796,12 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
             bucket = buckets[key] = {"Earnings": 0.0, "Hours": 0.0}
         bucket["Earnings"] += float(amount or 0.0)
         bucket["Hours"] += float(hours or 0.0)
+        # A lesson whose class was since deleted has lost its id; its date
+        # and frozen class name still tell it apart from the others.
+        lesson = session_id if session_id is not None else (when, class_name)
+        lessons[key][lesson] = max(lessons[key].get(lesson, 0.0), float(longest or 0.0))
+    for key, bucket in buckets.items():
+        bucket["Lesson hours"] = sum(lessons[key].values())
     return buckets
 
 
@@ -3790,7 +3810,8 @@ def _teacher_month_scheduled(session, first_day, last_day, teacher_ids):
 
     Kept separate from the money: a class is taught whether or not its
     invoice has gone out, so "hours taught" must not drop to zero just
-    because a month has not been billed yet.
+    because a month has not been billed yet. Lessons still to come and
+    classes called off are not hours taught, so neither is counted.
     """
     if not teacher_ids:
         return {}
@@ -3800,7 +3821,10 @@ def _teacher_month_scheduled(session, first_day, last_day, teacher_ids):
             ClassSession.session_date,
             ClassSession.start_time,
             ClassSession.end_time,
-        ).where(*_lesson_window(first_day, last_day, list(teacher_ids)))
+        ).where(
+            *_lesson_window(first_day, min(last_day, date.today()), list(teacher_ids)),
+            ClassSession.status != "Cancelled",
+        )
     ).all()
     buckets: dict[tuple[int, int, int], float] = {}
     for teacher_id, when, start, end in rows:
@@ -3870,6 +3894,7 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
                     "Teacher": teacher.name,
                     "Invoiced": round(bucket["Earnings"], 2) if bucket else 0.0,
                     "Billed hours": round(bucket["Hours"], 2) if bucket else 0.0,
+                    "Invoiced lesson hours": round(bucket["Lesson hours"], 2) if bucket else 0.0,
                     "Hours": round(hours, 2),
                     "Students": count,
                 }

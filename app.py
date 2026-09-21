@@ -3357,6 +3357,10 @@ def _history_view() -> None:
         st.rerun()
 
 
+def _per_hour(invoiced: float, hours: float) -> str:
+    return f"${invoiced / hours:,.0f}" if hours else "—"
+
+
 def data_tab() -> None:
     st.subheader("Data")
     view = st.radio(
@@ -3452,13 +3456,16 @@ def data_tab() -> None:
     st.markdown(f"#### {label}")
     columns = st.columns(3)
     columns[0].metric("Invoiced", f"${snapshot['Invoiced'].sum():,.2f}")
-    columns[1].metric("Hours taught", f"{snapshot['Hours'].sum():,.2f}")
-    hours = float(snapshot["Hours"].sum())
+    columns[1].metric(
+        "Hours taught", f"{snapshot['Hours'].sum():,.2f}",
+        help="Lessons held so far this month; ones still to come are not counted yet.",
+    )
     columns[2].metric(
         "Per teaching hour",
-        f"${snapshot['Invoiced'].sum() / hours:,.0f}" if hours else "—",
-        help="Invoiced divided by hours taught. A class of six earns six "
-             "students' rates in one hour of a teacher's time.",
+        _per_hour(snapshot["Invoiced"].sum(), snapshot["Invoiced lesson hours"].sum()),
+        help="Invoiced divided by the hours of the lessons on those invoices. A "
+             "class of six earns six students' rates in one hour of a teacher's "
+             "time. Lessons not invoiced yet are left out of both.",
     )
 
     # Bars along the ground, longest first, rather than a pie: a name reads
@@ -3489,6 +3496,7 @@ def data_tab() -> None:
                 "Teacher": row["Teacher"],
                 "Invoiced": f"${row['Invoiced']:,.2f}",
                 "Hours taught": row["Hours"],
+                "Per teaching hour": _per_hour(row["Invoiced"], row["Invoiced lesson hours"]),
                 "Unique students": row["Students"],
             }
             for row in sorted(stats, key=lambda r: r["Invoiced"], reverse=True)
