@@ -1,7 +1,7 @@
 """Writes a parsed Excel schedule into the database.
 
 ``schedule_parser`` reads a workbook into sessions; this writes those sessions
-in through the same functions the Timetable tab uses, so imported data is
+in through the same functions the Schedule tab uses, so imported data is
 indistinguishable from data typed by hand -- and admins can keep re-uploading
 the same month's workbook as they keep editing it in Excel:
 
@@ -438,12 +438,12 @@ def backfill(
             status = "Completed" if session["date"] <= dt.date.today() else "Scheduled"
             attendance_rows = _attendance_rows(session, name_to_id)
             month_key = (session["date"].year, session["date"].month)
-            existing_session_id = db.find_timetable_session(
+            existing_session_id = db.find_schedule_session(
                 class_id, session["date"], session["start_time"]
             )
 
             if existing_session_id is None:
-                outcome = db.create_timetable_session(
+                outcome = db.create_schedule_session(
                     teacher_id=teacher_id,
                     class_id=class_id,
                     session_date=session["date"],
@@ -462,7 +462,7 @@ def backfill(
 
             # Already on the calendar -- carry each student's Paid flag and
             # the class's note across, since Excel has no opinion on either.
-            current = db.get_timetable_session(existing_session_id) or {}
+            current = db.get_schedule_session(existing_session_id) or {}
             paid_by_student = {
                 row["student_id"]: row["is_paid"] for row in current.get("Attendance", [])
             }
@@ -478,7 +478,7 @@ def backfill(
                 created["sessions_unchanged"] += 1
                 continue
 
-            outcome = db.update_timetable_session(
+            outcome = db.update_schedule_session(
                 existing_session_id,
                 session_date=session["date"],
                 start_time=session["start_time"],

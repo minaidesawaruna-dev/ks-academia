@@ -87,7 +87,7 @@ def apply_sqlite_pragmas(target_engine):
     The default mode fsyncs the whole database file on every single commit,
     which is fine for occasional writes but turns an Excel import -- hundreds
     of small commits, one per class written through the same functions the
-    Timetable tab uses -- into a multi-second wait dominated almost entirely
+    Schedule tab uses -- into a multi-second wait dominated almost entirely
     by disk sync rather than actual work. Measured on a full year's import:
     4.1s with these pragmas, 10.7s without. WAL lets readers and writers
     proceed without that per-commit fsync, and is the standard, safe setting
@@ -357,7 +357,7 @@ class Credit(Base):
 
     ``class_name`` and ``session_date`` are copied in rather than read back
     through ``session_id`` so the credit still reads correctly on an invoice
-    after the class it came from has been removed from the timetable.
+    after the class it came from has been removed from the schedule.
     """
 
     __tablename__ = "credits"
@@ -410,7 +410,7 @@ class LessonHistory(Base):
     """One student at one past lesson, kept for analysis only.
 
     Deliberately a table of its own, with names rather than links. Importing a
-    year already billed elsewhere into the timetable would put every one of
+    year already billed elsewhere into the schedule would put every one of
     those lessons on a student's open invoice, a click away from being sent
     to a parent a second time. Nothing that bills, schedules or reminds ever
     reads this table; only the retention analysis does.
@@ -558,7 +558,7 @@ def initialise_database():
                     )
 
     # The import prototype created an earlier version of this table. Add the
-    # independent condition fields needed by the timetable without data loss.
+    # independent condition fields needed by the schedule without data loss.
     if "session_attendance" in inspect(engine).get_table_names():
         attendance_columns = {
             column["name"]
@@ -1175,7 +1175,7 @@ def set_class_rate_for_month(class_id, month_start, hourly_rate):
 def _apply_month_rate(session, class_id, month_start, hourly_rate):
     """The month-rate rule itself, inside a caller's transaction.
 
-    Shared so the Teachers tab and the Timetable's subject editor price a
+    Shared so the Teachers tab and the Schedule's subject editor price a
     subject the same way -- by the calendar month. The editor used to date a
     new period to the class being edited, which both split a month in half
     and, when that date fell before the existing period, left two open-ended
@@ -1455,7 +1455,7 @@ def create_class_and_first_session(
     note,
     attendance_rows,
 ):
-    """Create a reusable class and its first timetable slot in one transaction."""
+    """Create a reusable class and its first schedule slot in one transaction."""
 
     cleaned_name = _fit(name, AcademyClass.name)
     if (
@@ -1537,7 +1537,7 @@ def create_class_and_first_session(
     return "created"
 
 
-def create_timetable_session(
+def create_schedule_session(
     teacher_id,
     class_id,
     session_date,
@@ -1591,8 +1591,8 @@ def create_timetable_session(
     return "created"
 
 
-def get_month_timetable(teacher_id, year, month):
-    """Return timetable cards for one teacher and calendar month."""
+def get_month_schedule(teacher_id, year, month):
+    """Return schedule cards for one teacher and calendar month."""
 
     first_day = date(year, month, 1)
     last_day = date(year, month, monthrange(year, month)[1])
@@ -1658,8 +1658,8 @@ def get_month_attendance(teacher_id, year, month):
     """Every class's roster for one teacher-month, keyed by class id.
 
     The month grid names each student on the card along with their
-    condition, which otherwise means calling ``get_timetable_session`` once
-    per class -- three queries apiece, on every render of the Timetable
+    condition, which otherwise means calling ``get_schedule_session`` once
+    per class -- three queries apiece, on every render of the Schedule
     tab. This is the same information in one query.
     """
     first_day = date(year, month, 1)
@@ -1693,7 +1693,7 @@ def get_month_attendance(teacher_id, year, month):
         return dict(by_session)
 
 
-def get_timetable_session(session_id):
+def get_schedule_session(session_id):
     """Return one class with its editable roster and conditions."""
 
     with SessionLocal() as session:
@@ -1736,7 +1736,7 @@ def get_timetable_session(session_id):
         }
 
 
-def update_timetable_session(
+def update_schedule_session(
     session_id,
     session_date,
     start_time,
@@ -1777,7 +1777,7 @@ def update_timetable_session(
     return "updated"
 
 
-def delete_timetable_session(session_id):
+def delete_schedule_session(session_id):
     with SessionLocal() as session:
         class_session = session.get(ClassSession, session_id)
         if class_session is None:
@@ -3072,7 +3072,7 @@ def remove_lessons_not_in(teacher_id, periods, keep_slots, class_ids):
 
     Scoped deliberately tightly: only the given (year, month) periods, only
     that teacher, so uploading one month can never disturb another month or
-    another teacher's timetable.
+    another teacher's schedule.
 
     A class that moved to a new day leaves its old slot behind, and without
     this the student would be billed for both. Removing it is treated the
@@ -3156,7 +3156,7 @@ def payment_due_date(year, month):
 def _sync_lesson_paid_flags(session, invoice, paid):
     """Keep the per-class flags in step with the invoice.
 
-    The timetable grid marks classes with money still owing, and it reads
+    The schedule grid marks classes with money still owing, and it reads
     those flags. They are no longer edited by hand -- marking the invoice is
     the single action -- so they are kept correct from here.
     """
@@ -3213,7 +3213,7 @@ def mark_invoice_paid(invoice_id, paid_on=None, amount=None, note=None):
             invoice.payment_note = (
                 f"{invoice.payment_note}; {note}" if invoice.payment_note else note
             )
-        # The timetable's "owing" markers only clear once the whole invoice is
+        # The schedule's "owing" markers only clear once the whole invoice is
         # covered -- a part payment leaves the classes owing.
         _sync_lesson_paid_flags(
             session, invoice, invoice.paid_amount >= round(total, 2)
@@ -3500,7 +3500,7 @@ def get_payment_reminders(today=None):
 # ---------------------------------------------------------------------------
 
 
-def find_timetable_session(class_id, session_date, start_time):
+def find_schedule_session(class_id, session_date, start_time):
     """Return the id of the class already at this class/date/time, if any.
 
     Used by the Excel importer to decide whether a parsed class is new or
@@ -3769,7 +3769,7 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
 
     ``Lesson hours`` is the teacher's time behind that money: each invoiced
     lesson once, however many students it was billed to. Dividing by every
-    hour on the timetable instead would count lessons not billed yet as time
+    hour on the schedule instead would count lessons not billed yet as time
     that earned nothing.
     """
     if not teacher_ids:
@@ -4145,7 +4145,7 @@ def _lesson_condition(is_online, has_recording, is_cancelled):
 def get_analysis_lessons(today=None):
     """Every past lesson for the retention analysis, one row per student per lesson.
 
-    ``app`` is what the timetable holds; ``history`` is past schedules kept for
+    ``app`` is what the Schedule screen holds; ``history`` is past schedules kept for
     analysis. Cancelled classes and anything still in the future are left
     out. Overlap between the two is resolved by ``retention.combine``.
     """

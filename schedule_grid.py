@@ -1,6 +1,6 @@
 """Clickable month grid.
 
-Draws the timetable and returns the id of any class clicked, so the editor
+Draws the schedule and returns the id of any class clicked, so the editor
 below the grid follows the pointer instead of making the user find the same
 class twice.
 
@@ -32,7 +32,7 @@ def _declare():
         if not COMPONENT_DIR.is_dir():
             raise FileNotFoundError(
                 f"Missing {COMPONENT_DIR}. The grid_component folder, with "
-                "index.html inside it, must sit next to timetable_grid.py."
+                "index.html inside it, must sit next to schedule_grid.py."
             )
         _component = components.declare_component("ks_month_grid", path=str(COMPONENT_DIR))
     return _component

@@ -80,7 +80,7 @@ def run(args, env=None):
 # ---------------------------------------------------------------- 1. imports
 def t_imports():
     for m in ["db", "app", "invoice_render", "schedule_parser",
-              "schedule_backfill", "timetable_grid", "migrate_to_postgres"]:
+              "schedule_backfill", "schedule_grid", "migrate_to_postgres"]:
         importlib.import_module(m)
     return "7 modules"
 
@@ -481,7 +481,7 @@ def t_read_functions_all_run():
             lambda: db.get_unpriced_classes_for_month(year, month),
         "get_teacher_classes_for_schedule":
             lambda: db.get_teacher_classes_for_schedule(tid, first),
-        "get_month_timetable": lambda: db.get_month_timetable(tid, year, month),
+        "get_month_schedule": lambda: db.get_month_schedule(tid, year, month),
         "get_month_attendance": lambda: db.get_month_attendance(tid, year, month),
         "get_students_in_month": lambda: db.get_students_in_month(year, month),
         "get_all_student_month_breakdowns":

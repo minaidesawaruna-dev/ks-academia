@@ -158,7 +158,7 @@ _WEAK_SUBJECT = {"sl", "hl", "aa", "ai", "ee", "ia", "ap", "sat", "pre", "cal", 
                  "sjii", "acsi", "sas", "ofs", "sais", "nlcs", "cis", "tts"}
 _GRADE_WORD = re.compile(r"^(?:g|y|gr)\d{1,2}$")
 
-# Cells that sit on the timetable but are not lessons anyone is billed for.
+# Cells that sit on the schedule but are not lessons anyone is billed for.
 NON_LESSON_RE = re.compile(r"(?i)meeting|consult|interview|상담|설명회|보조\s*강사|회의|면접")
 
 # Things written onto a student's line that are not part of their name.
@@ -412,7 +412,7 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
     if name_month is None and not named_years:
         # Only a sheet named for its year ("2026", "2026(1-7월)") is read by
         # its labels. Anything else with no month in its name -- "세미나",
-        # "Holiday", a student list -- is not a timetable, however much it
+        # "Holiday", a student list -- is not a schedule, however much it
         # looks like one: a seminar sign-up sheet has day labels and a "JAN"
         # above them, and importing it would bill everyone who came.
         return [], [(None, None,
@@ -909,7 +909,7 @@ def parse_cell(text: str) -> dict[str, Any]:
     roster line.
     """
     # Two classes can share a cell, an empty line between them, each with its
-    # own time. Only the first is this cell's lesson -- a teacher's timetable
+    # own time. Only the first is this cell's lesson -- a teacher's schedule
     # holds one class at a time -- so the rest is handed back for a warning
     # instead of being read as more students of the first.
     extra_classes: list[str] = []
@@ -1786,7 +1786,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                     _warning(
                         "a second class is written in this cell after an empty line "
                         f"({' / '.join(_cell_lines(extra))[:90]}); it was not imported, "
-                        "because a teacher's timetable holds one class at a time. "
+                        "because a teacher's schedule holds one class at a time. "
                         "Give it its own cell.",
                         sheet=sheet_name,
                         coordinate=item["coordinate"],

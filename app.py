@@ -6,7 +6,7 @@ Seven tabs:
   enter the system), price a month's subjects, and read one subject's classes.
 * **Students** — who took a class in a given month, and what it would come to
   at today's prices.
-* **Timetable** — the month grid, for one-off manual fixes.
+* **Schedule** — the month grid, for one-off manual fixes.
 * **Invoices** — bill students for a month's unbilled classes.
 * **Payments** — record what parents have actually paid, in full or in part.
 * **Data** — earnings per teacher by month; student retention, with who is at
@@ -50,7 +50,7 @@ import retention
 import schedule_backfill
 import schedule_parser
 from schedule_parser import UNNAMED_CLASS
-from timetable_grid import render_month_grid
+from schedule_grid import render_month_grid
 from invoice_render import (
     format_dates,
     image_export_available,
@@ -70,7 +70,7 @@ st.set_page_config(
     layout="wide",
     # The sidebar exists only to hold "signed in as" and the sign-out button,
     # so it starts out of the way rather than taking a column from the
-    # timetable grid.
+    # schedule grid.
     initial_sidebar_state="collapsed",
 )
 
@@ -355,7 +355,7 @@ def _repeat_weekly(teacher_id, class_id, base, start, end, weeks, rows, note="")
     last = base
     for step in range(1, weeks + 1):
         later = base + dt.timedelta(weeks=step)
-        outcome = db.create_timetable_session(
+        outcome = db.create_schedule_session(
             teacher_id=teacher_id,
             class_id=class_id,
             session_date=later,
@@ -1158,7 +1158,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
 def _teacher_drilldown(teachers: list[dict]) -> None:
     """Pick a teacher and a month: price the subjects, then read one's classes.
 
-    Active teachers only, matching the Timetable and Data screens -- a
+    Active teachers only, matching the Schedule and Data screens -- a
     retired teacher is off every working screen until somebody takes them
     back on from "Rename or retire", which still lists everybody.
     """
@@ -1178,7 +1178,7 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     teacher_id = labels[chosen]
 
     year, month = _month_picker("teacher_drill")
-    lessons = db.get_month_timetable(teacher_id, year, month)
+    lessons = db.get_month_schedule(teacher_id, year, month)
     if not lessons:
         st.caption(f"No classes for {chosen} in {calendar.month_name[month]} {year}.")
         return
@@ -1215,7 +1215,7 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
 
     st.markdown(f"###### {class_name} — {calendar.month_name[month]} {year}")
     # One query for the month's rosters, not two per class listed: the
-    # Timetable screen already reads them this way, and a busy subject here
+    # Schedule screen already reads them this way, and a busy subject here
     # was thirty round trips to a database an ocean away.
     rosters = db.get_month_attendance(teacher_id, year, month)
     for lesson in class_lessons:
@@ -1520,7 +1520,7 @@ def students_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Timetable
+# Schedule
 # ---------------------------------------------------------------------------
 
 
@@ -1751,7 +1751,7 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
                 class_id = created[0]["ID"] if created else None
             else:
                 class_id = next(c["ID"] for c in classes if c["Class"] == choice)
-                outcome = db.create_timetable_session(
+                outcome = db.create_schedule_session(
                     teacher_id=teacher_id, class_id=class_id, session_date=when,
                     start_time=start, end_time=end, status=status,
                     note=lesson_note[:500], attendance_rows=rows,
@@ -1786,7 +1786,7 @@ def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) ->
     for _ in range(6):
         found += [
             _as_date(item["Date"])
-            for item in db.get_month_timetable(teacher_id, year, month)
+            for item in db.get_month_schedule(teacher_id, year, month)
             if item["Class ID"] == class_id and _as_time(item["Start"]) == start
         ]
         month += 1
@@ -1801,7 +1801,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
     Both sit in expanders so the screen reads as two decisions rather than a
     wall of controls: what happened in this sitting, and what the subject is.
     """
-    detail = db.get_timetable_session(lesson_id)
+    detail = db.get_schedule_session(lesson_id)
     if not detail:
         st.info("That class no longer exists.")
         return
@@ -1868,7 +1868,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             ]
             for name in adding:
                 existing.append(_blank_row(lookup[name]))
-            outcome = db.update_timetable_session(
+            outcome = db.update_schedule_session(
                 session_id=lesson_id,
                 session_date=_as_date(detail["Date"]),
                 start_time=_as_time(detail["Start"]),
@@ -1967,7 +1967,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                     "Listed more than once, so only the first row was kept: "
                     + ", ".join(sorted(set(duplicates)))
                 )
-            outcome = db.update_timetable_session(
+            outcome = db.update_schedule_session(
                 session_id=lesson_id,
                 session_date=when,
                 start_time=start,
@@ -2048,7 +2048,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
         with buttons[2].popover("Delete", width="stretch"):
             st.write("Removes this class and its attendance. The subject stays.")
             if st.button("Delete for good", key=f"del_{lesson_id}"):
-                db.delete_timetable_session(lesson_id)
+                db.delete_schedule_session(lesson_id)
                 st.session_state.pop("selected_lesson", None)
                 _rerun()
 
@@ -2110,10 +2110,10 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 st.warning(_explain(str(outcome)))
 
 
-def timetable_tab() -> None:
+def schedule_tab() -> None:
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
     if not teachers:
-        st.info("Add a teacher first — a timetable belongs to one.")
+        st.info("Add a teacher first — a schedule belongs to one.")
         return
 
     top = st.columns([2, 6])
@@ -2124,7 +2124,7 @@ def timetable_tab() -> None:
 
     _anchor("grid-top")
     year, month = _month_navigator()
-    summary = db.get_month_timetable(teacher_id, year, month)
+    summary = db.get_month_schedule(teacher_id, year, month)
     # One query for the whole month's rosters, rather than three per class.
     # The grid only needs each card's student names and their conditions,
     # which is exactly what this returns.
@@ -3659,7 +3659,7 @@ _floating_back_to_top()
 SECTIONS = {
     "Teachers": teachers_tab,
     "Students": students_tab,
-    "Timetable": timetable_tab,
+    "Schedule": schedule_tab,
     "Invoices": invoices_tab,
     "Payments": payments_tab,
     "Data": data_tab,
@@ -3677,6 +3677,12 @@ if _pending in SECTIONS:
 # *and* writing the key from elsewhere (the jump below) is the combination
 # Streamlit warns about, and session state alone does the same job.
 st.session_state.setdefault("active_section", next(iter(SECTIONS)))
+# A section that has since been renamed must not follow a browser that was
+# open across the change: it lands on the first screen instead.
+if st.session_state["active_section"] not in SECTIONS:
+    st.session_state["active_section"] = next(iter(SECTIONS))
+if st.session_state.get("last_section") not in SECTIONS:
+    st.session_state.pop("last_section", None)
 _section = st.segmented_control(
     "Section",
     list(SECTIONS),
