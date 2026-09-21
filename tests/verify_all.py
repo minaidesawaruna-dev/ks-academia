@@ -470,6 +470,7 @@ def t_read_functions_all_run():
     first = dt.date(year, month, 1)
     calls = {
         "get_all_teachers": lambda: db.get_all_teachers(),
+        "get_teacher_session_counts": lambda: db.get_teacher_session_counts(year, month),
         "get_all_students": lambda: db.get_all_students(),
         "get_all_classes": lambda: db.get_all_classes(),
         "get_all_class_rates": lambda: db.get_all_class_rates(),

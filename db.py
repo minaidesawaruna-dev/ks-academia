@@ -734,6 +734,22 @@ def get_all_teachers():
         ]
 
 
+def get_teacher_session_counts(year, month):
+    """How many classes each teacher has in a month, by teacher id."""
+    first_day = date(int(year), int(month), 1)
+    last_day = date(int(year), int(month), monthrange(int(year), int(month))[1])
+    with SessionLocal() as session:
+        return {
+            teacher_id: int(count)
+            for teacher_id, count in session.execute(
+                select(ClassSession.teacher_id, func.count(ClassSession.id))
+                .where(ClassSession.session_date >= first_day,
+                       ClassSession.session_date <= last_day)
+                .group_by(ClassSession.teacher_id)
+            ).all()
+        }
+
+
 def update_teacher_status(teacher_id, is_active):
     with SessionLocal() as session:
         teacher = session.get(Teacher, teacher_id)

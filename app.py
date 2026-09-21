@@ -24,8 +24,21 @@ from __future__ import annotations
 import calendar
 import datetime as dt
 import io
+import os
+import time
 import zipfile
 from pathlib import Path
+
+# The academy is in Singapore and the host runs on UTC, so until 8am the
+# server's "today" was still yesterday: overdue counts ran a day short, and
+# on the 1st the month in progress was still last month. Every date.today()
+# here and in db.py reads the process clock, so it is set once, first. A
+# POSIX rule rather than "Asia/Singapore" so it needs no tz database on the
+# host; Singapore keeps no daylight saving. (Windows has no tzset, and a
+# machine there is already on local time.)
+os.environ["TZ"] = "SGT-8"
+if hasattr(time, "tzset"):
+    time.tzset()
 
 import altair as alt
 import pandas as pd
@@ -1137,6 +1150,14 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     if not labels:
         st.caption("No active teachers. Bring one back from the panel above.")
         return
+    if st.session_state.get("teacher_drill_pick") not in labels:
+        # Open on whoever teaches most this month rather than whoever sorts
+        # first: "No classes for …" is a poor first screen after signing in.
+        today = dt.date.today()
+        busy = db.get_teacher_session_counts(today.year, today.month)
+        st.session_state["teacher_drill_pick"] = max(
+            labels, key=lambda name: busy.get(labels[name], 0)
+        )
     chosen = st.selectbox("Teacher", list(labels), key="teacher_drill_pick")
     teacher_id = labels[chosen]
 
@@ -3140,7 +3161,7 @@ def _retention_view() -> None:
     # quiet student cannot be told from one who has gone, and a line dropping
     # to zero at the right-hand edge would read as good news.
     share = alt.Chart(months[months["settled"]]).mark_line(
-        point=True, color="#eb6834", strokeWidth=2).encode(
+        point=alt.OverlayMarkDef(color="#eb6834"), color="#eb6834", strokeWidth=2).encode(
         x=shared,
         y=alt.Y("left_share:Q", title="Share who never came back",
                 axis=alt.Axis(format="%")),
@@ -3583,8 +3604,9 @@ def reminders_tab() -> None:
         strip = st.columns(3)
         strip[0].metric("Invoices due", len(show))
         strip[1].metric("Owed", f"${sum(i['Amount'] for i in show):,.2f}")
+        longest = max(i["Days overdue"] for i in show)
         strip[2].metric(
-            "Longest overdue", f"{max(i['Days overdue'] for i in show)} days"
+            "Longest overdue", f"{longest} day{'' if longest == 1 else 's'}"
         )
 
     st.dataframe(
