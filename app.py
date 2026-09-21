@@ -132,11 +132,19 @@ def _flash(message: str, kind: str = "success") -> None:
     st.session_state["_flash"] = (kind, message)
 
 
+_TOAST_ICONS = {"success": "✅", "warning": "⚠️", "info": "ℹ️", "error": "❌"}
+
+
 def _show_flash() -> None:
     entry = st.session_state.pop("_flash", None)
     if entry:
         kind, message = entry
         getattr(st, kind)(message)
+        # The line above sits at the top of the page, and a button is often
+        # far below it -- an import confirmed at the foot of a long preview
+        # showed nothing where anyone was looking. A toast floats over the
+        # page wherever it is scrolled.
+        st.toast(message, icon=_TOAST_ICONS.get(kind), duration="long")
 
 
 def _as_date(value) -> dt.date:
@@ -625,9 +633,13 @@ def _import_upload_panel() -> None:
         st.session_state["import_generation"] = (
             st.session_state.get("import_generation", 0) + 1
         )
+        st.session_state.pop("import_done", None)
 
     preview = st.session_state.get("import_preview")
     if not preview:
+        done = st.session_state.get("import_done")
+        if done:
+            st.success(done)
         return
     if st.session_state.get("import_fingerprint") != fingerprint:
         st.warning(
@@ -816,11 +828,12 @@ def _import_upload_panel() -> None:
 
         sessions = schedule_backfill.apply_review_decisions(preview, decisions)
         preview["sessions"] = sessions
-        result = schedule_backfill.backfill(
-            preview, commit_id,
-            name_overrides=name_overrides,
-            student_matches=student_matches,
-        )
+        with st.spinner(f"Importing {len(sessions)} class(es) for {teacher_name}…"):
+            result = schedule_backfill.backfill(
+                preview, commit_id,
+                name_overrides=name_overrides,
+                student_matches=student_matches,
+            )
         if result["status"] == "imported":
             counts = result["created"]
             message = (
@@ -858,6 +871,9 @@ def _import_upload_panel() -> None:
                         "were credited back."
                     )
             _flash(message)
+            # Also kept where the preview was, which is where anyone who just
+            # clicked the button is looking, until the next workbook is read.
+            st.session_state["import_done"] = f"{teacher_name} — {message}"
             # The month just imported is almost always the one about to be
             # billed, so offer the jump instead of making anyone re-pick it.
             months = sorted(

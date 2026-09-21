@@ -1156,6 +1156,312 @@ def _row_step_minutes(row_times: dict[int, dt.time]) -> int:
     return max(set(deltas), key=deltas.count)
 
 
+# --------------------------------------------------------------------------
+# Absence notes: who a note under the grid is about
+# --------------------------------------------------------------------------
+# A note like "우진결석" (Woojin absent) names the student in Hangul, while the
+# lessons list them in English letters -- "Kim Woojin". To see they are the
+# same person, the Hangul is spelled out every way families actually write
+# it in English (현 as Hyun or Hyeon, 우 as Woo or U), both sides are folded
+# over spellings that never tell two names apart (K/G, oo/u, a doubled
+# letter), and only an exact match counts -- among the students taught on
+# the same sheet. A match never changes a bill; it only decides which notes
+# are worth a warning.
+_INITIALS = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
+             "j", "jj", "ch", "k", "t", "p", "h")
+_MEDIALS = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe",
+            "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i")
+_FINALS = ("", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "l", "l", "l",
+           "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t")
+_FOLDS = tuple((re.compile(pattern), replacement) for pattern, replacement in (
+    ("sh", "s"), ("ph", "f"), ("oo", "u"), ("ee", "i"), ("ea", "e"), ("wu", "u"),
+    ("(?<=[aeiouy])h(?![aeiouy])", ""),          # Ahn, Oh, Suh
+    ("k", "g"), ("t", "d"), ("p", "b"), ("r", "l"), (r"(.)\1+", r"\1"),
+))
+# How a Korean surname is spelled in English, for a note that gives it.
+_KO_SURNAMES = {
+    "김": "kim gim", "이": "lee yi rhee i", "박": "park pak bak", "최": "choi choe",
+    "정": "jung jeong chung", "강": "kang gang", "조": "cho jo", "윤": "yoon yun",
+    "장": "jang chang", "임": "lim im", "한": "han", "오": "oh o", "서": "seo suh",
+    "신": "shin sin", "권": "kwon gwon", "황": "hwang", "안": "ahn an", "송": "song",
+    "류": "ryu yoo yu", "유": "yoo yu", "홍": "hong", "전": "jeon jun chun",
+    "고": "ko koh go", "문": "moon mun", "양": "yang", "손": "son sohn", "배": "bae",
+    "백": "baek paik", "허": "heo huh", "남": "nam", "심": "shim sim",
+    "노": "noh roh no", "하": "ha", "곽": "kwak gwak", "성": "sung seong", "차": "cha",
+    "주": "joo ju", "우": "woo u", "구": "koo gu", "민": "min", "나": "na", "지": "ji",
+    "진": "jin", "엄": "uhm eom", "채": "chae", "원": "won", "천": "cheon chun",
+    "방": "bang", "공": "kong gong", "현": "hyun hyeon", "함": "hahm ham",
+    "변": "byun byeon", "여": "yeo", "추": "choo chu", "도": "do", "석": "seok suk",
+    "소": "so", "마": "ma", "길": "gil kil", "연": "yeon", "표": "pyo", "기": "ki gi",
+}
+# English names as they are written in Hangul, which no romanisation recovers:
+# 에스더 reads "eseudeo", not Esther.
+_KO_ENGLISH = {
+    "에스더": "Esther", "알렉시스": "Alexis", "제임스": "James", "루카스": "Lucas",
+    "마이크": "Mike", "마이클": "Michael", "소피아": "Sophia", "이자벨": "Isabel",
+    "이사벨": "Isabel", "라파엘": "Raphael", "하이디": "Heidi", "조슈아": "Joshua",
+    "레이": "Ray", "스텔라": "Stella", "세바스찬": "Sebastian", "다니엘": "Daniel",
+    "데이빗": "David", "데이비드": "David", "사무엘": "Samuel", "조셉": "Joseph",
+    "엘리": "Ellie", "그레이스": "Grace", "클로이": "Chloe", "조이": "Joy",
+    "레이첼": "Rachel", "레베카": "Rebecca", "사라": "Sarah", "에이미": "Amy",
+    "에밀리": "Emily", "안나": "Anna", "한나": "Hannah", "제니": "Jenny",
+    "케이트": "Kate", "루시": "Lucy", "올리비아": "Olivia", "이든": "Eden",
+    "에단": "Ethan", "이선": "Ethan", "라이언": "Ryan", "브라이언": "Brian",
+    "앤드류": "Andrew", "매튜": "Matthew", "루크": "Luke", "노아": "Noah",
+    "조나단": "Jonathan", "저스틴": "Justin", "케빈": "Kevin", "레오": "Leo",
+    "에릭": "Eric", "알렉스": "Alex", "클레어": "Claire", "엘리자베스": "Elizabeth",
+    "레지나": "Regina", "이네스": "Ines", "네이선": "Nathan", "나단": "Nathan",
+    "제이든": "Jayden", "제이슨": "Jason", "헨리": "Henry", "줄리아": "Julia",
+    "엠마": "Emma", "미아": "Mia", "앨리스": "Alice", "엘라": "Ella", "벤": "Ben",
+    "벤자민": "Benjamin", "션": "Sean", "토마스": "Thomas", "윌리엄": "William",
+    "제이크": "Jake", "에이든": "Aiden", "크리스토퍼": "Christopher", "크리스": "Chris",
+    "딜런": "Dylan", "제이": "Jay", "조엘": "Joel", "카일": "Kyle", "테일러": "Taylor",
+    "로건": "Logan", "에이바": "Ava", "케일럽": "Caleb", "클라라": "Clara",
+}
+# Words a note wraps round a name -- dates, "teacher", reasons for being away,
+# "make-up class", "checked" -- taken out before looking for names, so
+# "서현결석 /토요일보강" (Seohyun absent, make-up on Saturday) is about 서현
+# and nobody called 토요일.
+_NOTE_WORDS = re.compile(
+    r"\(\s*[월화수목금토일]\s*\)|\d+\s*[월일]|[월화수목금토일]요일|[가-힣]*(?:쌤|선생님)"
+    r"|보강|수업|한국|학교|시험|예정|부터|까지|대신|변경|일정|참여|불가|당일|가족|독감|생일"
+    r"|필드|캠프|수련회|행사|행가|오케스트라|컨퍼런스|말레이시아|인터림|경시대회|대회|페이"
+    r"|확인|완료|관리|봄방학|방학|계속|캐미|이라서|한다고|합니다|으로|중으로"
+)
+# A lone syllable is kept as a name ("민결석", Min absent) unless it is one
+# of the particles a sentence leaves behind.
+# Single syllables a sentence leaves behind -- particles, and 초/말 (early,
+# late in a month), 시 (o'clock), 금 (Friday), 음 (the tail of 없었음).
+_PARTICLES = frozenset("로 에 는 은 를 을 가 와 과 도 만 의 중 후 내 및 완 급 초 말 시 금 음 딜".split())
+# Dates a note gives for itself: "27일", "6월15일-22일", "7/6-15", "4/13(월)~25(토)", "16-21".
+_NOTE_DATE = re.compile(
+    r"(?:(?P<m>\d{1,2})\s*(?:/|월)\s*)?(?P<d>\d{1,2})(?P<unit>\s*일)?(?:\s*\([월화수목금토일]\))?"
+    r"(?:\s*[-~]\s*(?:(?P<m2>\d{1,2})\s*(?:/|월)\s*)?(?P<d2>\d{1,2})\s*일?)?"
+)
+
+
+def _syllable_spellings(char: str, first: bool) -> list[str]:
+    code = ord(char) - 0xAC00
+    initial, medial, final = code // 588, code % 588 // 28, code % 28
+    vowels = [_MEDIALS[medial]]
+    if final and medial == 4:                    # ㅓ closed: 현 Hyun, 정 Jung, 혁 Hyuk
+        vowels.append("u")
+    if final and medial == 6 and initial != 11:  # ㅕ closed after a consonant: 경 Kyung
+        vowels.append("yu")
+    if medial == 19:                             # ㅢ: 희 Hee
+        vowels.append("i")
+    if medial == 14:                             # ㅝ: 원 Won or Weon
+        vowels.append("weo")
+    starts = [_INITIALS[initial]]
+    if first and initial == 5:                   # a name opening on ㄹ: 려원 Ryeowon or Yeowon
+        starts.append("")
+    return [start + vowel + _FINALS[final] for start in starts for vowel in vowels]
+
+
+def _fold(text: str) -> str:
+    key = re.sub(r"[^a-z]", "", text.lower())
+    for pattern, replacement in _FOLDS:
+        key = pattern.sub(replacement, key)
+    return key
+
+
+def _hangul_sounds(hangul: str) -> set[str]:
+    """Every folded English spelling of a run of Hangul syllables."""
+    spellings = [""]
+    for position, char in enumerate(hangul):
+        if not 0 <= ord(char) - 0xAC00 < 11172:
+            return set()
+        spellings = [so_far + piece for so_far in spellings
+                     for piece in _syllable_spellings(char, position == 0)]
+    return {_fold(spelling) for spelling in spellings}
+
+
+_KO_SURNAME_SOUNDS = {
+    hangul: frozenset(_fold(spelling) for spelling in spellings.split())
+    for hangul, spellings in _KO_SURNAMES.items()
+}
+_SURNAME_SOUNDS = frozenset(_fold(name) for name in _SURNAMES).union(
+    *_KO_SURNAME_SOUNDS.values())
+
+
+def _roster_sounds(name: str) -> tuple[frozenset, frozenset]:
+    """What a listed student answers to: every way their name can be called, and their surname."""
+    words = re.findall(r"[A-Za-z]+", name)
+    sounds = [_fold(word) for word in words]
+    surnames = {sound for sound in sounds if sound in _SURNAME_SOUNDS}
+    calls = set()
+    if words:
+        calls.add(_fold("".join(words)))
+        if len(words) > 1 and sounds[0] in surnames:
+            calls.add(_fold("".join(words[1:])))
+        if len(words) > 1 and sounds[-1] in surnames:
+            calls.add(_fold("".join(words[:-1])))
+        calls.update(sound for sound in sounds if sound not in surnames or len(words) == 1)
+    hangul = "".join(re.findall(r"[가-힣]+", name))
+    if hangul:
+        calls |= _hangul_sounds(hangul)
+        if len(hangul) >= 2 and hangul[0] in _KO_SURNAME_SOUNDS:
+            calls |= _hangul_sounds(hangul[1:])
+            surnames |= _KO_SURNAME_SOUNDS[hangul[0]]
+    return frozenset(call for call in calls if len(call) >= 2), frozenset(surnames)
+
+
+def _note_people(text: str) -> list[tuple[str, list[tuple[frozenset | None, frozenset]]]]:
+    """The people a note names, each as written with the ways it could be read.
+
+    A name is often run together with the reason -- "재호말레이시아결석",
+    Jaeho absent in Malaysia, or "경시대회준환" -- so a long run of Hangul is
+    also tried by its first and last two and three syllables, which is how
+    long a Korean name is.
+    """
+    text = re.sub(r"(?i)cancel\w*|absent\w*", " ", text)
+    text = _NOTE_WORDS.sub(" ", _ABSENCE_WORD.sub(" ", text))
+    people = []
+    for run in re.findall(r"[가-힣]+", text):
+        if len(run) == 1 and run in _PARTICLES:
+            continue
+        pieces = ([run] if len(run) <= 5 else []) + [
+            piece for n in (2, 3) if len(run) > n for piece in (run[:n], run[-n:])]
+        if len(run) >= 2 and run.endswith("이"):   # 민이, 규빈이: the name said fondly
+            pieces.append(run[:-1])
+        readings = []
+        for piece in dict.fromkeys(pieces):
+            if piece in _KO_ENGLISH:
+                readings.append((None, frozenset({_fold(_KO_ENGLISH[piece])})))
+                continue
+            readings.append((None, frozenset(_hangul_sounds(piece))))
+            if len(piece) >= 2 and piece[0] in _KO_SURNAME_SOUNDS:
+                readings.append((_KO_SURNAME_SOUNDS[piece[0]], frozenset(_hangul_sounds(piece[1:]))))
+        readings = [(surname, frozenset(s for s in given if len(s) >= 2))
+                    for surname, given in readings]
+        readings = [reading for reading in readings if reading[1]]
+        if readings:
+            people.append((run, readings))
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    for index, word in enumerate(words):
+        readings = [(None, frozenset({_fold(word)}))]
+        if index + 1 < len(words) and _fold(word) in _SURNAME_SOUNDS:
+            readings.append((frozenset({_fold(word)}), frozenset({_fold(words[index + 1])})))
+        people.append((word, readings))
+    return people
+
+
+def _answers_to(readings, student: tuple[frozenset, frozenset]) -> int:
+    """2 when the name and the surname the note gives both fit, 1 when the name fits, else 0."""
+    calls, surnames = student
+    best = 0
+    for surname, given in readings:
+        if given & calls:
+            if surname is None or not surnames:
+                best = max(best, 1)
+            elif surname & surnames:
+                return 2
+    return best
+
+
+def _note_dates(text: str, day: dt.date) -> set[dt.date]:
+    """The days a note is about: those it gives, and the day it sits under.
+
+    "27일" is the 27th of the sheet's month; "10월1일 ... 3일" the 1st and 3rd
+    of October; "14,21" two days of the month. The day the note sits under
+    counts too -- "마이크18일부터/소은결석" is Mike from the 18th and Soeun
+    today -- unless every date it gives is in another month: a note in
+    September about October is not about September.
+    """
+    found: set[dt.date] = set()
+    month = day.month
+    # After an arrow is the plan to make it up -- "예준결석>>5월20일 보강",
+    # Yejun absent, make-up on the 20th -- and a date just before 보강
+    # (make-up) or 참여 (will attend) is a day they come, not one they miss.
+    text = re.split(r"->|>>|→", text)[0]
+    for match in _NOTE_DATE.finditer(text):
+        if re.match(r"\s*(?:보강|참여)", text[match.end():]):
+            continue
+        before = text[:match.start()].rstrip()[-1:]
+        after = text[match.end():].lstrip()[:1]
+        listed = before == "," or after == ","
+        if not (match["m"] or match["unit"] or match["d2"] or listed):
+            continue                                  # a bare number: a time, a grade, a room
+        month = int(match["m"]) if match["m"] else month
+        year = day.year + (month + 6 < day.month) - (month - 6 > day.month)
+        try:
+            first = dt.date(year, month, int(match["d"]))
+        except ValueError:
+            continue
+        last = first
+        if match["d2"]:
+            month = int(match["m2"]) if match["m2"] else month
+            try:
+                last = max(first, dt.date(year, month, int(match["d2"])))
+            except ValueError:
+                pass
+        for offset in range(min((last - first).days, 31) + 1):
+            found.add(first + dt.timedelta(days=offset))
+    if not found or any(date.month == day.month for date in found):
+        found.add(day)
+    return found
+
+
+def _absence_note_warnings(notes, sessions, sheet_name: str) -> list[dict[str, Any]]:
+    """Warn about an absence note only where it could change a bill.
+
+    Teachers usually take an absent student off the lesson and write why
+    underneath; a warning for every such note asked the importer to act when
+    there was nothing to do. So a note is checked against the lessons on the
+    days it covers: a student it names who is still listed on one is the
+    case that bills someone who wasn't there, and gets a warning naming the
+    lesson. A student who isn't listed on those days isn't billed for them. A
+    note that matches nobody taught on the sheet is still put in front of the
+    importer, unless it covers no lessons at all.
+    """
+    sounds: dict[str, tuple[frozenset, frozenset]] = {}
+
+    def student(name: str):
+        if name not in sounds:
+            sounds[name] = _roster_sounds(name)
+        return sounds[name]
+
+    taught = sorted({a["student_name"] for s in sessions for a in s["attendance"]})
+    out = []
+    for coordinate, text, day in notes:
+        note = " / ".join(_cell_lines(text))
+        days = _note_dates(text, day)
+        lessons = [s for s in sessions if s["date"] in days]
+        listed, unknown, known = [], [], False
+        for written, readings in _note_people(text):
+            fits = {name: _answers_to(readings, student(name)) for name in taught}
+            best = max(fits.values(), default=0)
+            if not best:
+                if re.search(r"[가-힣]", written):
+                    # An English word left in a note is as often "Field" or
+                    # "next" as a name, so only Hangul that fits nobody is named.
+                    unknown.append(written)
+                continue
+            known = True
+            # Where the note gives a surname, a student it fits beats one
+            # whose surname nobody wrote: 홍서현 is Hong Seohyun, not Seohyun.
+            chosen = {name for name, fit in fits.items() if fit == best}
+            listed += [(written, s, a) for s in lessons for a in s["attendance"]
+                       if a["student_name"] in chosen and a.get("status") != CANCELLED]
+        for written, lesson, attendance in listed:
+            out.append(_warning(
+                f"a note says {written} was absent — “{note}” — but "
+                f"{attendance['student_name']} is still on {lesson['class_name']} on "
+                f"{lesson['date']:%a %d %b} at {lesson['start_time']:%H:%M}. If they "
+                "missed it, mark them Cancelled there so they aren't billed.",
+                sheet=sheet_name, coordinate=coordinate, date=day, cell_text=text))
+        if listed or known or not lessons:
+            continue
+        out.append(_warning(
+            f"a note says someone missed class — “{note}” — but "
+            + (f"no student taught on this sheet has a name like {', '.join(unknown)}. "
+               if unknown else "it doesn't name a student taught on this sheet. ")
+            + "If someone on these days' lessons missed class, mark them Cancelled "
+            "there so they aren't billed.",
+            sheet=sheet_name, coordinate=coordinate, date=day, cell_text=text))
+    return out
+
+
 def _warning(
     message: str,
     *,
@@ -1344,6 +1650,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
     header_columns = sorted(days)
 
     sessions: list[dict[str, Any]] = []
+    day_notes: list[tuple[str, str, dt.date]] = []
 
     for position, anchor in enumerate(header_columns):
         if anchor not in dates:
@@ -1733,26 +2040,14 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             )
 
         # An absence written as a note -- "지훈결석" in the row under the grid,
-        # or a status cell no class claimed -- can't be tied to a student: the
-        # note has the name in Korean, the roster in English. It is not guessed
-        # at. It is put in front of whoever imports, because the student it
-        # describes is otherwise billed as having come.
+        # or a status cell no class claimed. Nothing is changed on its say-so;
+        # it is checked once every day's lessons are known, below.
         for row, column, _, _, text in status_cells:
             if (row, column) not in attached and _ABSENCE_WORD.search(text):
                 absence_notes.append((f"{get_column_letter(column)}{row}", text))
-        for coordinate, text in absence_notes:
-            warnings.append(
-                _warning(
-                    f"absence note not matched to a lesson — {' / '.join(_cell_lines(text))}. "
-                    "If a student here missed a class, mark them Cancelled on it so "
-                    "they aren't billed.",
-                    sheet=sheet_name,
-                    coordinate=coordinate,
-                    date=session_date,
-                    cell_text=text,
-                )
-            )
+        day_notes += [(coordinate, text, session_date) for coordinate, text in absence_notes]
 
+    warnings += _absence_note_warnings(day_notes, sessions, sheet_name)
     sessions.sort(key=lambda item: (item["date"], item["start_time"], item["class_name"]))
     return sessions, warnings, [(block["year"], block["month"]) for block in blocks]
 

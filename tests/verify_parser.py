@@ -605,13 +605,57 @@ def t_late_lesson_below_axis():
     out = sp.parse_workbook(io.BytesIO(buf.getvalue()), ["Aug"], 2026)
     got = [(s["start_time"], [a["student_name"] for a in s["attendance"]]) for s in out["sessions"]]
     assert got == [(dt.time(21, 30), ["Nam Jihoon"])], got
-    notes = [w for w in out["warnings"] if w["message"].startswith("absence note")]
-    assert len(notes) == 2, out["warnings"]
+    # 지훈 is still on the 9.30pm lesson: warned. Minseok has no lesson on
+    # the 5th, so nothing is billed and nothing is said.
+    notes = [w for w in out["warnings"] if w["message"].startswith("a note says")]
+    assert len(notes) == 1 and "Nam Jihoon is still on" in notes[0]["message"], out["warnings"]
     for note in ("민석안옴", "Oh Minseok 없었음", "지훈수업참여불가", "스킵", "Field Trip", "지훈,민석 없음", "한국행"):
         assert sp._ABSENCE_WORD.search(note), note
     for note in ("답변없음", "일대일수업필요없음", "내일 테스트", "Strip", "보강희망"):
         assert not sp._ABSENCE_WORD.search(note), note
     return "a lesson under the time axis is read; notes under it are flagged, not attached"
+
+
+def t_absence_notes():
+    """A note in Hangul is checked against the English names on the lessons it covers."""
+    wb = Workbook()
+    ws = _grid(wb.active, [(None, [("3(MON)", LESSON),
+                                   ("5(WED)", "G10 Math\n9am-11am\nOh Minseok"),
+                                   ("7(FRI)", None)])])
+    ws.title = "Aug"
+    ws.cell(row=12, column=2, value="지훈결석")   # listed on the 3rd: the one that bills
+    ws.cell(row=12, column=3, value="지훈결석")   # not on the 5th's lesson: nothing billed
+    ws.cell(row=13, column=3, value="예린결석")   # nobody taught here sounds like 예린
+    ws.cell(row=12, column=4, value="도윤결석")   # no lessons on the 7th at all
+    buf = io.BytesIO()
+    wb.save(buf)
+    out = sp.parse_workbook(io.BytesIO(buf.getvalue()), ["Aug"], 2026)
+    notes = sorted((w["date"].day, w["message"]) for w in out["warnings"]
+                   if w["message"].startswith("a note says"))
+    assert len(notes) == 2, notes
+    assert notes[0][0] == 3 and "Nam Jihoon is still on G10 Math on Mon 03 Aug" in notes[0][1], notes
+    assert notes[1][0] == 5 and "has a name like 예린" in notes[1][1], notes
+    # A note only ever decides a warning; nobody's status is changed by it.
+    first = next(s for s in out["sessions"] if s["date"].day == 3)
+    assert all(a["status"] != sp.CANCELLED for a in first["attendance"]), first["attendance"]
+
+    def fit(note, name):
+        return max((sp._answers_to(readings, sp._roster_sounds(name))
+                    for _, readings in sp._note_people(note)), default=0)
+    assert fit("우진결석", "Kim Woojin") and fit("아윤,찬혁 캔슬", "Chanhyuk Ahn")
+    assert fit("에스더 결석", "Esther Nam"), "an English name written in Hangul"
+    assert fit("민이 급한국행", "Min"), "a name with the fond 이 on the end"
+    assert fit("홍서현 여행", "Hong Seohyun") == 2 and fit("홍서현 여행", "Seohyun") == 1
+    assert not fit("서현결석", "Suhyun"), "서현 and 수현 are two different children"
+    assert not fit("Cancelled", "Nam Jihoon")
+
+    day = dt.date(2026, 8, 24)
+    assert dt.date(2026, 8, 27) in sp._note_dates("27일 지훈결석", day)
+    assert sp._note_dates("예린결석>>8월28일 보강", day) == {day}, "a make-up date is not an absence"
+    assert sp._note_dates("지훈 10월1일 결석", day) == {dt.date(2026, 10, 1)}, "about October, not today"
+    assert sp._note_dates("24-26 여행", day) == {dt.date(2026, 8, d) for d in (24, 25, 26)}
+    assert sp._note_dates("7/6-9 여행", day) == {dt.date(2026, 7, d) for d in range(6, 10)}
+    return "a note warns only when someone it names is still listed, or it matches nobody"
 
 
 def t_joined_times():
@@ -672,6 +716,7 @@ for name, fn in [
     ("grade-prefix student match", t_grade_prefix_match),
     ("time sharing a line", t_time_shares_a_line),
     ("lesson under the time axis", t_late_lesson_below_axis),
+    ("absence notes matched to lessons", t_absence_notes),
     ("'6pm7.30pm' joined times", t_joined_times),
     ("ONLINE day labels", t_online_day_label),
     ("standard rate by grade", t_standard_rate_by_grade),
