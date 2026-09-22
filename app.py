@@ -2580,12 +2580,6 @@ def credits_tab() -> None:
         "off the lesson — is owed back. It comes off their next invoice by itself."
     )
     credits = db.get_credits()
-    if not credits:
-        st.info(
-            "No credits yet. A class cancelled before its invoice goes out is "
-            "simply left off it; one missed after shows up here."
-        )
-        return
 
     # By the month of the class that was missed: "what did September's
     # cancellations come to" is the question this answers.
@@ -2628,6 +2622,14 @@ def credits_tab() -> None:
         "Refunded", f"${sum(c['Amount'] for c in refunded):,.2f}",
         help=f"{len(refunded)} credit(s) for classes in {period}, paid back in money.",
     )
+    # The filter stays in view even with nothing to filter: a screen that
+    # hides its controls until there is data reads as one missing them.
+    if not credits:
+        st.info(
+            "No credits yet. A class cancelled before its invoice goes out is "
+            "simply left off it; one missed after it has gone out shows up here."
+        )
+        return
 
     def when(credit):
         return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
