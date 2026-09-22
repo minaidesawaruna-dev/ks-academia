@@ -744,6 +744,20 @@ def get_unpriced_subjects(class_ids=None):
     nothing -- years of lessons billed before prices were kept in the app
     would otherwise all read as unpriced.
     """
+    # The "already on an issued invoice" test is done by the database, so
+    # once a month is billed its lessons never leave it: with everything
+    # invoiced this reads nothing, where it used to fetch every lesson ever
+    # taught and every invoice line to throw them all away here.
+    billed = (
+        select(InvoiceItem.id)
+        .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+        .where(
+            Invoice.status == "Issued",
+            InvoiceItem.session_id == ClassSession.id,
+            Invoice.student_id == SessionAttendance.student_id,
+        )
+        .exists()
+    )
     with SessionLocal() as session:
         rows = session.execute(
             select(
@@ -753,7 +767,6 @@ def get_unpriced_subjects(class_ids=None):
                 AcademyClass.name,
                 Teacher.id,
                 Teacher.name,
-                SessionAttendance.student_id,
             )
             .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
             .join(Teacher, ClassSession.teacher_id == Teacher.id)
@@ -761,25 +774,18 @@ def get_unpriced_subjects(class_ids=None):
             .where(
                 ClassSession.status != "Cancelled",
                 SessionAttendance.is_cancelled.is_(False),
+                ~billed,
                 *([ClassSession.class_id.in_([int(c) for c in class_ids])]
                   if class_ids is not None else []),
             )
+            .distinct()
         ).all()
-        billed = set(
-            session.execute(
-                select(Invoice.student_id, InvoiceItem.session_id)
-                .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
-                .where(Invoice.status == "Issued", InvoiceItem.session_id.is_not(None),
-                       *([InvoiceItem.session_id.in_({row[0] for row in rows})]
-                         if class_ids is not None else []))
-            ).all()
-        )
         rates = _rate_index(session, {row[1] for row in rows})
         subjects: dict[int, dict[str, Any]] = {}
         counted: set[int] = set()
-        for session_id, class_id, when, name, teacher_id, teacher, student_id in rows:
+        for session_id, class_id, when, name, teacher_id, teacher in rows:
             when = _as_day(when)
-            if (student_id, session_id) in billed or session_id in counted:
+            if session_id in counted:
                 continue
             if _rate_lookup(rates, class_id, when) > UNSET_RATE:
                 continue
@@ -1412,7 +1418,13 @@ def _attendance_status(row):
 
 
 def get_teacher_classes_for_schedule(teacher_id, on_date):
-    """Return a teacher's reusable classes, current price, and roster."""
+    """Return a teacher's reusable classes, current price, and roster.
+
+    Three queries whatever the number of subjects -- the subjects, every
+    price period they have, every enrolment -- rather than two per subject:
+    the Schedule screen asks this on every render, and a teacher with a
+    dozen subjects cost it five seconds of round trips on the live app.
+    """
 
     with SessionLocal() as session:
         classes = session.scalars(
@@ -1423,29 +1435,32 @@ def get_teacher_classes_for_schedule(teacher_id, on_date):
             )
             .order_by(AcademyClass.name)
         ).all()
+        ids = [academy_class.id for academy_class in classes]
+        # The period in force on the day; where two overlap, the one that
+        # started latest -- as the per-subject query ordered them.
+        rate_on: dict[int, ClassRate] = {}
+        for rate in session.scalars(
+            select(ClassRate).where(
+                ClassRate.class_id.in_(ids),
+                ClassRate.effective_from <= on_date,
+                ClassRate.effective_to.is_(None) | (ClassRate.effective_to >= on_date),
+            )
+        ).all() if ids else []:
+            current = rate_on.get(rate.class_id)
+            if current is None or rate.effective_from > current.effective_from:
+                rate_on[rate.class_id] = rate
+        roster: dict[int, list[Student]] = defaultdict(list)
+        for class_id, student in session.execute(
+            select(Enrolment.class_id, Student)
+            .join(Student, Enrolment.student_id == Student.id)
+            .where(Enrolment.class_id.in_(ids), Student.is_active.is_(True))
+            .order_by(Student.full_name)
+        ).all() if ids else []:
+            roster[class_id].append(student)
         results = []
         for academy_class in classes:
-            rate = session.scalar(
-                select(ClassRate)
-                .where(
-                    ClassRate.class_id == academy_class.id,
-                    ClassRate.effective_from <= on_date,
-                    (
-                        ClassRate.effective_to.is_(None)
-                        | (ClassRate.effective_to >= on_date)
-                    ),
-                )
-                .order_by(ClassRate.effective_from.desc())
-            )
-            students = session.execute(
-                select(Student)
-                .join(Enrolment, Enrolment.student_id == Student.id)
-                .where(
-                    Enrolment.class_id == academy_class.id,
-                    Student.is_active.is_(True),
-                )
-                .order_by(Student.full_name)
-            ).scalars().all()
+            rate = rate_on.get(academy_class.id)
+            students = roster[academy_class.id]
             results.append(
                 {
                     "ID": academy_class.id,
@@ -1957,34 +1972,8 @@ def set_subject_note(class_id, note):
         return "updated"
 
 
-def get_student_usage(student_id):
-    """How much a student is tied into: subjects, classes, invoices sent."""
-
-    with SessionLocal() as session:
-        subjects = session.scalar(
-            select(func.count())
-            .select_from(Enrolment)
-            .where(Enrolment.student_id == student_id)
-        )
-        classes = session.scalar(
-            select(func.count())
-            .select_from(SessionAttendance)
-            .where(SessionAttendance.student_id == student_id)
-        )
-        invoices = session.scalar(
-            select(func.count())
-            .select_from(Invoice)
-            .where(Invoice.student_id == student_id, Invoice.status == "Issued")
-        )
-        return {
-            "subjects": int(subjects or 0),
-            "classes": int(classes or 0),
-            "invoices": int(invoices or 0),
-        }
-
-
 def get_student_usage_many(student_ids):
-    """The same figures as ``get_student_usage``, for a whole screen at once.
+    """How much each student is tied into -- subjects, classes, invoices sent -- for a whole screen at once.
 
     Three grouped queries rather than three per student. The Students screen
     draws 25 rows, and asking per row cost a hundred round trips to a
@@ -3121,19 +3110,6 @@ def refund_credits(credit_ids, refunded_on=None):
             credit.settled_on = refunded_on or date.today()
         session.commit()
         return len(credits)
-
-
-def get_student_credit_total(student_id):
-    """What a student is owed and has not yet had deducted."""
-    with SessionLocal() as session:
-        return float(
-            session.scalar(
-                select(func.coalesce(func.sum(Credit.amount), 0.0)).where(
-                    Credit.student_id == student_id, Credit.status == "Open"
-                )
-            )
-            or 0.0
-        )
 
 
 def get_student_credit_totals(student_ids):

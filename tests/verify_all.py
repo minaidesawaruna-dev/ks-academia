@@ -692,29 +692,41 @@ def t_cancelled_classes_credited():
 
 
 def t_student_batch_matches_single():
-    """The Students screen's figures must not change by being fetched together.
+    """The Students screen's figures, fetched for a screen at once, match the records.
 
     One row's worth of figures used to cost four queries, so a screen of 25
     students cost a hundred round trips. They are collected in one pass now,
-    which is only worth doing if it says exactly the same thing.
+    which is only worth doing if it says exactly what the records do --
+    counted here straight from the tables, student by student.
     """
     import db
+    from sqlalchemy import func, select
 
     ids = [row["ID"] for row in db.get_all_students()][:30]
     if not ids:
         return "no students to compare"
     usage = db.get_student_usage_many(ids)
     credits = db.get_student_credit_totals(ids)
-    for student_id in ids:
-        assert usage.get(student_id) == db.get_student_usage(student_id), (
-            f"usage differs for student {student_id}"
-        )
-        assert abs(credits.get(student_id, 0.0)
-                   - db.get_student_credit_total(student_id)) < 0.005, (
-            f"credit differs for student {student_id}"
-        )
+    with db.SessionLocal() as session:
+        def count(model, *where):
+            return session.scalar(select(func.count()).select_from(model).where(*where)) or 0
+        for student_id in ids:
+            expected = {
+                "subjects": count(db.Enrolment, db.Enrolment.student_id == student_id),
+                "classes": count(db.SessionAttendance, db.SessionAttendance.student_id == student_id),
+                "invoices": count(db.Invoice, db.Invoice.student_id == student_id,
+                                  db.Invoice.status == "Issued"),
+            }
+            assert usage.get(student_id) == expected, f"usage differs for student {student_id}"
+            owed = session.scalar(
+                select(func.coalesce(func.sum(db.Credit.amount), 0))
+                .where(db.Credit.student_id == student_id, db.Credit.status == "Open")
+            ) or 0
+            assert abs(credits.get(student_id, 0.0) - float(owed)) < 0.005, (
+                f"credit differs for student {student_id}"
+            )
     assert db.get_student_usage_many([]) == {} and db.get_student_credit_totals([]) == {}
-    return f"{len(ids)} students' figures identical either way"
+    return f"{len(ids)} students' figures match the records"
 
 
 def t_korean_pdf():
@@ -828,7 +840,7 @@ for name, fn in [
     ("no credentials committed to the repo", t_no_credentials_in_repo),
     ("every read query runs on this backend", t_read_functions_all_run),
     ("batched invoices match single", t_batch_matches_single),
-    ("batched student figures match single", t_student_batch_matches_single),
+    ("student figures match the records", t_student_batch_matches_single),
     ("long names fit their columns", t_long_names_fit_their_columns),
     ("import prices by grade", t_import_prices_by_grade),
     ("cancelled classes credited", t_cancelled_classes_credited),
