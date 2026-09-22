@@ -28,10 +28,14 @@ from collections import Counter, defaultdict
 from typing import Any
 
 import db
-from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, name_sound, standard_rate
+from schedule_parser import (
+    JUNIOR_RATE, MERGE_THRESHOLD, SENIOR_RATE, _bare, _suffix, name_sound, standard_rate,
+)
 
 __all__ = [
     "backfill",
+    "price_rule",
+    "price_by_rule",
     "apply_review_decisions",
     "suggest_class_renames",
     "suggest_student_matches",
@@ -146,6 +150,83 @@ def suggest_class_renames(
         if owner and owner.casefold() != teacher_name.casefold():
             collisions[name] = f"{name} ({teacher_name})"
     return collisions
+
+
+def _grade_rate(grade: int) -> float:
+    return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
+
+
+def grades_text(grades: list[int]) -> str:
+    """[9, 10] -> "Grades 9–10"; [9, 11] -> "Grades 9 and 11"; [12] -> "Grade 12"."""
+    if len(grades) == 1:
+        return f"Grade {grades[0]}"
+    if grades == list(range(grades[0], grades[-1] + 1)):
+        return f"Grades {grades[0]}–{grades[-1]}"
+    return "Grades " + ", ".join(map(str, grades[:-1])) + f" and {grades[-1]}"
+
+
+def price_rule(subjects: list[dict], rates: list[dict] | None = None) -> dict[int, tuple[float, str, bool]]:
+    """What the academy's price rule makes each subject: ``{class_id: (rate, why, certain)}``.
+
+    Grade 11 and above is $65/h, everything else $60/h. The grade comes from
+    the subject's name; failing that the subject's own price from another
+    month stands ("Basic Eng", $65 from August); failing that its students'
+    grades elsewhere decide. ``certain`` is False where it is the $60
+    default -- a group either side of the line, or nobody's grade known --
+    which only ever fills a subject that has no price, never replaces one
+    somebody chose. ``rates`` is ``db.get_all_class_rates()`` when the caller
+    already has it.
+    """
+    ungraded = [item["Class ID"] for item in subjects if not standard_rate(item["Class"])]
+    student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
+    chosen: dict[int, tuple[dt.date, float]] = {}
+    for row in (rates if rates is not None else db.get_all_class_rates()) if ungraded else []:
+        starts = row["Effective From"]
+        starts = starts if isinstance(starts, dt.date) else dt.date.fromisoformat(str(starts))
+        if row["Hourly Rate"] > db.UNSET_RATE and starts >= chosen.get(row["Class ID"], (dt.date.min, 0))[0]:
+            chosen[row["Class ID"]] = (starts, row["Hourly Rate"])
+    rule: dict[int, tuple[float, str, bool]] = {}
+    for item in subjects:
+        named = standard_rate(item["Class"])
+        grades = sorted(set(student_grades.get(item["Class ID"], [])))
+        bands = {_grade_rate(grade) for grade in grades}
+        own = chosen.get(item["Class ID"])
+        if named:
+            rule[item["Class ID"]] = (named, "", True)
+        elif own:
+            rule[item["Class ID"]] = (own[1], f"its own price from {own[0]:%B %Y}", True)
+        elif len(bands) == 1:
+            rule[item["Class ID"]] = (bands.pop(), f"its students are in {grades_text(grades)}", True)
+        elif grades:
+            rule[item["Class ID"]] = (JUNIOR_RATE, f"students in {grades_text(grades)}", False)
+        else:
+            rule[item["Class ID"]] = (JUNIOR_RATE, "grade not known", False)
+    return rule
+
+
+def price_by_rule(unpriced: list[dict]) -> tuple[int, list[dict]]:
+    """Price every subject listed (from ``db.get_unpriced_subjects``) by the rule.
+
+    Each from the first month it has no price, all in one commit, so nothing
+    clicked meanwhile can leave half of them priced. A subject priced again
+    part-way through -- placeholder in spring, a real price in summer,
+    placeholder again since -- still has a gap after one pass; another closes
+    it. Returns how many were priced and any still without a price.
+    """
+    if not unpriced:
+        return 0, []
+    rule = price_rule(unpriced)
+    done: set[int] = set()
+    for _ in range(3):
+        db.set_class_rates_for_months(
+            (item["Class ID"], dt.date(*item["Months"][0], 1), rule[item["Class ID"]][0])
+            for item in unpriced
+        )
+        done |= {item["Class ID"] for item in unpriced}
+        unpriced = db.get_unpriced_subjects(class_ids=list(rule))
+        if not unpriced:
+            break
+    return len(done), unpriced
 
 
 def _without_grade(name: str) -> str:
@@ -536,6 +617,14 @@ def backfill(
         created["lessons_removed"] = reconciled["lessons_removed"]
     if reconciled["credits_raised"]:
         created["credits_raised"] = reconciled["credits_raised"]
+
+    # No subject is left on the placeholder. A name with a grade was priced
+    # as it was created; the rest are priced here, once their lessons are in
+    # and their students' grades can be read -- else the $60 default. A
+    # placeholder only ever meant an invoice nobody could send.
+    priced, _ = price_by_rule(db.get_unpriced_subjects(class_ids=imported_class_ids))
+    if priced:
+        created["priced_by_rule"] = priced
 
     for (year, month), stats in period_stats.items():
         db._record_import(

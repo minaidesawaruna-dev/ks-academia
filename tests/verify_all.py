@@ -577,11 +577,12 @@ def t_long_names_fit_their_columns():
 
 
 def t_import_prices_by_grade():
-    """An imported class arrives at the academy's price for its grade.
+    """An imported subject arrives priced; none is left on the placeholder.
 
-    Grade 10 and below is $60/h, above it $65/h. A subject whose name says
-    no grade has no standard price and must stay on the placeholder, which
-    billing refuses to issue at -- better a prompt than a figure nobody chose.
+    Grade 10 and below is $60/h, above it $65/h. The grade is read from the
+    subject's name, else from its students' grades in their other subjects,
+    else the $60 default the academy asked for -- a placeholder only ever
+    meant an invoice nobody could send.
     """
     import tempfile
 
@@ -590,24 +591,29 @@ def t_import_prices_by_grade():
         "db.initialise_database();"
         "db.create_teacher('Teacher A');"
         "teacher = db.get_all_teachers()[0]['ID'];"
-        "lesson = lambda name, day: {'class_name': name, 'date': dt.date(2026, 8, day),"
+        "lesson = lambda name, day, who: {'class_name': name, 'date': dt.date(2026, 8, day),"
         "  'start_time': dt.time(9), 'end_time': dt.time(11), 'warnings': [],"
-        "  'attendance': [{'student_name': 'Seo Yerin', 'status': 'Attending'}]};"
-        "preview = {'sessions': [lesson('G9 Science', 3), lesson('G12 Econs HL', 4),"
-        "                        lesson('Basic Eng', 5)], 'name_reviews': []};"
+        "  'attendance': [{'student_name': who, 'status': 'Attending'}]};"
+        "preview = {'sessions': [lesson('G9 Science', 3, 'Seo Yerin'),"
+        "  lesson('G12 Econs HL', 4, 'Nam Jihoon'), lesson('Basic Eng', 5, 'Seo Yerin'),"
+        "  lesson('Essay Club', 6, 'Nam Jihoon'), lesson('Art Club', 7, 'Oh Minseok')],"
+        "  'name_reviews': []};"
         "schedule_backfill.backfill(preview, teacher);"
         "rates = {row['Class']: row['Hourly Rate'] for row in db.get_all_class_rates()};"
-        "print(rates.get('G9 Science'), rates.get('G12 Econs HL'), rates.get('Basic Eng'))"
+        "print(*[rates.get(n) for n in ('G9 Science', 'G12 Econs HL', 'Basic Eng', 'Essay Club', 'Art Club')]);"
+        "print(len(db.get_unpriced_subjects()))"
     )
     with tempfile.TemporaryDirectory() as folder:
         url = "sqlite:///" + os.path.join(folder, "rates.db").replace("\\", "/")
         result = run(["-c", script], {"DATABASE_URL": url})
         assert result.returncode == 0, result.stderr[-400:]
-        junior, senior, unnamed = result.stdout.split()
-        assert float(junior) == 60.0, f"G9 priced at {junior}"
-        assert float(senior) == 65.0, f"G12 priced at {senior}"
-        assert float(unnamed) == 1.0, f"a subject with no grade priced at {unnamed}"
-    return "G9 at $60/h, G12 at $65/h, a gradeless subject left unpriced"
+        prices, unpriced = result.stdout.strip().splitlines()[-2:]
+        got = dict(zip(("G9 Science", "G12 Econs HL", "Basic Eng", "Essay Club", "Art Club"),
+                       map(float, prices.split())))
+    assert got == {"G9 Science": 60.0, "G12 Econs HL": 65.0, "Basic Eng": 60.0,
+                   "Essay Club": 65.0, "Art Club": 60.0}, got
+    assert unpriced == "0", f"{unpriced} subject(s) left on the placeholder"
+    return "by name (G9 $60, G12 $65), by students' grades, else $60; none on the placeholder"
 
 
 _CREDIT_SCRIPT = '''

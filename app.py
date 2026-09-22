@@ -869,6 +869,12 @@ def _import_upload_panel() -> None:
                     "duplicate time slot from the workbook's overlapping month "
                     "columns, or an unresolved class-name collision."
                 )
+            priced = counts.get("priced_by_rule", 0)
+            if priced:
+                message += (
+                    f" {priced} subject(s) without a grade in the name were priced by "
+                    "their students' grades, or $60/h — change any under Teacher detail."
+                )
             removed = counts.get("lessons_removed", 0)
             if removed:
                 message += (
@@ -899,67 +905,38 @@ def _import_upload_panel() -> None:
             st.warning(f"Nothing imported ({result['status']}).")
 
 
-def _price_rule(subjects: list[dict]) -> dict[int, tuple[float, str, bool]]:
-    """What the academy's price rule makes each subject: (rate, why, certain).
-
-    Grade 11 and above is $65/h, everything else $60/h. The grade comes from
-    the subject's name; failing that the subject's own price from another
-    month stands; failing that its students' grades elsewhere decide.
-    ``certain`` is False where it is the $60 default -- a group either side of
-    the line, or nobody's grade known -- which only ever fills a subject that
-    has no price, never replaces one somebody chose.
-    """
-    ungraded = [item["Class ID"] for item in subjects
-                if not schedule_parser.standard_rate(item["Class"])]
-    student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
-    # A subject with no grade in its name but a price somebody chose in
-    # another month -- "Basic Eng", $65 from August -- is that price in the
-    # months it lacks one, not the default.
-    chosen: dict[int, tuple[dt.date, float]] = {}
-    for row in db.get_all_class_rates() if ungraded else []:
-        starts = _as_date(row["Effective From"])
-        if row["Hourly Rate"] > db.UNSET_RATE and starts >= chosen.get(row["Class ID"], (dt.date.min, 0))[0]:
-            chosen[row["Class ID"]] = (starts, row["Hourly Rate"])
-    rule: dict[int, tuple[float, str, bool]] = {}
-    for item in subjects:
-        named = schedule_parser.standard_rate(item["Class"])
-        grades = sorted(set(student_grades.get(item["Class ID"], [])))
-        bands = {_grade_rate(grade) for grade in grades}
-        own = chosen.get(item["Class ID"])
-        if named:
-            rule[item["Class ID"]] = (named, "", True)
-        elif own:
-            rule[item["Class ID"]] = (own[1], f"its own price from {own[0]:%B %Y}", True)
-        elif len(bands) == 1:
-            rule[item["Class ID"]] = (bands.pop(), f"its students are in {_grades(grades)}", True)
-        elif grades:
-            rule[item["Class ID"]] = (schedule_parser.JUNIOR_RATE,
-                                      f"students in {_grades(grades)}", False)
-        else:
-            rule[item["Class ID"]] = (schedule_parser.JUNIOR_RATE, "grade not known", False)
-    return rule
+def _price_all_button(unpriced: list[dict], key: str) -> None:
+    """One click that prices every subject listed by the academy's rule."""
+    if st.button(
+        f"Price all {len(unpriced)} by grade — ${schedule_parser.SENIOR_RATE:,.0f}/h Grade 11 "
+        f"and above, ${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise",
+        type="primary", key=key, width="stretch",
+    ):
+        with st.spinner(f"Pricing {len(unpriced)} subject(s)…"):
+            done, left = schedule_backfill.price_by_rule(unpriced)
+        _flash(f"Priced {done} subject(s) by grade."
+               + (f" {len(left)} still have no price." if left else ""))
+        _rerun()
 
 
 def _unpriced_everywhere() -> None:
-    """Every subject without a price, in any month, priced by the rule in one go.
+    """Every subject without a price, in any month, in plain sight with its fix.
 
-    The Invoices screen prices one month at a time, and a subject imported
-    with no grade in its name sat on the placeholder in every month since,
-    each needing its own visit. This finds them all, says what each will be
-    and why, and prices each from the first month it has none.
+    An upload prices every new subject now; this catches any left from before
+    that, or a price removed by hand. A warning, not a fold -- a subject with
+    no price is an invoice nobody can send.
     """
     unpriced = db.get_unpriced_subjects()
     if not unpriced:
         return
-    rule = _price_rule(unpriced)
     lessons = sum(item["Sessions"] for item in unpriced)
-    with st.expander(f"⚠️ {len(unpriced)} subject(s) have no price — {lessons} lessons, all months"):
-        st.caption(
-            f"The academy's rule: ${schedule_parser.SENIOR_RATE:,.0f}/h for Grade 11 and "
-            f"above, ${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise — including where the "
-            "grade isn't known. Each is priced from the first month it has no price; "
-            "any price can be changed afterwards under Teacher detail."
-        )
+    st.warning(
+        f"**{len(unpriced)} subject(s) have no price** — {lessons} lesson(s) that can't be "
+        "invoiced until they do."
+    )
+    _price_all_button(unpriced, "price_everything")
+    with st.expander("Which, and the price each would get"):
+        rule = schedule_backfill.price_rule(unpriced)
         st.dataframe(
             [
                 {
@@ -975,41 +952,6 @@ def _unpriced_everywhere() -> None:
             width="stretch",
             hide_index=True,
         )
-        if st.button(f"Price all {len(unpriced)} by grade", type="primary",
-                     key="price_everything", width="stretch"):
-            with st.spinner(f"Pricing {len(unpriced)} subject(s)…"):
-                done = set()
-                # All in one commit, so nothing clicked meanwhile can leave
-                # half of them priced. A subject priced again part-way
-                # through -- placeholder in spring, a real price in summer,
-                # placeholder again since -- still has a gap after one pass;
-                # a second closes it.
-                for _ in range(3):
-                    db.set_class_rates_for_months(
-                        (item["Class ID"], dt.date(*item["Months"][0], 1), rule[item["Class ID"]][0])
-                        for item in unpriced
-                    )
-                    done |= {item["Class ID"] for item in unpriced}
-                    unpriced = [item for item in db.get_unpriced_subjects()
-                                if item["Class ID"] in rule]
-                    if not unpriced:
-                        break
-            _flash(f"Priced {len(done)} subject(s) by grade."
-                   + (f" {len(unpriced)} still have no price — see above." if unpriced else ""))
-            _rerun()
-
-
-def _grade_rate(grade: int) -> float:
-    return schedule_parser.JUNIOR_RATE if grade <= 10 else schedule_parser.SENIOR_RATE
-
-
-def _grades(grades: list[int]) -> str:
-    """[9, 10] -> "Grades 9–10"; [9, 11] -> "Grades 9 and 11"; [12] -> "Grade 12"."""
-    if len(grades) == 1:
-        return f"Grade {grades[0]}"
-    if grades == list(range(grades[0], grades[-1] + 1)):
-        return f"Grades {grades[0]}–{grades[-1]}"
-    return "Grades " + ", ".join(map(str, grades[:-1])) + f" and {grades[-1]}"
 
 
 def _save_subject_rate(class_id: int, month_start: dt.date, rate: float) -> str:
@@ -1084,7 +1026,8 @@ def _bulk_rate_section(
     # the 1st called a G11 subject "no price set" when billing would charge
     # its $65 on every lesson.
     starts_within: dict[int, tuple[dt.date, float]] = {}
-    for row in db.get_all_class_rates():
+    all_rates = db.get_all_class_rates()
+    for row in all_rates:
         starts = _as_date(row["Effective From"])
         ends = _as_date(row["Effective To"]) if row["Effective To"] else None
         if month_start < starts <= month_end:
@@ -1096,7 +1039,7 @@ def _bulk_rate_section(
         if priced_from.get(row["Class ID"], dt.date.min) < starts:
             priced_from[row["Class ID"]] = starts
 
-    rule = _price_rule(subjects)
+    rule = schedule_backfill.price_rule(subjects, rates=all_rates)
 
     selected_ids: list[int] = []
     for item in subjects:
@@ -2796,14 +2739,16 @@ def _unpriced_warning(year: int, month: int) -> None:
     lessons = sum(item["Sessions"] for item in unpriced)
     hours = sum(item["Hours"] for item in unpriced)
     st.warning(
-        f"**{len(unpriced)} subject(s) have no real price for "
-        f"{calendar.month_name[month]} {year}** — {lessons} class(es) "
-        f"({hours:,.1f}h) would go out at the ${db.UNSET_RATE:,.2f}/h "
-        "placeholder an import leaves behind, or at nothing at all where no "
-        "price was ever set. Set the prices first."
+        f"**{len(unpriced)} subject(s) have no price for "
+        f"{calendar.month_name[month]} {year}** — {lessons} class(es) ({hours:,.1f}h) "
+        "can't be invoiced until they do."
+    )
+    _price_all_button(
+        db.get_unpriced_subjects(class_ids=[item["Class ID"] for item in unpriced]),
+        f"price_month_{year}_{month}",
     )
     if st.checkbox(
-        f"Set prices for the {len(unpriced)} unpriced subject(s)",
+        "Or set them one by one",
         key=f"fix_prices_{year}_{month}",
     ):
         _bulk_rate_section(

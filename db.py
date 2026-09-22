@@ -734,7 +734,7 @@ def get_all_teachers():
         ]
 
 
-def get_unpriced_subjects():
+def get_unpriced_subjects(class_ids=None):
     """Every subject with a lesson on no real price, and the months it lacks one in.
 
     All months, not one: a price is set from a month onward, so pricing each
@@ -761,13 +761,17 @@ def get_unpriced_subjects():
             .where(
                 ClassSession.status != "Cancelled",
                 SessionAttendance.is_cancelled.is_(False),
+                *([ClassSession.class_id.in_([int(c) for c in class_ids])]
+                  if class_ids is not None else []),
             )
         ).all()
         billed = set(
             session.execute(
                 select(Invoice.student_id, InvoiceItem.session_id)
                 .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
-                .where(Invoice.status == "Issued", InvoiceItem.session_id.is_not(None))
+                .where(Invoice.status == "Issued", InvoiceItem.session_id.is_not(None),
+                       *([InvoiceItem.session_id.in_({row[0] for row in rows})]
+                         if class_ids is not None else []))
             ).all()
         )
         rates = _rate_index(session, {row[1] for row in rows})
