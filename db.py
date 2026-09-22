@@ -1505,11 +1505,14 @@ def create_class_and_first_session(
             Enrolment(class_id=academy_class.id, student_id=student.id)
             for student in valid_students
         )
+        # From the 1st of the month, as every other price is: a price that
+        # started on the first lesson's date read as "no price set" to
+        # anything asking what the month is priced at.
         session.add(
             ClassRate(
                 class_id=academy_class.id,
                 hourly_rate=hourly_rate,
-                effective_from=session_date,
+                effective_from=session_date.replace(day=1),
             )
         )
 

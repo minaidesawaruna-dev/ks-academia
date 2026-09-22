@@ -963,10 +963,20 @@ def _bulk_rate_section(
     # pricing a fresh month. A rate period always starts on the 1st, so the
     # one covering this month either starts on it -- set here -- or earlier,
     # in which case the label names the month the price carries over from.
+    month_end = dt.date(year, month, calendar.monthrange(year, month)[1])
     priced_from: dict[int, dt.date] = {}
+    # A subject created by an import is priced from its first lesson, which
+    # can fall after the 1st. That price is still this month's: reading only
+    # the 1st called a G11 subject "no price set" when billing would charge
+    # its $65 on every lesson.
+    starts_within: dict[int, tuple[dt.date, float]] = {}
     for row in db.get_all_class_rates():
         starts = _as_date(row["Effective From"])
         ends = _as_date(row["Effective To"]) if row["Effective To"] else None
+        if month_start < starts <= month_end:
+            if row["Class ID"] not in starts_within or starts < starts_within[row["Class ID"]][0]:
+                starts_within[row["Class ID"]] = (starts, row["Hourly Rate"])
+            continue
         if starts > month_start or (ends and ends < month_start):
             continue
         if priced_from.get(row["Class ID"], dt.date.min) < starts:
@@ -977,6 +987,9 @@ def _bulk_rate_section(
         class_id = item["Class ID"]
         month_rate = month_rates.get(class_id)
         starts = priced_from.get(class_id)
+        if not (month_rate and month_rate > db.UNSET_RATE) and class_id in starts_within:
+            month_rate = starts_within[class_id][1]
+            starts = month_start
         # The placeholder an import seeds is not a price anybody chose, so it
         # reads as unset here -- same as it does in the Invoices warning.
         if not (month_rate and month_rate > db.UNSET_RATE):
