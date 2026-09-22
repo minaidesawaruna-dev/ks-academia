@@ -2611,24 +2611,33 @@ def credits_tab() -> None:
     def when(credit):
         return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
 
-    st.markdown(f"#### Waiting for the next invoice ({len(waiting)})")
+    # One line a student, with what they are owed; open it for the classes
+    # behind the figure. A parent asks "why is there a credit on my bill",
+    # and the answer is one click from their child's name.
+    by_student: dict[int, list[dict]] = {}
+    for credit in waiting:
+        by_student.setdefault(credit["Student ID"], []).append(credit)
+    st.markdown(f"#### Waiting for the next invoice ({len(by_student)} student(s))")
     if waiting:
-        st.dataframe(
-            [
-                {
-                    "Student": c["Student"],
-                    "Teacher": c["Teacher"] or "—",
-                    "Subject": c["Subject"],
-                    "Class": when(c),
-                    "Amount": f"${c['Amount']:,.2f}",
-                    "Why": c["Reason"],
-                    "Raised": c["Created"],
-                }
-                for c in waiting
-            ],
-            width="stretch",
-            hide_index=True,
-        )
+        for owed in sorted(by_student.values(), key=lambda cs: cs[0]["Student"].casefold()):
+            with st.expander(
+                f"**{owed[0]['Student']}** — ${sum(c['Amount'] for c in owed):,.2f} "
+                f"· {len(owed)} class(es)"
+            ):
+                st.dataframe(
+                    [
+                        {
+                            "Class": when(c),
+                            "Subject": c["Subject"],
+                            "Teacher": c["Teacher"] or "—",
+                            "Amount": f"${c['Amount']:,.2f}",
+                            "Why": c["Reason"],
+                        }
+                        for c in sorted(owed, key=lambda c: c["Class date"] or dt.date.min)
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
         with st.expander("Paying one back in money instead"):
             labels = {
                 f"{c['Student']} — {c['Subject']} {when(c)} — ${c['Amount']:,.2f}": c
@@ -2650,27 +2659,39 @@ def credits_tab() -> None:
     else:
         st.caption("None waiting." if not search else "None waiting for that name.")
 
-    st.markdown(f"#### Settled ({len(settled)})")
+    settled_by: dict[int, list[dict]] = {}
+    for credit in settled:
+        settled_by.setdefault(credit["Student ID"], []).append(credit)
+    st.markdown(f"#### Settled ({len(settled_by)} student(s))")
     if settled:
-        st.dataframe(
-            [
-                {
-                    "Student": c["Student"],
-                    "Subject": c["Subject"],
-                    "Class": when(c),
-                    "Amount": f"${c['Amount']:,.2f}",
-                    "How": (f"Taken off invoice #{c['Invoice number']}"
-                            if c["Status"] == "Applied" and c["Invoice number"]
-                            else "Taken off an invoice" if c["Status"] == "Applied"
-                            else "Refunded"),
-                    "On": c["Settled"],
-                }
-                for c in sorted(settled, key=lambda c: c["Settled"] or dt.date.min,
-                                reverse=True)[:300]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
+        # The most recently settled first, and no more than a screenful of
+        # names -- search above finds anyone further back.
+        latest = sorted(settled_by.values(),
+                        key=lambda cs: max(c["Settled"] or dt.date.min for c in cs), reverse=True)
+        for done in latest[:60]:
+            with st.expander(
+                f"{done[0]['Student']} — ${sum(c['Amount'] for c in done):,.2f} "
+                f"· {len(done)} class(es)"
+            ):
+                st.dataframe(
+                    [
+                        {
+                            "Class": when(c),
+                            "Subject": c["Subject"],
+                            "Amount": f"${c['Amount']:,.2f}",
+                            "How": (f"Taken off invoice #{c['Invoice number']}"
+                                    if c["Status"] == "Applied" and c["Invoice number"]
+                                    else "Taken off an invoice" if c["Status"] == "Applied"
+                                    else "Refunded"),
+                            "On": c["Settled"],
+                        }
+                        for c in sorted(done, key=lambda c: c["Class date"] or dt.date.min)
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+        if len(latest) > 60:
+            st.caption(f"Showing the 60 most recent of {len(latest)} — search above for anyone else.")
     else:
         st.caption("None yet.")
 
