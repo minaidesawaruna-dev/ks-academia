@@ -1,6 +1,6 @@
 """KS Academia — scheduling and attendance.
 
-Seven tabs:
+Eight tabs:
 
 * **Teachers** — upload a teacher's Excel schedule (the primary way classes
   enter the system), price a month's subjects, and read one subject's classes.
@@ -9,6 +9,7 @@ Seven tabs:
 * **Schedule** — the month grid, for one-off manual fixes.
 * **Invoices** — bill students for a month's unbilled classes.
 * **Payments** — record what parents have actually paid, in full or in part.
+* **Credits** — classes invoiced and then missed, owed back off the next invoice.
 * **Data** — earnings per teacher by month; student retention, with who is at
   risk of not coming back; and past schedules kept for analysis only.
 * **Reminders** — students overdue on payment.
@@ -2607,77 +2608,128 @@ def _just_issued_panel(year: int, month: int) -> None:
         _rerun()
 
 
-def _credits_section() -> None:
-    """Cancelled classes a student has already paid for, and what to do next.
+def _credits_pointer() -> None:
+    """A line on the Invoices screen saying what credit is waiting, and where it lives."""
+    waiting = db.get_credits(status="Open")
+    if waiting:
+        st.caption(
+            f"{len(waiting)} credit(s) for missed classes, "
+            f"${sum(c['Amount'] for c in waiting):,.2f}, come off students' next "
+            "invoices automatically — see the Credits screen."
+        )
 
-    Nothing here needs touching in the normal case -- an open credit comes
-    off the student's next invoice by itself. It exists for the rare time
-    the money has to go back instead, and so the amounts are never
-    invisible.
+
+def credits_tab() -> None:
+    """Every credit: what is waiting to come off an invoice, and what already has.
+
+    A class a student was invoiced for and then missed -- marked cancelled,
+    or taken off the lesson -- is owed back, and comes off their next invoice
+    by itself. This is where that can be seen, and where the rare credit
+    paid back in money instead is marked refunded.
     """
-    outstanding = db.get_credits(status="Open")
-    settled = [c for c in db.get_credits() if c["Status"] != "Open"]
-    total = sum(c["Amount"] for c in outstanding)
-
-    st.markdown(
-        f"#### Cancellation credits ({len(outstanding)} waiting, ${total:,.2f})"
+    st.subheader("Credits")
+    st.caption(
+        "A class a student was invoiced for and then missed — cancelled, or taken "
+        "off the lesson — is owed back. It comes off their next invoice by itself."
     )
-
-    if not outstanding and not settled:
-        st.caption(
-            "None. A class cancelled before its invoice goes out is simply "
-            "left off it; one cancelled afterwards shows up here."
+    credits = db.get_credits()
+    waiting = [c for c in credits if c["Status"] == "Open"]
+    applied = [c for c in credits if c["Status"] == "Applied"]
+    refunded = [c for c in credits if c["Status"] == "Refunded"]
+    columns = st.columns(3)
+    columns[0].metric(
+        "Waiting", f"${sum(c['Amount'] for c in waiting):,.2f}",
+        help=f"{len(waiting)} credit(s), to come off each student's next invoice.",
+    )
+    columns[1].metric(
+        "Taken off invoices", f"${sum(c['Amount'] for c in applied):,.2f}",
+        help=f"{len(applied)} credit(s) already deducted.",
+    )
+    columns[2].metric(
+        "Refunded", f"${sum(c['Amount'] for c in refunded):,.2f}",
+        help=f"{len(refunded)} credit(s) paid back in money instead.",
+    )
+    if not credits:
+        st.info(
+            "No credits yet. A class cancelled before its invoice goes out is "
+            "simply left off it; one missed after shows up here."
         )
         return
 
-    if not st.checkbox("Show credits", key="credits_show"):
-        return
+    search = st.text_input(
+        "Search", placeholder="Type part of a student's name", key="credits_search"
+    ).strip().casefold()
+    if search:
+        waiting = [c for c in waiting if search in c["Student"].casefold()]
+        settled = [c for c in applied + refunded if search in c["Student"].casefold()]
+    else:
+        settled = applied + refunded
 
-    if outstanding:
-        st.caption(
-            "These come off each student's next invoice automatically. Refund "
-            "one only if the money is actually going back to the parent."
+    def when(credit):
+        return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
+
+    st.markdown(f"#### Waiting for the next invoice ({len(waiting)})")
+    if waiting:
+        st.dataframe(
+            [
+                {
+                    "Student": c["Student"],
+                    "Teacher": c["Teacher"] or "—",
+                    "Subject": c["Subject"],
+                    "Class": when(c),
+                    "Amount": f"${c['Amount']:,.2f}",
+                    "Why": c["Reason"],
+                    "Raised": c["Created"],
+                }
+                for c in waiting
+            ],
+            width="stretch",
+            hide_index=True,
         )
-        for credit in outstanding:
-            columns = st.columns([5, 1.4])
-            when = credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
-            columns[0].write(
-                f"**{credit['Student']}** — {credit['Subject']} {when} "
-                f"· **${credit['Amount']:,.2f}** · {credit['Reason']}"
+        with st.expander("Paying one back in money instead"):
+            labels = {
+                f"{c['Student']} — {c['Subject']} {when(c)} — ${c['Amount']:,.2f}": c
+                for c in waiting
+            }
+            chosen = labels[st.selectbox("Credit", list(labels), key="credit_refund_pick")]
+            st.caption(
+                "Only if the money is actually going back to the parent: a refunded "
+                "credit no longer comes off their next invoice."
             )
-            with columns[1].popover("Refund", width="stretch"):
-                st.write(
-                    f"Pay ${credit['Amount']:,.2f} back to "
-                    f"{credit['Student']} instead of deducting it?"
-                )
-                if st.button("Yes, refunded", key=f"refund_{credit['ID']}"):
-                    outcome = db.refund_credit(credit["ID"])
-                    if outcome == "refunded":
-                        _flash(
-                            f"Marked ${credit['Amount']:,.2f} refunded to "
-                            f"{credit['Student']}."
-                        )
-                        _rerun()
-                    else:
-                        st.warning(f"Could not refund it ({outcome}).")
+            if st.button(f"Mark ${chosen['Amount']:,.2f} refunded to {chosen['Student']}",
+                         key="credit_refund_go"):
+                outcome = db.refund_credit(chosen["ID"])
+                if outcome == "refunded":
+                    _flash(f"Marked ${chosen['Amount']:,.2f} refunded to {chosen['Student']}.")
+                    _rerun()
+                else:
+                    st.warning(f"Could not refund it ({outcome}).")
+    else:
+        st.caption("None waiting." if not search else "None waiting for that name.")
 
+    st.markdown(f"#### Settled ({len(settled)})")
     if settled:
-        with st.expander(f"Already settled ({len(settled)})"):
-            st.dataframe(
-                [
-                    {
-                        "Student": c["Student"],
-                        "Subject": c["Subject"],
-                        "Class date": c["Class date"],
-                        "Amount": f"${c['Amount']:,.2f}",
-                        "Settled": c["Status"],
-                        "On": c["Settled"],
-                    }
-                    for c in settled[:200]
-                ],
-                width="stretch",
-                hide_index=True,
-            )
+        st.dataframe(
+            [
+                {
+                    "Student": c["Student"],
+                    "Subject": c["Subject"],
+                    "Class": when(c),
+                    "Amount": f"${c['Amount']:,.2f}",
+                    "How": (f"Taken off invoice #{c['Invoice number']}"
+                            if c["Status"] == "Applied" and c["Invoice number"]
+                            else "Taken off an invoice" if c["Status"] == "Applied"
+                            else "Refunded"),
+                    "On": c["Settled"],
+                }
+                for c in sorted(settled, key=lambda c: c["Settled"] or dt.date.min,
+                                reverse=True)[:300]
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+    else:
+        st.caption("None yet.")
 
 
 def _issued_lookup_section(counts: dict) -> None:
@@ -2831,7 +2883,7 @@ def _past_invoices_section(year: int, month: int, counts: dict) -> None:
                         db.delete_invoice(invoice["ID"])
                         _rerun()
 
-    _credits_section()
+    _credits_pointer()
     _issued_lookup_section(counts)
 
 
@@ -3047,6 +3099,13 @@ def _paid_list(paid: list[dict], year: int, month: int) -> None:
         return
     for row in shown[:PAID_ROWS]:
         columns = st.columns([5, 1])
+        if row["Paid on"] is None:
+            # Nothing was ever owed: credit for missed classes took the
+            # invoice to $0. There is no payment to show, or to undo.
+            columns[0].markdown(
+                f"**{row['Student']}** — nothing to pay: credit for missed classes covered it"
+            )
+            continue
         amount = row["Paid amount"] if row["Paid amount"] is not None else row["Total"]
         line = (
             f"**{row['Student']}** — ${amount:,.2f} on "
@@ -3856,6 +3915,7 @@ SECTIONS = {
     "Schedule": schedule_tab,
     "Invoices": invoices_tab,
     "Payments": payments_tab,
+    "Credits": credits_tab,
     "Data": data_tab,
     "Reminders": reminders_tab,
 }

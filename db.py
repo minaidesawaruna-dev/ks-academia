@@ -3060,9 +3060,19 @@ def delete_invoice(invoice_id):
 
 
 def get_credits(status=None, student_id=None):
-    """Credits with their student, newest first."""
+    """Credits with their student, the teacher of the class, and the invoice that settled it.
+
+    The teacher comes from the class while it exists; a class since removed
+    from the schedule has lost it, and reads as blank. One query for all.
+    """
     with SessionLocal() as session:
-        query = select(Credit, Student).join(Student, Credit.student_id == Student.id)
+        query = (
+            select(Credit, Student, Teacher.name, Invoice.invoice_number)
+            .join(Student, Credit.student_id == Student.id)
+            .outerjoin(ClassSession, Credit.session_id == ClassSession.id)
+            .outerjoin(Teacher, ClassSession.teacher_id == Teacher.id)
+            .outerjoin(Invoice, Credit.invoice_id == Invoice.id)
+        )
         if status:
             query = query.where(Credit.status == status)
         if student_id:
@@ -3073,17 +3083,19 @@ def get_credits(status=None, student_id=None):
                 "ID": credit.id,
                 "Student": student.full_name,
                 "Student ID": student.id,
+                "Teacher": teacher or "",
                 "Amount": float(credit.amount or 0),
                 "Subject": credit.class_name or "",
                 "Class date": credit.session_date,
                 "Reason": credit.reason,
                 "Status": credit.status,
                 "Invoice ID": credit.invoice_id,
+                "Invoice number": number,
                 "Created": credit.created_on,
                 "Settled": credit.settled_on,
                 "Note": credit.note or "",
             }
-            for credit, student in rows
+            for credit, student, teacher, number in rows
         ]
         results.sort(
             key=lambda row: (row["Status"] != "Open", row["Class date"] or date.min),
@@ -3466,7 +3478,9 @@ def get_invoice_payments(year, month, today=None):
                 unpaid.append(row)
             else:
                 paid.append(row)
-        paid.sort(key=lambda item: (item["Paid on"], item["Student"]), reverse=True)
+        # An invoice a credit took to $0 is settled but was never paid, so
+        # it has no date; it sorts after every real payment.
+        paid.sort(key=lambda item: (item["Paid on"] or date.min, item["Student"]), reverse=True)
         return {"unpaid": unpaid, "paid": paid, "due": due}
 
 
