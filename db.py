@@ -3107,18 +3107,20 @@ def get_credits(status=None, student_id=None):
         return results
 
 
-def refund_credit(credit_id, refunded_on=None):
-    """Settle a credit with money back instead of carrying it forward."""
+def refund_credits(credit_ids, refunded_on=None):
+    """Mark several credits paid back in money, in one commit. Returns how many were open."""
+    ids = [int(value) for value in credit_ids]
+    if not ids:
+        return 0
     with SessionLocal() as session:
-        credit = session.get(Credit, credit_id)
-        if credit is None:
-            return "missing"
-        if credit.status != "Open":
-            return "already_settled"
-        credit.status = "Refunded"
-        credit.settled_on = refunded_on or date.today()
+        credits = session.scalars(
+            select(Credit).where(Credit.id.in_(ids), Credit.status == "Open")
+        ).all()
+        for credit in credits:
+            credit.status = "Refunded"
+            credit.settled_on = refunded_on or date.today()
         session.commit()
-        return "refunded"
+        return len(credits)
 
 
 def get_student_credit_total(student_id):

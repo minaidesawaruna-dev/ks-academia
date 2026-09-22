@@ -2562,13 +2562,17 @@ def _credits_pointer() -> None:
         )
 
 
+_ALL_MONTHS = "All months"
+
+
 def credits_tab() -> None:
     """Every credit: what is waiting to come off an invoice, and what already has.
 
     A class a student was invoiced for and then missed -- marked cancelled,
     or taken off the lesson -- is owed back, and comes off their next invoice
-    by itself. This is where that can be seen, and where the rare credit
-    paid back in money instead is marked refunded.
+    by itself. This is where that can be seen, a student at a time, and
+    where one already paid back in money is marked refunded so it comes off
+    nothing.
     """
     st.subheader("Credits")
     st.caption(
@@ -2576,22 +2580,6 @@ def credits_tab() -> None:
         "off the lesson — is owed back. It comes off their next invoice by itself."
     )
     credits = db.get_credits()
-    waiting = [c for c in credits if c["Status"] == "Open"]
-    applied = [c for c in credits if c["Status"] == "Applied"]
-    refunded = [c for c in credits if c["Status"] == "Refunded"]
-    columns = st.columns(3)
-    columns[0].metric(
-        "Waiting", f"${sum(c['Amount'] for c in waiting):,.2f}",
-        help=f"{len(waiting)} credit(s), to come off each student's next invoice.",
-    )
-    columns[1].metric(
-        "Taken off invoices", f"${sum(c['Amount'] for c in applied):,.2f}",
-        help=f"{len(applied)} credit(s) already deducted.",
-    )
-    columns[2].metric(
-        "Refunded", f"${sum(c['Amount'] for c in refunded):,.2f}",
-        help=f"{len(refunded)} credit(s) paid back in money instead.",
-    )
     if not credits:
         st.info(
             "No credits yet. A class cancelled before its invoice goes out is "
@@ -2599,101 +2587,124 @@ def credits_tab() -> None:
         )
         return
 
-    search = st.text_input(
+    # By the month of the class that was missed: "what did September's
+    # cancellations come to" is the question this answers.
+    today = dt.date.today()
+    years = sorted({c["Class date"].year for c in credits if c["Class date"]} | {today.year},
+                   reverse=True)
+    columns = st.columns([1, 1.4, 2.6])
+    year = columns[0].selectbox("Year", years, key="credits_year")
+    month = columns[1].selectbox(
+        "Month of the class", [_ALL_MONTHS] + list(calendar.month_name[1:]), key="credits_month"
+    )
+    search = columns[2].text_input(
         "Search", placeholder="Type part of a student's name", key="credits_search"
     ).strip().casefold()
-    if search:
-        waiting = [c for c in waiting if search in c["Student"].casefold()]
-        settled = [c for c in applied + refunded if search in c["Student"].casefold()]
-    else:
-        settled = applied + refunded
+
+    def shown(credit) -> bool:
+        day = credit["Class date"]
+        if day is None or day.year != year:
+            return False
+        if month != _ALL_MONTHS and day.month != list(calendar.month_name).index(month):
+            return False
+        return not search or search in credit["Student"].casefold()
+
+    picked = [c for c in credits if shown(c)]
+    waiting = [c for c in picked if c["Status"] == "Open"]
+    applied = [c for c in picked if c["Status"] == "Applied"]
+    refunded = [c for c in picked if c["Status"] == "Refunded"]
+    period = f"{month} {year}" if month != _ALL_MONTHS else str(year)
+    columns = st.columns(3)
+    columns[0].metric(
+        "Waiting", f"${sum(c['Amount'] for c in waiting):,.2f}",
+        help=f"{len(waiting)} credit(s) for classes in {period}, to come off each "
+             "student's next invoice.",
+    )
+    columns[1].metric(
+        "Taken off invoices", f"${sum(c['Amount'] for c in applied):,.2f}",
+        help=f"{len(applied)} credit(s) for classes in {period}, already deducted.",
+    )
+    columns[2].metric(
+        "Refunded", f"${sum(c['Amount'] for c in refunded):,.2f}",
+        help=f"{len(refunded)} credit(s) for classes in {period}, paid back in money.",
+    )
 
     def when(credit):
         return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
 
+    def line(credit):
+        return (f"{when(credit)} · {credit['Subject']} · {credit['Teacher'] or '—'} · "
+                f"${credit['Amount']:,.2f} · {credit['Reason']}")
+
     # One line a student, with what they are owed; open it for the classes
     # behind the figure. A parent asks "why is there a credit on my bill",
-    # and the answer is one click from their child's name.
+    # and the answer is one click from their child's name. A class already
+    # paid back in money is ticked and marked refunded right there, so it
+    # stops coming off their next invoice.
     by_student: dict[int, list[dict]] = {}
     for credit in waiting:
         by_student.setdefault(credit["Student ID"], []).append(credit)
     st.markdown(f"#### Waiting for the next invoice ({len(by_student)} student(s))")
-    if waiting:
-        for owed in sorted(by_student.values(), key=lambda cs: cs[0]["Student"].casefold()):
-            with st.expander(
-                f"**{owed[0]['Student']}** — ${sum(c['Amount'] for c in owed):,.2f} "
-                f"· {len(owed)} class(es)"
+    if not waiting:
+        st.caption(f"None waiting for classes in {period}.")
+    for owed in sorted(by_student.values(), key=lambda cs: cs[0]["Student"].casefold()):
+        student_id = owed[0]["Student ID"]
+        with st.expander(
+            f"**{owed[0]['Student']}** — ${sum(c['Amount'] for c in owed):,.2f} "
+            f"· {len(owed)} class(es)"
+        ):
+            st.caption("Tick a class only if its money has already been paid back to the parent.")
+            ticked = [
+                c for c in sorted(owed, key=lambda c: c["Class date"] or dt.date.min)
+                if st.checkbox(line(c), key=f"credit_refund_{c['ID']}")
+            ]
+            if st.button(
+                f"Mark {len(ticked)} refunded — ${sum(c['Amount'] for c in ticked):,.2f} paid back"
+                if ticked else "Mark refunded",
+                key=f"credit_refund_go_{student_id}", disabled=not ticked,
             ):
-                st.dataframe(
-                    [
-                        {
-                            "Class": when(c),
-                            "Subject": c["Subject"],
-                            "Teacher": c["Teacher"] or "—",
-                            "Amount": f"${c['Amount']:,.2f}",
-                            "Why": c["Reason"],
-                        }
-                        for c in sorted(owed, key=lambda c: c["Class date"] or dt.date.min)
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-        with st.expander("Paying one back in money instead"):
-            labels = {
-                f"{c['Student']} — {c['Subject']} {when(c)} — ${c['Amount']:,.2f}": c
-                for c in waiting
-            }
-            chosen = labels[st.selectbox("Credit", list(labels), key="credit_refund_pick")]
-            st.caption(
-                "Only if the money is actually going back to the parent: a refunded "
-                "credit no longer comes off their next invoice."
-            )
-            if st.button(f"Mark ${chosen['Amount']:,.2f} refunded to {chosen['Student']}",
-                         key="credit_refund_go"):
-                outcome = db.refund_credit(chosen["ID"])
-                if outcome == "refunded":
-                    _flash(f"Marked ${chosen['Amount']:,.2f} refunded to {chosen['Student']}.")
-                    _rerun()
-                else:
-                    st.warning(f"Could not refund it ({outcome}).")
-    else:
-        st.caption("None waiting." if not search else "None waiting for that name.")
+                done = db.refund_credits([c["ID"] for c in ticked])
+                for c in ticked:
+                    st.session_state.pop(f"credit_refund_{c['ID']}", None)
+                _flash(f"Marked {done} credit(s) refunded to {owed[0]['Student']} — "
+                       f"${sum(c['Amount'] for c in ticked):,.2f}. They won't come off an invoice.")
+                _rerun()
 
     settled_by: dict[int, list[dict]] = {}
-    for credit in settled:
+    for credit in applied + refunded:
         settled_by.setdefault(credit["Student ID"], []).append(credit)
     st.markdown(f"#### Settled ({len(settled_by)} student(s))")
-    if settled:
-        # The most recently settled first, and no more than a screenful of
-        # names -- search above finds anyone further back.
-        latest = sorted(settled_by.values(),
-                        key=lambda cs: max(c["Settled"] or dt.date.min for c in cs), reverse=True)
-        for done in latest[:60]:
-            with st.expander(
-                f"{done[0]['Student']} — ${sum(c['Amount'] for c in done):,.2f} "
-                f"· {len(done)} class(es)"
-            ):
-                st.dataframe(
-                    [
-                        {
-                            "Class": when(c),
-                            "Subject": c["Subject"],
-                            "Amount": f"${c['Amount']:,.2f}",
-                            "How": (f"Taken off invoice #{c['Invoice number']}"
-                                    if c["Status"] == "Applied" and c["Invoice number"]
-                                    else "Taken off an invoice" if c["Status"] == "Applied"
-                                    else "Refunded"),
-                            "On": c["Settled"],
-                        }
-                        for c in sorted(done, key=lambda c: c["Class date"] or dt.date.min)
-                    ],
-                    width="stretch",
-                    hide_index=True,
-                )
-        if len(latest) > 60:
-            st.caption(f"Showing the 60 most recent of {len(latest)} — search above for anyone else.")
-    else:
-        st.caption("None yet.")
+    if not settled_by:
+        st.caption(f"None settled for classes in {period}.")
+        return
+    # The most recently settled first, and no more than a screenful of names;
+    # the month and the search narrow it to anyone further back.
+    latest = sorted(settled_by.values(),
+                    key=lambda cs: max(c["Settled"] or dt.date.min for c in cs), reverse=True)
+    for done in latest[:60]:
+        with st.expander(
+            f"{done[0]['Student']} — ${sum(c['Amount'] for c in done):,.2f} "
+            f"· {len(done)} class(es)"
+        ):
+            st.dataframe(
+                [
+                    {
+                        "Class": when(c),
+                        "Subject": c["Subject"],
+                        "Amount": f"${c['Amount']:,.2f}",
+                        "How": (f"Taken off invoice #{c['Invoice number']}"
+                                if c["Status"] == "Applied" and c["Invoice number"]
+                                else "Taken off an invoice" if c["Status"] == "Applied"
+                                else "Refunded"),
+                        "On": c["Settled"],
+                    }
+                    for c in sorted(done, key=lambda c: c["Class date"] or dt.date.min)
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+    if len(latest) > 60:
+        st.caption(f"Showing the 60 most recent of {len(latest)} — pick a month or search.")
 
 
 def _issued_lookup_section(counts: dict) -> None:
