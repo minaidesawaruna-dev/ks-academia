@@ -3676,7 +3676,11 @@ def data_tab() -> None:
     # tangle -- ten colours between them, a key twice the chart's height and
     # cut off, most lines lying flat at $0 -- so only the teachers picked are
     # drawn, and at most eight, which is as many colours as stay distinct.
-    by_teacher = frame.groupby("Teacher")["Invoiced"].sum().sort_values(ascending=False)
+    # A teacher's month is what was invoiced plus what is still to invoice:
+    # drawing invoices alone showed every teacher not yet billed through the
+    # app as a flat line at $0, whatever they taught.
+    frame["Month total"] = frame["Invoiced"] + frame["Not invoiced"]
+    by_teacher = frame.groupby("Teacher")["Month total"].sum().sort_values(ascending=False)
     names = sorted(by_teacher.index, key=str.casefold)
     earning = [name for name, total in by_teacher.items() if total > 0]
     # Picks from another year or month can name a teacher not on this list,
@@ -3703,24 +3707,25 @@ def data_tab() -> None:
             .mark_line(point=True)
             .encode(
                 x=alt.X("Month name:N", sort=order, title=None),
-                y=alt.Y("Invoiced:Q", title="Invoiced", axis=alt.Axis(format="$,.0f")),
+                y=alt.Y("Month total:Q", title="Invoiced + still to invoice",
+                        axis=alt.Axis(format="$,.0f")),
                 color=alt.Color("Teacher:N", sort=picked, legend=alt.Legend(
                     title=None, orient="bottom", columns=4, labelLimit=0)),
                 tooltip=[
                     alt.Tooltip("Teacher:N"),
                     alt.Tooltip("Month name:N", title="Month"),
                     alt.Tooltip("Invoiced:Q", format="$,.2f"),
+                    alt.Tooltip("Not invoiced:Q", title="Still to invoice", format="$,.2f"),
                     alt.Tooltip("Hours:Q", title="Hours taught"),
                 ],
             )
             .properties(height=260),
             width="stretch",
         )
-    idle = len(names) - len(earning)
     st.caption(
-        f"{year} only, so December is never drawn beside the next January."
-        + (f" {idle} of the {len(names)} teachers have nothing invoiced this year yet."
-           if idle else "")
+        f"{year} only, so December is never drawn beside the next January. Each line "
+        "is a teacher's month: what was invoiced, plus what is still to invoice at "
+        "today's prices — hover a point for the two."
     )
 
     st.divider()
