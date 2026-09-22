@@ -734,6 +734,63 @@ def get_all_teachers():
         ]
 
 
+def get_unpriced_subjects():
+    """Every subject with a lesson on no real price, and the months it lacks one in.
+
+    All months, not one: a price is set from a month onward, so pricing each
+    subject from the first month it is missing one covers the months after.
+    Only lessons someone is still to be billed for count: one already on
+    every student's issued invoice kept the price it went out at, and needs
+    nothing -- years of lessons billed before prices were kept in the app
+    would otherwise all read as unpriced.
+    """
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(
+                ClassSession.id,
+                ClassSession.class_id,
+                ClassSession.session_date,
+                AcademyClass.name,
+                Teacher.id,
+                Teacher.name,
+                SessionAttendance.student_id,
+            )
+            .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
+            .join(Teacher, ClassSession.teacher_id == Teacher.id)
+            .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+            .where(
+                ClassSession.status != "Cancelled",
+                SessionAttendance.is_cancelled.is_(False),
+            )
+        ).all()
+        billed = set(
+            session.execute(
+                select(Invoice.student_id, InvoiceItem.session_id)
+                .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+                .where(Invoice.status == "Issued", InvoiceItem.session_id.is_not(None))
+            ).all()
+        )
+        rates = _rate_index(session, {row[1] for row in rows})
+        subjects: dict[int, dict[str, Any]] = {}
+        counted: set[int] = set()
+        for session_id, class_id, when, name, teacher_id, teacher, student_id in rows:
+            when = _as_day(when)
+            if (student_id, session_id) in billed or session_id in counted:
+                continue
+            if _rate_lookup(rates, class_id, when) > UNSET_RATE:
+                continue
+            counted.add(session_id)
+            item = subjects.setdefault(class_id, {
+                "Class ID": class_id, "Class": name, "Teacher ID": teacher_id,
+                "Teacher": teacher, "Sessions": 0, "Months": set(),
+            })
+            item["Sessions"] += 1
+            item["Months"].add((when.year, when.month))
+    for item in subjects.values():
+        item["Months"] = sorted(item["Months"])
+    return sorted(subjects.values(), key=lambda item: (item["Teacher"].casefold(), item["Class"].casefold()))
+
+
 def get_subject_student_grades(class_ids):
     """The grade of each student on each subject, read from the rest of their lessons.
 
@@ -3895,12 +3952,14 @@ def _teacher_month_scheduled(session, first_day, last_day, teacher_ids):
 
 
 def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
-    """Lessons in a span with a student on them who has not been invoiced for it yet.
+    """Per teacher and month: lessons with a student not invoiced for them yet, and their worth.
 
     The Data tab's money is read off issued invoices, so a month just
-    imported added hours and nothing else, and read as a screen that had not
-    noticed the import. Counted in lessons and hours rather than priced: a
-    subject fresh from a workbook often has no price yet.
+    imported -- or a subject just priced -- changed nothing there, and read
+    as a screen that had missed it. This is what is still to come: each
+    student-lesson not on an issued invoice, at the price in force on its
+    date. A subject still on the import's placeholder is counted, not
+    priced, so a guess never reaches the total.
     """
     if not teacher_ids:
         return {}
@@ -3908,6 +3967,8 @@ def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
         select(
             ClassSession.teacher_id,
             ClassSession.id,
+            ClassSession.class_id,
+            ClassSession.session_date,
             ClassSession.start_time,
             ClassSession.end_time,
             SessionAttendance.student_id,
@@ -3931,13 +3992,29 @@ def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
             )
         ).all()
     )
-    waiting: dict[int, dict[int, float]] = defaultdict(dict)
-    for teacher_id, session_id, start, end, student_id in rows:
-        if (student_id, session_id) not in billed:
-            waiting[teacher_id][session_id] = _span_hours(start, end)
+    rates = _rate_index(session, {row[2] for row in rows})
+    waiting: dict[tuple[int, int, int], dict[str, Any]] = {}
+    for teacher_id, session_id, class_id, when, start, end, student_id in rows:
+        if (student_id, session_id) in billed:
+            continue
+        when = _as_day(when)
+        bucket = waiting.setdefault((teacher_id, when.year, when.month), {
+            "lessons": {}, "value": 0.0, "unpriced": set()})
+        hours = _span_hours(start, end)
+        bucket["lessons"][session_id] = hours
+        rate = _rate_lookup(rates, class_id, when)
+        if rate > UNSET_RATE:
+            bucket["value"] += hours * rate
+        else:
+            bucket["unpriced"].add(session_id)
     return {
-        teacher_id: {"lessons": len(lessons), "hours": sum(lessons.values())}
-        for teacher_id, lessons in waiting.items()
+        key: {
+            "lessons": len(bucket["lessons"]),
+            "hours": sum(bucket["lessons"].values()),
+            "value": round(bucket["value"], 2),
+            "unpriced": len(bucket["unpriced"]),
+        }
+        for key, bucket in waiting.items()
     }
 
 
@@ -3995,7 +4072,7 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
             bucket = money.get(key)
             hours = taught.get(key, 0.0)
             count = students.get(teacher.id, 0)
-            unbilled = waiting.get(teacher.id, {"lessons": 0, "hours": 0.0})
+            unbilled = waiting.get(key, {"lessons": 0, "hours": 0.0, "value": 0.0, "unpriced": 0})
             if not bucket and not hours and not count:
                 continue
             results.append(
@@ -4009,6 +4086,8 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
                     "Students": count,
                     "Not invoiced lessons": unbilled["lessons"],
                     "Not invoiced hours": round(unbilled["hours"], 2),
+                    "Not invoiced value": unbilled["value"],
+                    "Not invoiced unpriced": unbilled["unpriced"],
                 }
             )
         return results
@@ -4042,14 +4121,16 @@ def get_teacher_year_trend(year, up_to_month, teacher_ids=None):
         ids = [teacher.id for teacher in teachers]
         money = _teacher_month_money(session, first_day, last_day, ids)
         scheduled = _teacher_month_scheduled(session, first_day, last_day, ids)
-        if not money and not scheduled:
+        waiting = _teacher_month_uninvoiced(session, first_day, last_day, ids)
+        if not money and not scheduled and not waiting:
             return []
 
         # A teacher belongs on the chart if they either billed or taught in
         # the span -- so a month that has been taught but not yet invoiced
         # still shows its line, sitting at zero, rather than the teacher
         # vanishing from the comparison entirely.
-        active = {tid for tid, _, _ in money} | {tid for tid, _, _ in scheduled}
+        active = ({tid for tid, _, _ in money} | {tid for tid, _, _ in scheduled}
+                  | {tid for tid, _, _ in waiting})
         rows = []
         for teacher in teachers:
             if teacher.id not in active:
@@ -4067,6 +4148,7 @@ def get_teacher_year_trend(year, up_to_month, teacher_ids=None):
                         "Invoiced": round(bucket["Earnings"], 2) if bucket else 0.0,
                         "Billed hours": round(bucket["Hours"], 2) if bucket else 0.0,
                         "Hours": round(scheduled.get(key, 0.0), 2),
+                        "Not invoiced": waiting.get(key, {}).get("value", 0.0),
                     }
                 )
         return rows

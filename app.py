@@ -898,6 +898,105 @@ def _import_upload_panel() -> None:
             st.warning(f"Nothing imported ({result['status']}).")
 
 
+def _price_rule(subjects: list[dict]) -> dict[int, tuple[float, str, bool]]:
+    """What the academy's price rule makes each subject: (rate, why, certain).
+
+    Grade 11 and above is $65/h, everything else $60/h. The grade comes from
+    the subject's name; failing that the subject's own price from another
+    month stands; failing that its students' grades elsewhere decide.
+    ``certain`` is False where it is the $60 default -- a group either side of
+    the line, or nobody's grade known -- which only ever fills a subject that
+    has no price, never replaces one somebody chose.
+    """
+    ungraded = [item["Class ID"] for item in subjects
+                if not schedule_parser.standard_rate(item["Class"])]
+    student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
+    # A subject with no grade in its name but a price somebody chose in
+    # another month -- "Basic Eng", $65 from August -- is that price in the
+    # months it lacks one, not the default.
+    chosen: dict[int, tuple[dt.date, float]] = {}
+    for row in db.get_all_class_rates() if ungraded else []:
+        starts = _as_date(row["Effective From"])
+        if row["Hourly Rate"] > db.UNSET_RATE and starts >= chosen.get(row["Class ID"], (dt.date.min, 0))[0]:
+            chosen[row["Class ID"]] = (starts, row["Hourly Rate"])
+    rule: dict[int, tuple[float, str, bool]] = {}
+    for item in subjects:
+        named = schedule_parser.standard_rate(item["Class"])
+        grades = sorted(set(student_grades.get(item["Class ID"], [])))
+        bands = {_grade_rate(grade) for grade in grades}
+        own = chosen.get(item["Class ID"])
+        if named:
+            rule[item["Class ID"]] = (named, "", True)
+        elif own:
+            rule[item["Class ID"]] = (own[1], f"its own price from {own[0]:%B %Y}", True)
+        elif len(bands) == 1:
+            rule[item["Class ID"]] = (bands.pop(), f"its students are in {_grades(grades)}", True)
+        elif grades:
+            rule[item["Class ID"]] = (schedule_parser.JUNIOR_RATE,
+                                      f"students in {_grades(grades)}", False)
+        else:
+            rule[item["Class ID"]] = (schedule_parser.JUNIOR_RATE, "grade not known", False)
+    return rule
+
+
+def _unpriced_everywhere() -> None:
+    """Every subject without a price, in any month, priced by the rule in one go.
+
+    The Invoices screen prices one month at a time, and a subject imported
+    with no grade in its name sat on the placeholder in every month since,
+    each needing its own visit. This finds them all, says what each will be
+    and why, and prices each from the first month it has none.
+    """
+    unpriced = db.get_unpriced_subjects()
+    if not unpriced:
+        return
+    rule = _price_rule(unpriced)
+    lessons = sum(item["Sessions"] for item in unpriced)
+    with st.expander(f"⚠️ {len(unpriced)} subject(s) have no price — {lessons} lessons, all months"):
+        st.caption(
+            f"The academy's rule: ${schedule_parser.SENIOR_RATE:,.0f}/h for Grade 11 and "
+            f"above, ${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise — including where the "
+            "grade isn't known. Each is priced from the first month it has no price; "
+            "any price can be changed afterwards under Teacher detail."
+        )
+        st.dataframe(
+            [
+                {
+                    "Teacher": item["Teacher"],
+                    "Subject": item["Class"],
+                    "From": dt.date(*item["Months"][0], 1).strftime("%b %Y"),
+                    "Lessons": item["Sessions"],
+                    "Price": f"${rule[item['Class ID']][0]:,.0f}/h",
+                    "Because": rule[item["Class ID"]][1] or "the grade in its name",
+                }
+                for item in unpriced
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        if st.button(f"Price all {len(unpriced)} by grade", type="primary",
+                     key="price_everything", width="stretch"):
+            with st.spinner(f"Pricing {len(unpriced)} subject(s)…"):
+                done = set()
+                # A subject priced again part-way through -- placeholder in
+                # spring, a real price in summer, placeholder again since --
+                # still has a gap after one pass; a second closes it.
+                for _ in range(3):
+                    for item in unpriced:
+                        year, month = item["Months"][0]
+                        outcome = db.set_class_rate_for_month(
+                            item["Class ID"], dt.date(year, month, 1), rule[item["Class ID"]][0])
+                        if outcome in ("created", "updated"):
+                            done.add(item["Class ID"])
+                    unpriced = [item for item in db.get_unpriced_subjects()
+                                if item["Class ID"] in rule]
+                    if not unpriced:
+                        break
+            _flash(f"Priced {len(done)} subject(s) by grade."
+                   + (f" {len(unpriced)} still have no price — see above." if unpriced else ""))
+            _rerun()
+
+
 def _grade_rate(grade: int) -> float:
     return schedule_parser.JUNIOR_RATE if grade <= 10 else schedule_parser.SENIOR_RATE
 
@@ -995,27 +1094,7 @@ def _bulk_rate_section(
         if priced_from.get(row["Class ID"], dt.date.min) < starts:
             priced_from[row["Class ID"]] = starts
 
-    # What the price rule makes each subject: from the grade in its name, or
-    # failing that from its students' grades when they all fall on one side
-    # of the line. A group straddling it, or whose students' grades nobody
-    # has recorded, is left for a person to price rather than guessed at.
-    ungraded = [item["Class ID"] for item in subjects
-                if not schedule_parser.standard_rate(item["Class"])]
-    student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
-    rule: dict[int, tuple[float | None, str]] = {}
-    for item in subjects:
-        named = schedule_parser.standard_rate(item["Class"])
-        grades = sorted(set(student_grades.get(item["Class ID"], [])))
-        bands = {_grade_rate(grade) for grade in grades}
-        if named:
-            rule[item["Class ID"]] = (named, "")
-        elif len(bands) == 1:
-            rule[item["Class ID"]] = (bands.pop(), f"its students are in {_grades(grades)}")
-        elif grades:
-            rule[item["Class ID"]] = (None, f"students in {_grades(grades)}, either side of "
-                                            "the $60/$65 line: set a price")
-        else:
-            rule[item["Class ID"]] = (None, "")
+    rule = _price_rule(subjects)
 
     selected_ids: list[int] = []
     for item in subjects:
@@ -1042,11 +1121,14 @@ def _bulk_rate_section(
         # What the rule says it costs, when that differs from what it is on
         # now: the price is a rule, and a screen that knows the rule should
         # say so rather than leave it to memory.
-        standard, why = rule[class_id]
-        if standard and abs((month_rate or 0) - standard) > 0.005:
+        standard, why, certain = rule[class_id]
+        unset = not (month_rate and month_rate > db.UNSET_RATE)
+        if certain and abs((month_rate or 0) - standard) > 0.005:
             suggestion = f" — standard ${standard:,.2f}/h" + (f", as {why}" if why else "")
+        elif not certain and unset:
+            suggestion = f" — ${standard:,.2f}/h by default, {why}"
         else:
-            suggestion = f" — {why}" if not standard and why else ""
+            suggestion = ""
         checked = st.checkbox(
             f"{item['Class']}{who} — {rate_text}, {item['Sessions']} session(s){suggestion}",
             key=f"bulk_rate_pick_{scope}_{class_id}",
@@ -1064,17 +1146,20 @@ def _bulk_rate_section(
     # Only where the rule would change something, and across everything
     # listed unless some are ticked -- pricing a month by the rule is one
     # click, not thirty ticks and a click.
-    by_grade = {
-        item["Class ID"]: rule[item["Class ID"]][0]
-        for item in subjects
-        if rule[item["Class ID"]][0]
-        and (not selected_ids or item["Class ID"] in selected_ids)
-        and abs((month_rates.get(item["Class ID"]) or 0) - rule[item["Class ID"]][0]) > 0.005
-    }
+    # A default only ever fills a subject with no price; it never replaces
+    # one somebody chose.
+    by_grade = {}
+    for item in subjects:
+        rate, _, certain = rule[item["Class ID"]]
+        current = month_rates.get(item["Class ID"]) or 0
+        if selected_ids and item["Class ID"] not in selected_ids:
+            continue
+        if (certain or current <= db.UNSET_RATE) and abs(current - rate) > 0.005:
+            by_grade[item["Class ID"]] = rate
     if by_grade and st.button(
         f"Price {len(by_grade)} {'ticked ' if selected_ids else ''}subject(s) by grade "
-        f"(${schedule_parser.JUNIOR_RATE:,.0f}/h Grade 10 and below, "
-        f"${schedule_parser.SENIOR_RATE:,.0f}/h above)",
+        f"(${schedule_parser.SENIOR_RATE:,.0f}/h Grade 11 and above, "
+        f"${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise)",
         key=f"bulk_rate_standard_{scope}",
         width="stretch",
     ):
@@ -1355,6 +1440,7 @@ def teachers_tab() -> None:
             db.update_teacher_status(record["ID"], not record["Active"])
             _rerun()
 
+    _unpriced_everywhere()
     st.markdown("#### Teacher detail")
     _teacher_drilldown(teachers)
 
@@ -3506,9 +3592,9 @@ def data_tab() -> None:
         _history_view()
         return
     st.caption(
-        "Money here is what was actually invoiced — read off the issued "
-        "invoices, so it never moves when a rate is changed later. A month "
-        "shows nothing until its invoices go out."
+        "Invoiced is read off the invoices sent, so it never moves when a price "
+        "changes. Still to invoice is everything else taught or booked, at "
+        "today's prices — it moves the moment a price is set."
     )
 
     year, month = _month_picker("data_month")
@@ -3524,18 +3610,26 @@ def data_tab() -> None:
 
     # The academy as a whole first: one bar a month, whoever taught it.
     st.markdown(f"#### Invoiced by month — January to {calendar.month_name[month]} {year}")
-    totals = frame.groupby("Month name", as_index=False)[["Invoiced", "Hours"]].sum()
+    totals = frame.groupby("Month name", as_index=False)[["Invoiced", "Not invoiced", "Hours"]].sum()
+    stacked = totals.melt(id_vars=["Month name", "Hours"], value_vars=["Invoiced", "Not invoiced"],
+                          var_name="Kind", value_name="Amount")
+    stacked["Kind"] = stacked["Kind"].map({"Invoiced": "Invoiced", "Not invoiced": "Still to invoice"})
     st.altair_chart(
-        alt.Chart(totals)
-        .mark_bar(color="#2a78d6")
+        alt.Chart(stacked)
+        .mark_bar()
         .encode(
             x=alt.X("Month name:N", sort=order, title=None),
-            y=alt.Y("Invoiced:Q", title="Invoiced, all teachers", axis=alt.Axis(format="$,.0f")),
+            y=alt.Y("Amount:Q", stack=True, title="All teachers", axis=alt.Axis(format="$,.0f")),
+            color=alt.Color("Kind:N", scale=alt.Scale(
+                domain=["Invoiced", "Still to invoice"], range=["#2a78d6", "#a9c8ee"]),
+                legend=alt.Legend(title=None, orient="top")),
+            order=alt.Order("Kind:N", sort="ascending"),
             tooltip=[alt.Tooltip("Month name:N", title="Month"),
-                     alt.Tooltip("Invoiced:Q", format="$,.2f"),
+                     alt.Tooltip("Kind:N", title=" "),
+                     alt.Tooltip("Amount:Q", format="$,.2f"),
                      alt.Tooltip("Hours:Q", title="Hours taught")],
         )
-        .properties(height=220),
+        .properties(height=240),
         width="stretch",
     )
 
@@ -3615,21 +3709,24 @@ def data_tab() -> None:
              "class of six earns six students' rates in one hour of a teacher's "
              "time. Lessons not invoiced yet are left out of both.",
     )
-    # The money on this screen is read off invoices already sent, so a month
-    # just imported added hours and nothing else -- and read as a screen that
-    # had not noticed the upload. Saying what is still waiting closes that.
+    # Invoiced money only moves when invoices go out, so an import or a new
+    # price changed nothing on this screen. What is still to come, at
+    # today's prices, is the figure that answers to both.
+    unpriced = int(snapshot["Not invoiced unpriced"].sum())
     columns[3].metric(
-        "Not invoiced yet", _lessons(waiting),
-        help="Lessons this month with a student not yet invoiced for them. They "
-             "add money here once their invoices go out, on the Invoices screen.",
+        "Still to invoice", f"${snapshot['Not invoiced value'].sum():,.2f}",
+        help=f"{_lessons(waiting)} with a student not yet invoiced, at today's prices."
+             + (f" {_lessons(unpriced)} have no price yet and count as nothing." if unpriced else ""),
     )
-    behind = [row for row in stats if row["Not invoiced lessons"]]
+    behind = sorted((row for row in stats if row["Not invoiced lessons"]),
+                    key=lambda r: -r["Not invoiced value"])
     if behind:
+        shown = ", ".join(f"{row['Teacher']} ${row['Not invoiced value']:,.0f}" for row in behind[:6])
         st.caption(
-            "Waiting to be invoiced: "
-            + ", ".join(f"{row['Teacher']} ({_lessons(row['Not invoiced lessons'])})"
-                        for row in sorted(behind, key=lambda r: -r["Not invoiced lessons"]))
-            + "."
+            f"Still to invoice: {shown}"
+            + (f", and {len(behind) - 6} more" if len(behind) > 6 else "") + "."
+            + (f" {_lessons(unpriced)} have no price yet — price them under Teachers."
+               if unpriced else "")
         )
 
     # Bars along the ground, longest first, rather than a pie: a name reads
@@ -3661,7 +3758,10 @@ def data_tab() -> None:
             {
                 "Teacher": row["Teacher"],
                 "Invoiced": f"${row['Invoiced']:,.2f}",
-                "Not invoiced yet": _lessons(row["Not invoiced lessons"]) if row["Not invoiced lessons"] else "—",
+                "Still to invoice": (
+                    f"${row['Not invoiced value']:,.2f} · {_lessons(row['Not invoiced lessons'])}"
+                    + (f", {row['Not invoiced unpriced']} unpriced" if row["Not invoiced unpriced"] else "")
+                    if row["Not invoiced lessons"] else "—"),
                 "Hours taught": row["Hours"],
                 "Per teaching hour": _per_hour(row["Invoiced"], row["Invoiced lesson hours"]),
                 "Unique students": row["Students"],

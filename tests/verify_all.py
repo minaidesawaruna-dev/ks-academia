@@ -471,6 +471,9 @@ def t_read_functions_all_run():
     calls = {
         "get_all_teachers": lambda: db.get_all_teachers(),
         "get_teacher_session_counts": lambda: db.get_teacher_session_counts(year, month),
+        "get_unpriced_subjects": lambda: db.get_unpriced_subjects(),
+        "get_subject_student_grades": lambda: db.get_subject_student_grades(
+            [c["ID"] for c in db.get_all_classes()[:20]]),
         "get_all_students": lambda: db.get_all_students(),
         "get_all_classes": lambda: db.get_all_classes(),
         "get_all_class_rates": lambda: db.get_all_class_rates(),
