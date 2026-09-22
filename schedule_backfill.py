@@ -28,7 +28,7 @@ from collections import defaultdict
 from typing import Any
 
 import db
-from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, standard_rate
+from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, name_sound, standard_rate
 
 __all__ = [
     "backfill",
@@ -170,6 +170,7 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
     """
     existing = db.get_all_students()
     exact = {item["Name"].casefold() for item in existing}
+    sounds = {item["ID"]: name_sound(item["Name"]) for item in existing}
 
     parsed_names = sorted(
         {
@@ -212,10 +213,19 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                     "existing_tag": _suffix(existing_name) or None,
                 }
         if best:
+            # Spelled differently but said the same -- Jaaeho and Jaeho, Kyuwon
+            # and Gyuwon -- and by nobody else on file: the same child, so
+            # "new person" by default would split their bills in two.
+            sound = name_sound(name)
+            alike = [student for student, said in sounds.items() if sound and said == sound]
+            if best["reason"] == "spelling" and alike == [best["existing_id"]]:
+                best["reason"] = "sound"
             # Only a grade apart, and from one student only: that student
             # already has this name's invoices, so saying "new person" by
             # default would bill every one of those classes again.
-            best["likely_same"] = best["reason"] == "grade" and grade_matches == 1
+            best["likely_same"] = (
+                (best["reason"] == "grade" and grade_matches == 1) or best["reason"] == "sound"
+            )
             candidates.append(best)
 
     candidates.sort(key=lambda item: -item["similarity"])

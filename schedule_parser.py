@@ -1265,6 +1265,12 @@ def _fold(text: str) -> str:
     return key
 
 
+def name_sound(name: str) -> str:
+    """A name as it is said, in any word order: "Chung Jaaeho" and "Jaeho Chung",
+    "Lee Kyuwon" and "Lee Gyuwon" all come out the same."""
+    return " ".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", name)))
+
+
 def _hangul_sounds(hangul: str) -> set[str]:
     """Every folded English spelling of a run of Hangul syllables."""
     spellings = [""]

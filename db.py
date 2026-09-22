@@ -3849,6 +3849,53 @@ def _teacher_month_scheduled(session, first_day, last_day, teacher_ids):
     return buckets
 
 
+def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
+    """Lessons in a span with a student on them who has not been invoiced for it yet.
+
+    The Data tab's money is read off issued invoices, so a month just
+    imported added hours and nothing else, and read as a screen that had not
+    noticed the import. Counted in lessons and hours rather than priced: a
+    subject fresh from a workbook often has no price yet.
+    """
+    if not teacher_ids:
+        return {}
+    rows = session.execute(
+        select(
+            ClassSession.teacher_id,
+            ClassSession.id,
+            ClassSession.start_time,
+            ClassSession.end_time,
+            SessionAttendance.student_id,
+        )
+        .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+        .where(
+            *_lesson_window(first_day, last_day, list(teacher_ids)),
+            ClassSession.status != "Cancelled",
+            SessionAttendance.is_cancelled.is_(False),
+        )
+    ).all()
+    billed = set(
+        session.execute(
+            select(Invoice.student_id, InvoiceItem.session_id)
+            .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+            .where(
+                Invoice.status == "Issued",
+                InvoiceItem.session_id.is_not(None),
+                InvoiceItem.session_date >= first_day,
+                InvoiceItem.session_date <= last_day,
+            )
+        ).all()
+    )
+    waiting: dict[int, dict[int, float]] = defaultdict(dict)
+    for teacher_id, session_id, start, end, student_id in rows:
+        if (student_id, session_id) not in billed:
+            waiting[teacher_id][session_id] = _span_hours(start, end)
+    return {
+        teacher_id: {"lessons": len(lessons), "hours": sum(lessons.values())}
+        for teacher_id, lessons in waiting.items()
+    }
+
+
 def _teacher_student_counts(session, first_day, last_day, teacher_ids):
     """Unique students per teacher across a span, counted by the database.
 
@@ -3895,6 +3942,7 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
         money = _teacher_month_money(session, first_day, last_day, ids)
         taught = _teacher_month_scheduled(session, first_day, last_day, ids)
         students = _teacher_student_counts(session, first_day, last_day, ids)
+        waiting = _teacher_month_uninvoiced(session, first_day, last_day, ids)
 
         results = []
         for teacher in teachers:
@@ -3902,6 +3950,7 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
             bucket = money.get(key)
             hours = taught.get(key, 0.0)
             count = students.get(teacher.id, 0)
+            unbilled = waiting.get(teacher.id, {"lessons": 0, "hours": 0.0})
             if not bucket and not hours and not count:
                 continue
             results.append(
@@ -3913,6 +3962,8 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
                     "Invoiced lesson hours": round(bucket["Lesson hours"], 2) if bucket else 0.0,
                     "Hours": round(hours, 2),
                     "Students": count,
+                    "Not invoiced lessons": unbilled["lessons"],
+                    "Not invoiced hours": round(unbilled["hours"], 2),
                 }
             )
         return results

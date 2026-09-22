@@ -562,6 +562,15 @@ def t_grade_prefix_match():
         sb.db.get_all_students = real
     # One grade-apart match is taken as the same student by default; two are left to the admin.
     assert found == {"Sohee": (1, True), "Yerin": (2, False)}, found
+    # Spelled another way but said the same is the same child; a different name is not.
+    lesson = {"attendance": [{"student_name": n} for n in ("Nam Jiihoon", "Lee Kyuwon", "Lee Ayoon")]}
+    try:
+        sb.db.get_all_students = lambda: [{"ID": 4, "Name": "Nam Jihoon"}, {"ID": 5, "Name": "Lee Gyuwon"},
+                                          {"ID": 6, "Name": "Lee Jaeyoon"}]
+        found = {m["parsed_name"]: (m["existing_id"], m["likely_same"]) for m in sb.suggest_student_matches([lesson])}
+    finally:
+        sb.db.get_all_students = real
+    assert found == {"Nam Jiihoon": (4, True), "Lee Kyuwon": (5, True), "Lee Ayoon": (6, False)}, found
     return "an existing 'G5 Sohee' is offered, and pre-selected, as the match for 'Sohee'"
 
 

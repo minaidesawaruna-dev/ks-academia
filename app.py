@@ -147,6 +147,15 @@ def _show_flash() -> None:
         st.toast(message, icon=_TOAST_ICONS.get(kind), duration="long")
 
 
+def _local_time(stamp: dt.datetime) -> dt.datetime:
+    """A time the database stamped in UTC, in the academy's own time.
+
+    Both databases stamp UTC, so an upload made at 7.30am showed as 23:30
+    the night before.
+    """
+    return stamp.replace(tzinfo=dt.timezone.utc).astimezone()
+
+
 def _as_date(value) -> dt.date:
     if isinstance(value, dt.datetime):
         return value.date()
@@ -698,6 +707,7 @@ def _import_upload_panel() -> None:
             reason_text = {
                 "tag": "same name, tagged differently",
                 "grade": "same name, with a grade written in front",
+                "sound": "same name, spelled another way",
             }.get(candidate["reason"], "similar spelling")
             choice = st.radio(
                 f"'{candidate['parsed_name']}' — {reason_text} to existing "
@@ -1313,7 +1323,7 @@ def students_tab() -> None:
         for index, item in enumerate(statuses):
             slot = badge_columns[index % len(badge_columns)]
             if item["Imported"]:
-                slot.success(f"✅ {item['Teacher']} · {item['Imported At']:%d %b %H:%M}")
+                slot.success(f"✅ {item['Teacher']} · {_local_time(item['Imported At']):%d %b %H:%M}")
             else:
                 slot.warning(f"⏳ {item['Teacher']} — not uploaded yet")
 
@@ -3079,11 +3089,9 @@ def _drivers_chart(report: dict) -> None:
         (ranges + points + no_effect).properties(height=34 * len(drivers)), width="stretch"
     )
     st.caption(
-        "Each dot is how much a factor changes the odds of not coming back, with the "
-        "others held level; the line is a rough 95% range. Shares are per 25 "
-        "percentage points — hover a dot for its unit."
-        + (f" Left out for now, with too few leavers to place them: "
-           f"{', '.join(unplaced).lower()}." if unplaced else "")
+        "Dot: how much a factor changes the odds of leaving, the others held level. "
+        "Line: a rough 95% range. Hover for units."
+        + (f" Too few leavers yet to place: {', '.join(unplaced).lower()}." if unplaced else "")
     )
 
 
@@ -3122,38 +3130,36 @@ def _days_ago(day: dt.date | None) -> str:
 
 
 def _retention_view() -> None:
-    st.caption(
-        "Who stops coming, and who looks likely to next — learned from every past "
-        "lesson in the app plus any past schedules added under **Past schedules**, "
-        "which are kept for analysis only and never billed."
-    )
-    report = _retention_report(db.get_analysis_data_version(), dt.date.today())
+    today = dt.date.today()
+    report = _retention_report(db.get_analysis_data_version(), today)
     if not report["enough"]:
         st.info(report["message"])
         return
+    # Said up front because an upload changes nothing visible until its month
+    # is over, which otherwise reads as a page that never updates.
+    st.caption(
+        f"Lessons up to the end of {report['last_month']}, recalculated after every "
+        f"upload. {calendar.month_name[today.month]} counts once it's over."
+    )
 
     validation = report["validation"]
     columns = st.columns(4)
     columns[0].metric(
         "Students observed", f"{report['students']:,}",
-        help=f"{report['first_month']} to {report['last_month']}. The month in "
-        "progress is left out until it ends.",
+        help=f"{report['first_month']} to {report['last_month']}.",
     )
     columns[1].metric(
         "Current students", f"{report['current']:,}",
-        help=f"Had a lesson in {report['last_month']} or the month before. Grade 12 "
-        "students finishing school are left out.",
+        help=f"Came in {report['last_month']} or the month before.",
     )
     columns[2].metric(
         "Expected not to return", f"{report['expected_leavers']:.0f}",
-        help="Added up over the current students who have not been in yet this "
-        f"month. The {report['came_back']} who already have are left out — they "
-        "have come back, whatever the model made of their last full month.",
+        help="Summed over current students who haven't been back this month.",
     )
     columns[3].metric(
         "Model check", f"{validation['auc']:.2f}" if validation else "—",
-        help="On months the model had not seen: how often it ranked a student who "
-        "left above one who stayed. 0.50 is guessing, 1.00 is perfect.",
+        help="On months it hadn't seen, how often it ranked a student who left "
+        "above one who stayed. 0.50 is guessing, 1.00 perfect.",
     )
 
     st.markdown("#### Month by month")
@@ -3188,14 +3194,9 @@ def _retention_view() -> None:
     )
     unsettled = [row["label"] for row in report["months"] if not row["settled"]]
     st.caption(
-        "Bars are students taught that month; the line is the share of them who "
-        "never came back."
-        + (f" {' and '.join(unsettled)} have no line yet — a student who has "
-           "simply not been in for a few weeks cannot be told from one who has "
-           "left until two months have passed." if unsettled else "")
-        + (f" Starts {order[0]}: before then no month has more than {thin} "
-           "students on record, too few for a share to mean anything. Those "
-           "months still count in the model." if thin else "")
+        "Bars: students taught. Line: share who never came back."
+        + (f" {' and '.join(unsettled)}: too soon to tell." if unsettled else "")
+        + (f" Starts {order[0]}; earlier months have {thin} students or fewer." if thin else "")
     )
 
     st.markdown("#### How long students stay")
@@ -3226,16 +3227,10 @@ def _retention_view() -> None:
     followed = next((point["at_risk"] for point in report["km"]
                      if point["month"] == median), 0)
     st.caption(
-        (f"Half of students have left by month {median}"
-         + (f", though only {followed} students are still followed that far, so "
-            "read the right-hand end as a rough guide. " if followed < 50 else ". ")
-         if median else
-         "More than half of students are still enrolled at the longest stay observed. ")
-        + "Months count from a student's first lesson on record, so one who "
-        "joined before their teacher's schedules begin is counted from there. "
-        + f"Leaving means no lesson for {report['grace_months']} months and never "
-        "coming back. Grade 12 students whose last lesson is in May or June have "
-        "finished school and are not counted as leaving."
+        (f"Half have left by month {median}"
+         + (f" — but only {followed} students are followed that far." if followed < 50 else ".")
+         if median else "More than half are still here at the longest stay seen.")
+        + " Counted from each student's first lesson on record."
     )
 
     st.markdown("#### When a student is drifting")
@@ -3256,23 +3251,11 @@ def _retention_view() -> None:
     )
     thin, thick = report["by_lessons"][0], report["by_lessons"][-1]
     st.caption(
-        f"Counted, not modelled: a month with {thin['label']} "
-        f"lesson{'' if thin['label'] == '1' else 's'} was a student's "
-        f"last {thin['share']:.0%} of the time ({thin['last']:,} of {thin['months']:,}), "
-        f"against {thick['share']:.0%} for {thick['label']} lessons. A student whose "
-        "lessons thin out is the one to ring."
+        f"A month with {thin['label']} lesson{'' if thin['label'] == '1' else 's'} was "
+        f"a student's last {thin['share']:.0%} of the time ({thin['last']:,} of "
+        f"{thin['months']:,}), against {thick['share']:.0%} with {thick['label']}. "
+        "Call the ones whose lessons thin out."
     )
-    if validation:
-        st.caption(
-            f"Checked on months it hadn't seen: fitted on lessons up to "
-            f"{validation['trained_through']}, then tested on {validation['tested_from']}–"
-            f"{validation['tested_to']}. It ranked a student who left above one who stayed "
-            f"{validation['auc']:.0%} of the time, and the riskiest fifth of students "
-            f"included {validation['captured_top_fifth']:.0%} of the "
-            f"{validation['test_leavers']} who left."
-        )
-    else:
-        st.caption("Not enough later data yet to check the model on months it hasn't seen.")
 
     st.markdown("#### Most at risk of not coming back")
     if report["at_risk"]:
@@ -3294,43 +3277,43 @@ def _retention_view() -> None:
             hide_index=True,
         )
         st.caption(
-            "A chance, not a verdict. The reasons are what raises each student's odds "
-            "most compared with a typical student."
-            + (f" {report['came_back']} student(s) have already been in this month "
-               "and are not listed." if report["came_back"] else "")
+            "A chance, not a verdict."
+            + (f" Leaves out the {report['came_back']} already back this month."
+               if report["came_back"] else "")
+            + (f" And {report['graduating']} Grade 12s finishing school."
+               if report["graduating"] else "")
         )
     else:
         st.caption(
-            f"Every current student has already been in this month."
+            "Every current student has already been in this month."
             if report["came_back"] else "No current students to score."
         )
-    if report["graduating"]:
-        st.caption(f"{report['graduating']} Grade 12 student(s) finishing school are left out.")
 
     with st.expander("How this works"):
         _drivers_chart(report)
         sources = report["sources"]
+        check = (
+            f"- **Checked** on months it hadn't seen: trained to "
+            f"{validation['trained_through']}, tested {validation['tested_from']}–"
+            f"{validation['tested_to']}. The riskiest fifth held "
+            f"{validation['captured_top_fifth']:.0%} of the {validation['test_leavers']} "
+            "who left.\n" if validation else
+            "- **Not yet checked** on months it hadn't seen: too little later data.\n"
+        )
         st.markdown(
             f"- **Data:** {sources['app']:,} student-lessons from the app and "
-            f"{sources['history']:,} from past schedules "
-            f"({sources['history_already_in_app']:,} more were already in the app and "
-            f"counted once), {report['first_month']} to {report['last_month']}.\n"
-            "- **Each row is one student in one month they came**, described only by "
-            "what was known by then — lessons that month against their usual, "
-            "recordings, online, cancellations, one-to-one share, grade, months enrolled "
-            "— and whether they came back.\n"
-            f"- **Leaving** means no lesson for {report['grace_months']} months and never "
-            f"coming back. The last {report['grace_months']} months can't be judged yet, "
-            "so they are scored but not learned from.\n"
-            "- **The model** is a monthly survival model: logistic regression on "
-            "student-months, lightly regularised. It refits whenever lessons change.\n"
-            "- **Its strongest signal is a student who has already started to drift** "
-            "— fewer lessons than usual — so it is best at catching a drop-off early, "
-            "not a student who stops without warning.\n"
-            "- **A gap in a teacher's records is not students leaving**: a month is "
-            "only judged when that teacher's schedule carries on after it.\n"
-            "- **Students are matched across teachers by name**, and grade is read from "
-            "class names (G11, Y5…), so a class without one counts as grade unknown."
+            f"{sources['history']:,} more from past schedules (never billed), "
+            f"{report['first_month']} to {report['last_month']}. A lesson in both "
+            "counts once.\n"
+            f"- **Leaving** is no lesson for {report['grace_months']} months and never "
+            "coming back. Grade 12s ending in May or June have finished school, not left.\n"
+            "- **The model** is logistic regression on student-months — one row per "
+            "student per month, using only what was known then.\n"
+            + check +
+            "- **A gap in a teacher's records** is not students leaving: a month is "
+            "judged only when that teacher's schedule carries on after it.\n"
+            "- **Students are matched across teachers by name**; grade comes from "
+            "class names (G11, Y5)."
         )
 
 
@@ -3435,6 +3418,10 @@ def _per_hour(invoiced: float, hours: float) -> str:
     return f"${invoiced / hours:,.0f}" if hours else "—"
 
 
+def _lessons(count: int) -> str:
+    return f"{count} lesson{'' if count == 1 else 's'}"
+
+
 def data_tab() -> None:
     st.subheader("Data")
     view = st.radio(
@@ -3520,15 +3507,10 @@ def data_tab() -> None:
         return
 
     snapshot = pd.DataFrame(stats)
-    tooltip = [
-        alt.Tooltip("Teacher:N"),
-        alt.Tooltip("Invoiced:Q", format="$,.2f"),
-        alt.Tooltip("Hours:Q", title="Hours taught"),
-        alt.Tooltip("Students:Q"),
-    ]
+    waiting = int(snapshot["Not invoiced lessons"].sum())
 
     st.markdown(f"#### {label}")
-    columns = st.columns(3)
+    columns = st.columns(4)
     columns[0].metric("Invoiced", f"${snapshot['Invoiced'].sum():,.2f}")
     columns[1].metric(
         "Hours taught", f"{snapshot['Hours'].sum():,.2f}",
@@ -3541,34 +3523,52 @@ def data_tab() -> None:
              "class of six earns six students' rates in one hour of a teacher's "
              "time. Lessons not invoiced yet are left out of both.",
     )
+    # The money on this screen is read off invoices already sent, so a month
+    # just imported added hours and nothing else -- and read as a screen that
+    # had not noticed the upload. Saying what is still waiting closes that.
+    columns[3].metric(
+        "Not invoiced yet", _lessons(waiting),
+        help="Lessons this month with a student not yet invoiced for them. They "
+             "add money here once their invoices go out, on the Invoices screen.",
+    )
+    behind = [row for row in stats if row["Not invoiced lessons"]]
+    if behind:
+        st.caption(
+            "Waiting to be invoiced: "
+            + ", ".join(f"{row['Teacher']} ({_lessons(row['Not invoiced lessons'])})"
+                        for row in sorted(behind, key=lambda r: -r["Not invoiced lessons"]))
+            + "."
+        )
 
     # Bars along the ground, longest first, rather than a pie: a name reads
     # the same whether there are two teachers or forty, where slices become
     # slivers and a colour key you have to look things up in. Height grows
     # with the roster so nothing is squeezed.
-    def _by_teacher(field: str, heading: str, money: bool = False) -> None:
-        st.markdown(f"##### {heading}")
-        st.altair_chart(
-            alt.Chart(snapshot)
-            .mark_bar(color="#2a78d6")
-            .encode(
-                y=alt.Y("Teacher:N", sort="-x", title=None,
-                        axis=alt.Axis(labelLimit=0)),
-                x=alt.X(f"{field}:Q", title=None,
-                        axis=alt.Axis(format="$,.0f") if money else alt.Axis()),
-                tooltip=tooltip,
-            )
-            .properties(height=max(120, 26 * len(snapshot))),
-            width="stretch",
+    st.markdown("##### Invoiced")
+    st.altair_chart(
+        alt.Chart(snapshot)
+        .mark_bar(color="#2a78d6")
+        .encode(
+            y=alt.Y("Teacher:N", sort="-x", title=None, axis=alt.Axis(labelLimit=0)),
+            x=alt.X("Invoiced:Q", title=None, axis=alt.Axis(format="$,.0f")),
+            tooltip=[
+                alt.Tooltip("Teacher:N"),
+                alt.Tooltip("Invoiced:Q", format="$,.2f"),
+                alt.Tooltip("Hours:Q", title="Hours taught"),
+                alt.Tooltip("Not invoiced lessons:Q", title="Lessons not invoiced yet"),
+                alt.Tooltip("Students:Q"),
+            ],
         )
-
-    _by_teacher("Invoiced", "Invoiced", money=True)
+        .properties(height=max(120, 26 * len(snapshot))),
+        width="stretch",
+    )
 
     st.dataframe(
         [
             {
                 "Teacher": row["Teacher"],
                 "Invoiced": f"${row['Invoiced']:,.2f}",
+                "Not invoiced yet": _lessons(row["Not invoiced lessons"]) if row["Not invoiced lessons"] else "—",
                 "Hours taught": row["Hours"],
                 "Per teaching hour": _per_hour(row["Invoiced"], row["Invoiced lesson hours"]),
                 "Unique students": row["Students"],
