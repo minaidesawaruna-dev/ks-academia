@@ -24,6 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import difflib
 import re
+import threading
 from collections import Counter, defaultdict
 from typing import Any
 
@@ -181,8 +182,7 @@ def price_rule(subjects: list[dict], rates: list[dict] | None = None) -> dict[in
     student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
     chosen: dict[int, tuple[dt.date, float]] = {}
     for row in (rates if rates is not None else db.get_all_class_rates()) if ungraded else []:
-        starts = row["Effective From"]
-        starts = starts if isinstance(starts, dt.date) else dt.date.fromisoformat(str(starts))
+        starts = db.as_date(row["Effective From"])
         if row["Hourly Rate"] > db.UNSET_RATE and starts >= chosen.get(row["Class ID"], (dt.date.min, 0))[0]:
             chosen[row["Class ID"]] = (starts, row["Hourly Rate"])
     rule: dict[int, tuple[float, str, bool]] = {}
@@ -378,6 +378,15 @@ def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> lis
     return rows
 
 
+# One import at a time. A second run of the app can start while the first is
+# still busy -- a second click on "Commit import", or the app open in another
+# tab -- and two imports side by side each check that a new student isn't on
+# file yet, then each add them: eleven students were put on file
+# twice that way, a fraction of a second apart. Waiting here, the second
+# import finds everything the first one did already in place.
+_ONE_IMPORT_AT_A_TIME = threading.Lock()
+
+
 def backfill(
     preview: dict[str, Any],
     teacher_id: int,
@@ -394,6 +403,11 @@ def backfill(
     new student, same as always -- this only short-circuits that for names
     the admin actually looked at and said yes to.
     """
+    with _ONE_IMPORT_AT_A_TIME:
+        return _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
+
+
+def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches):
     sessions = preview.get("sessions") or []
     if not sessions:
         return {"status": "empty"}

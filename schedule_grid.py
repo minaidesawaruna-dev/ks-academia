@@ -13,11 +13,12 @@ JavaScript, no build step.
 
 from __future__ import annotations
 
-import datetime as dt
 from pathlib import Path
 from typing import Any
 
 import streamlit.components.v1 as components
+
+from db import as_date, as_time
 
 __all__ = ["render_month_grid", "lessons_to_payload"]
 
@@ -36,23 +37,6 @@ def _declare():
             )
         _component = components.declare_component("ks_month_grid", path=str(COMPONENT_DIR))
     return _component
-
-
-def _as_time(value: Any) -> dt.time:
-    if isinstance(value, dt.time):
-        return value
-    if isinstance(value, dt.datetime):
-        return value.time()
-    parts = [int(part) for part in str(value).split(":")[:2]]
-    return dt.time(parts[0], parts[1] if len(parts) > 1 else 0)
-
-
-def _as_date(value: Any) -> dt.date:
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value))
 
 
 def lessons_to_payload(
@@ -87,9 +71,9 @@ def lessons_to_payload(
         payload.append(
             {
                 "id": lesson["ID"],
-                "date": _as_date(lesson["Date"]).isoformat(),
-                "start": _as_time(lesson["Start"]).strftime("%H:%M"),
-                "end": _as_time(lesson["End"]).strftime("%H:%M"),
+                "date": as_date(lesson["Date"]).isoformat(),
+                "start": as_time(lesson["Start"]).strftime("%H:%M"),
+                "end": as_time(lesson["End"]).strftime("%H:%M"),
                 "class_name": lesson.get("Class", ""),
                 "colour": lesson.get("Colour") or "#8a93a6",
                 "students": lesson.get("Students", 0),

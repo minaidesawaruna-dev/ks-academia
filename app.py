@@ -88,7 +88,7 @@ def _ensure_database_ready() -> bool:
     Streamlit re-runs this file from the top on every interaction, so
     anything at module scope is on the critical path of every button press.
     Even the cheap version of this check is a few round trips, which is
-    nothing beside the database and noticeable from another region.
+    little beside the database, but paid on every click all the same.
     """
     db.initialise_database()
     return True
@@ -155,21 +155,6 @@ def _local_time(stamp: dt.datetime) -> dt.datetime:
     the night before.
     """
     return stamp.replace(tzinfo=dt.timezone.utc).astimezone()
-
-
-def _as_date(value) -> dt.date:
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value))
-
-
-def _as_time(value) -> dt.time:
-    if isinstance(value, dt.time):
-        return value
-    parts = [int(part) for part in str(value).split(":")[:2]]
-    return dt.time(parts[0], parts[1] if len(parts) > 1 else 0)
 
 
 def _hours(start: dt.time, end: dt.time) -> float:
@@ -1028,8 +1013,8 @@ def _bulk_rate_section(
     starts_within: dict[int, tuple[dt.date, float]] = {}
     all_rates = db.get_all_class_rates()
     for row in all_rates:
-        starts = _as_date(row["Effective From"])
-        ends = _as_date(row["Effective To"]) if row["Effective To"] else None
+        starts = db.as_date(row["Effective From"])
+        ends = db.as_date(row["Effective To"]) if row["Effective To"] else None
         if month_start < starts <= month_end:
             if row["Class ID"] not in starts_within or starts < starts_within[row["Class ID"]][0]:
                 starts_within[row["Class ID"]] = (starts, row["Hourly Rate"])
@@ -1722,12 +1707,12 @@ def _month_navigator() -> tuple:
 
 def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) -> str:
     for item in lessons:
-        if _as_date(item["Date"]) != when:
+        if db.as_date(item["Date"]) != when:
             continue
-        if _as_time(item["Start"]) < end and _as_time(item["End"]) > start:
+        if db.as_time(item["Start"]) < end and db.as_time(item["End"]) > start:
             return (
-                f"{item['Class']} already runs {_as_time(item['Start']):%H:%M}"
-                f"–{_as_time(item['End']):%H:%M} that day."
+                f"{item['Class']} already runs {db.as_time(item['Start']):%H:%M}"
+                f"–{db.as_time(item['End']):%H:%M} that day."
             )
     return ""
 
@@ -1891,9 +1876,9 @@ def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) ->
     year, month = base.year, base.month
     for _ in range(6):
         found += [
-            _as_date(item["Date"])
+            db.as_date(item["Date"])
             for item in db.get_month_schedule(teacher_id, year, month)
-            if item["Class ID"] == class_id and _as_time(item["Start"]) == start
+            if item["Class ID"] == class_id and db.as_time(item["Start"]) == start
         ]
         month += 1
         if month == 13:
@@ -1918,20 +1903,20 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
     attendance = detail.get("Attendance", [])
 
     st.markdown(
-        f"#### {detail['Class']} · {_as_date(detail['Date']):%a %d %b} · "
-        f"{_as_time(detail['Start']):%H:%M}–{_as_time(detail['End']):%H:%M}"
+        f"#### {detail['Class']} · {db.as_date(detail['Date']):%a %d %b} · "
+        f"{db.as_time(detail['Start']):%H:%M}–{db.as_time(detail['End']):%H:%M}"
     )
 
     with st.expander("Edit the class", expanded=True):
         columns = st.columns([1.4, 1, 1, 1.2])
         when = columns[0].date_input(
-            "Date", value=_as_date(detail["Date"]), key=f"date_{lesson_id}"
+            "Date", value=db.as_date(detail["Date"]), key=f"date_{lesson_id}"
         )
         start = columns[1].time_input(
-            "Start", value=_as_time(detail["Start"]), step=60, key=f"start_{lesson_id}"
+            "Start", value=db.as_time(detail["Start"]), step=60, key=f"start_{lesson_id}"
         )
         end = columns[2].time_input(
-            "End", value=_as_time(detail["End"]), step=60, key=f"end_{lesson_id}"
+            "End", value=db.as_time(detail["End"]), step=60, key=f"end_{lesson_id}"
         )
         status = columns[3].selectbox(
             "Status",
@@ -1976,9 +1961,9 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 existing.append(_blank_row(lookup[name]))
             outcome = db.update_schedule_session(
                 session_id=lesson_id,
-                session_date=_as_date(detail["Date"]),
-                start_time=_as_time(detail["Start"]),
-                end_time=_as_time(detail["End"]),
+                session_date=db.as_date(detail["Date"]),
+                start_time=db.as_time(detail["Start"]),
+                end_time=db.as_time(detail["End"]),
                 status=detail["Status"],
                 note=detail.get("Note") or "",
                 attendance_rows=existing,
@@ -2093,10 +2078,10 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 st.warning(_explain(str(outcome)))
 
         run = _run_dates(
-            teacher_id, detail["Class ID"], _as_time(detail["Start"]),
-            _as_date(detail["Date"]),
+            teacher_id, detail["Class ID"], db.as_time(detail["Start"]),
+            db.as_date(detail["Date"]),
         )
-        is_last = not run or _as_date(detail["Date"]) >= max(run)
+        is_last = not run or db.as_date(detail["Date"]) >= max(run)
         months_key = f"rep_{lesson_id}"
         months = st.session_state.setdefault(months_key, 0)
 
@@ -2125,20 +2110,20 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
 
         if is_last and months:
             extra = months * WEEKS_PER_MONTH
-            through = _as_date(detail["Date"]) + dt.timedelta(weeks=extra)
+            through = db.as_date(detail["Date"]) + dt.timedelta(weeks=extra)
             st.info(
                 f"**+{months} month{'s' if months > 1 else ''}** — adds {extra} "
-                f"weekly classes, every {_as_date(detail['Date']):%A} at "
-                f"{_as_time(detail['Start']):%H:%M}, through {through:%d %b}. "
+                f"weekly classes, every {db.as_date(detail['Date']):%A} at "
+                f"{db.as_time(detail['Start']):%H:%M}, through {through:%d %b}. "
                 "Same students, everyone in class and unpaid."
             )
             confirm = st.columns([1, 4])[0]
             if confirm.button(f"Add {extra} classes", key=f"repgo_{lesson_id}",
                               type="primary", width="stretch"):
-                base = _as_date(detail["Date"])
+                base = db.as_date(detail["Date"])
                 made, blocked, last = _repeat_weekly(
                     teacher_id, detail["Class ID"], base,
-                    _as_time(detail["Start"]), _as_time(detail["End"]), extra,
+                    db.as_time(detail["Start"]), db.as_time(detail["End"]), extra,
                     [_blank_row(row["student_id"]) for row in attendance],
                 )
                 st.session_state[months_key] = 0
@@ -2167,7 +2152,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             (
                 item
                 for item in db.get_teacher_classes_for_schedule(
-                    teacher_id, _as_date(detail["Date"])
+                    teacher_id, db.as_date(detail["Date"])
                 )
                 if item["ID"] == detail["Class ID"]
             ),
@@ -2204,7 +2189,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 # enrolment exists rather than rewriting it from this screen.
                 student_ids=db.get_class_student_ids(detail["Class ID"]),
                 display_color=class_colour,
-                effective_from=_as_date(detail["Date"]),
+                effective_from=db.as_date(detail["Date"]),
             )
             if outcome in ("updated", "success", True):
                 # Only once the subject itself saved: writing the note first
@@ -2242,7 +2227,7 @@ def schedule_tab() -> None:
     if lessons:
         strip = st.columns(5)
         strip[0].metric("Classes", len(lessons))
-        strip[1].metric("Teaching days", len({_as_date(i["Date"]) for i in lessons}))
+        strip[1].metric("Teaching days", len({db.as_date(i["Date"]) for i in lessons}))
         strip[2].metric("Online", sum(i.get("Online", 0) for i in summary))
         strip[3].metric("Recording", sum(i.get("Recording", 0) for i in summary))
         strip[4].metric("Cancelled", sum(i.get("Cancelled students", 0) for i in summary))
@@ -2793,7 +2778,7 @@ def _unpriced_warning(year: int, month: int) -> None:
         )
 
 
-def _past_invoices_section(year: int, month: int, counts: dict) -> None:
+def _past_invoices_section(counts: dict) -> None:
     """Everything that is reference rather than workflow, kept out of the way.
 
     Looking an old invoice up, browsing what is still accumulating, checking
@@ -3011,7 +2996,7 @@ def invoices_tab() -> None:
     # Sits below the month's figures rather than on top of them, and belongs
     # to the month it was issued for.
     _just_issued_panel(year, month)
-    _past_invoices_section(year, month, counts)
+    _past_invoices_section(counts)
 
 
 # ---------------------------------------------------------------------------
@@ -3671,6 +3656,27 @@ def data_tab() -> None:
         .properties(height=240),
         width="stretch",
     )
+    # Teachers came onto the app at different times -- most in September
+    # 2026 -- and a month before that holds only the few billed through it
+    # then. Unsaid, the jump reads as the academy's takings quadrupling.
+    active = frame[(frame["Invoiced"] + frame["Not invoiced"]) > 0]
+    per_month = active.groupby("Month")["Teacher"].nunique()
+    if len(per_month) > 1:
+        full = int(per_month.max())
+        first_full = int(per_month[per_month == full].index.min())
+        earlier = sorted(set(active.loc[active["Month"] < first_full, "Teacher"]), key=str.casefold)
+        if earlier and len(earlier) * 2 <= full:
+            who = (
+                f"{len(earlier)} teachers" if len(earlier) > 3
+                else " and ".join([", ".join(earlier[:-1]), earlier[-1]]) if len(earlier) > 1
+                else earlier[0]
+            )
+            st.caption(
+                f"Before {calendar.month_name[first_full]} only {who} "
+                f"{'was' if len(earlier) == 1 else 'were'} billed through the app, so earlier "
+                "months are their classes alone, not the academy's whole takings. From "
+                f"{calendar.month_name[first_full]}, {full} teachers are in."
+            )
 
     # Then teachers side by side. A line each for two dozen teachers was a
     # tangle -- ten colours between them, a key twice the chart's height and

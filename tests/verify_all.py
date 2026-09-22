@@ -616,6 +616,70 @@ def t_import_prices_by_grade():
     return "by name (G9 $60, G12 $65), by students' grades, else $60; none on the placeholder"
 
 
+_DOUBLE_IMPORT_SCRIPT = '''
+import datetime as dt, json, threading
+import db, schedule_backfill
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+names = ["Nam Jihoon", "Oh Minseok", "Seo Yerin", "Choi Doyun", "Lee Kyuwon", "Park Hana"]
+def preview():
+    return {"name_reviews": [], "sessions": [
+        {"class_name": f"G9 Group {i % 3}", "date": dt.date(2026, 9, 1 + i), "start_time": dt.time(9),
+         "end_time": dt.time(11), "warnings": [],
+         "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+        for i in range(8)]}
+previews, results, errors = [preview(), preview()], [None, None], []
+start = threading.Barrier(2)
+def go(i):
+    start.wait()
+    try:
+        results[i] = schedule_backfill.backfill(previews[i], teacher)["status"]
+    except Exception as error:
+        errors.append(repr(error)[:200])
+threads = [threading.Thread(target=go, args=(i,)) for i in range(2)]
+[t.start() for t in threads]; [t.join() for t in threads]
+# Issued invoices: newest first by number, as the lookup promises.
+rows = db.get_open_invoice_items_for_month(2026, 9)
+for row in rows:
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+numbers = [i["Number"] for i in db.get_invoices(status="Issued")]
+from sqlalchemy import func, select
+with db.SessionLocal() as session:
+    on_file = dict(session.execute(select(db.Student.full_name, func.count()).group_by(db.Student.full_name)).all())
+    lessons = session.scalar(select(func.count()).select_from(db.ClassSession))
+print(json.dumps({"results": results, "errors": errors, "on_file": on_file, "lessons": lessons,
+                  "numbers": numbers}))
+'''
+
+
+def t_double_import():
+    """Two imports at the same instant put each student on file once.
+
+    A second run of the app can start while the first is still importing -- a
+    second click on "Commit import", or the app open in another tab. Side by
+    side, each checked that a new student wasn't on file yet and each added
+    them; eleven students were put on file twice that way, and one of the two
+    imports failed half way. Now the second waits for the first, and finds
+    everything already there.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "double.db").replace("\\", "/")
+        result = run(["-c", _DOUBLE_IMPORT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert not got["errors"], got["errors"]
+    assert got["results"] == ["imported", "imported"], got["results"]
+    twice = {name: n for name, n in got["on_file"].items() if n > 1}
+    assert not twice, f"on file more than once: {twice}"
+    assert len(got["on_file"]) == 6 and got["lessons"] == 8, got
+    assert got["numbers"] == sorted(got["numbers"], reverse=True), f"not newest first: {got['numbers']}"
+    return f"6 students once each, 8 lessons, {len(got['numbers'])} invoices newest first"
+
+
 _CREDIT_SCRIPT = '''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -844,6 +908,7 @@ for name, fn in [
     ("long names fit their columns", t_long_names_fit_their_columns),
     ("import prices by grade", t_import_prices_by_grade),
     ("cancelled classes credited", t_cancelled_classes_credited),
+    ("two imports at once", t_double_import),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

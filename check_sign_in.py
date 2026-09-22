@@ -19,7 +19,6 @@ is not echoed as you type, and it is not written down.
 from __future__ import annotations
 
 import getpass
-import sys
 import tomllib
 from pathlib import Path
 

@@ -1,10 +1,11 @@
 from pathlib import Path
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from calendar import month_abbr, monthrange
 from typing import Any
 import os
 import re
+import threading
 
 from sqlalchemy import (
     Boolean,
@@ -445,8 +446,8 @@ def _schema_is_current() -> bool:
     against a remote Postgres: ``create_all``'s reflection plus the column
     inspections guarding each migration come to over fifteen hundred round
     trips. Sitting beside the database that is six seconds, measured. The
-    database is in ap-southeast-1 and the host is not, so each of those
-    trips costs far more there, and the total ran into minutes. It also ran
+    database was then in Singapore and the host in Oregon, so each of those
+    trips cost far more, and the total ran into minutes. It also ran
     on *every* rerun, because Streamlit re-executes the script from the top
     on each interaction -- so the deployed app appeared to hang on every
     click, which is how this was found.
@@ -784,7 +785,7 @@ def get_unpriced_subjects(class_ids=None):
         subjects: dict[int, dict[str, Any]] = {}
         counted: set[int] = set()
         for session_id, class_id, when, name, teacher_id, teacher in rows:
-            when = _as_day(when)
+            when = as_date(when)
             if session_id in counted:
                 continue
             if _rate_lookup(rates, class_id, when) > UNSET_RATE:
@@ -834,8 +835,8 @@ def get_subject_student_grades(class_ids):
     latest: dict[int, tuple[date, int]] = {}
     for student_id, class_name, when in lessons:
         grade = grade_of(class_name)
-        if grade and (student_id not in latest or _as_day(when) > latest[student_id][0]):
-            latest[student_id] = (_as_day(when), grade)
+        if grade and (student_id not in latest or as_date(when) > latest[student_id][0]):
+            latest[student_id] = (as_date(when), grade)
     grades: dict[int, list[int]] = {class_id: [] for class_id in ids}
     for class_id, student_id in on_subject:
         if student_id in latest:
@@ -2074,18 +2075,29 @@ def remove_student(student_id):
 INVOICE_NUMBER_START = 7323
 
 
-def _as_day(value):
+def as_date(value) -> date:
     """A date, whatever SQLite handed back.
 
     ``min()``/``max()`` over a Date column come back as text rather than a
     date object, so anything comparing an aggregate against a real date has
-    to go through here first.
+    to go through here first. The screens use it on the dates the functions
+    here hand back for the same reason.
     """
     if isinstance(value, datetime):
         return value.date()
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value))
+
+
+def as_time(value) -> time:
+    """A time of day from a time, a datetime, or "HH:MM[:SS]" text."""
+    if isinstance(value, time):
+        return value
+    if isinstance(value, datetime):
+        return value.time()
+    parts = [int(part) for part in str(value).split(":")[:2]]
+    return time(parts[0], parts[1] if len(parts) > 1 else 0)
 
 
 def _span_hours(start_time, end_time):
@@ -2708,8 +2720,18 @@ def get_invoices(status=None, student_id=None):
                     "Created": invoice.created_at,
                 }
             )
+        # Newest by what a person reads -- the issue date, then the invoice
+        # number -- not by the row's id. Issuing a backlog oldest month
+        # first splits new rows off each student's open invoice, so ids and
+        # numbers run in different orders: by id, the newest-numbered
+        # invoices sat hundreds down the list, past the 100 the lookup shows.
         results.sort(
-            key=lambda row: (row["Status"] != "Open", -(row["ID"] or 0))
+            key=lambda row: (
+                row["Status"] != "Open",
+                -(as_date(row["Issued"]).toordinal() if row["Issued"] else 0),
+                -(row["Number"] or 0),
+                -(row["ID"] or 0),
+            )
         )
         return results
 
@@ -2837,8 +2859,9 @@ def get_invoices_detailed(invoice_ids):
     month's invoices to files, or listing what was just issued -- ask for one
     invoice at a time. Thirty of them is a hundred and twenty round trips:
     under a second beside the database, and the better part of half a minute
-    from a host that is not in the same region, which is what the
-    deployment actually is.
+    from a host in another region, which is where the deployment first put
+    it. Both are in Oregon now, but the count still matters: every trip is
+    paid for on every click.
 
     Everything an *issued* invoice needs is fetched up front and grouped in
     Python, so the cost stops growing with the number of invoices. Issued is
@@ -2939,6 +2962,14 @@ def get_invoices_detailed(invoice_ids):
         return detailed
 
 
+# Two issues at once -- a double click, two admins, or a script run while the
+# app is in use -- would each read the same highest invoice number and hand
+# it out twice, and each move the same classes. The thread lock covers runs
+# inside the app; on Postgres an advisory lock, held until the commit, covers
+# everything else that talks to the same database.
+_ONE_ISSUE_AT_A_TIME = threading.Lock()
+
+
 def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
     """Freeze only the classes on an open invoice that fall in one month.
 
@@ -2952,7 +2983,10 @@ def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
     first_day = date(year, month, 1)
     last_day = date(year, month, monthrange(year, month)[1])
 
-    with SessionLocal() as session:
+    with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                            {"key": INVOICE_NUMBER_START})
         invoice = session.get(Invoice, invoice_id)
         if invoice is None:
             return "missing", None
@@ -3411,7 +3445,7 @@ def get_invoice_payments(year, month, today=None):
         invoice_ids = [
             invoice_id
             for invoice_id, (_, latest) in spans.items()
-            if latest is not None and first_day <= _as_day(latest) <= last_day
+            if latest is not None and first_day <= as_date(latest) <= last_day
         ]
         if not invoice_ids:
             return {"unpaid": [], "paid": [], "due": due}
@@ -3446,7 +3480,7 @@ def get_invoice_payments(year, month, today=None):
             earliest, latest = spans.get(invoice.id, (None, None))
             row["Covers"] = ""
             if earliest is not None and latest is not None:
-                earliest, latest = _as_day(earliest), _as_day(latest)
+                earliest, latest = as_date(earliest), as_date(latest)
                 if (earliest.year, earliest.month) != (latest.year, latest.month):
                     row["Covers"] = (
                         f"{month_abbr[earliest.month]} {earliest.year} – "
@@ -3602,7 +3636,7 @@ def get_payment_reminders(today=None):
         for (
             invoice_id, number, student_id, name, latest, earliest, amount, classes
         ) in rows:
-            latest, earliest = _as_day(latest), _as_day(earliest)
+            latest, earliest = as_date(latest), as_date(earliest)
             due = payment_due_date(latest.year, latest.month)
             if today < due:
                 continue
@@ -3944,7 +3978,7 @@ def _teacher_month_money(session, first_day, last_day, teacher_ids):
     for teacher_id, when, session_id, class_name, amount, hours, longest in rows:
         if teacher_id is None:
             continue
-        when = _as_day(when)
+        when = as_date(when)
         key = (teacher_id, when.year, when.month)
         bucket = buckets.get(key)
         if bucket is None:
@@ -4034,7 +4068,7 @@ def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
     for teacher_id, session_id, class_id, when, start, end, student_id in rows:
         if (student_id, session_id) in billed:
             continue
-        when = _as_day(when)
+        when = as_date(when)
         bucket = waiting.setdefault((teacher_id, when.year, when.month), {
             "lessons": {}, "value": 0.0, "unpriced": set()})
         hours = _span_hours(start, end)
@@ -4331,7 +4365,7 @@ def get_lesson_history_summary():
         ).all()
     return [
         {"Teacher": teacher, "Student-lessons": lessons, "Students": students,
-         "From": _as_day(first), "To": _as_day(last)}
+         "From": as_date(first), "To": as_date(last)}
         for teacher, lessons, students, first, last in rows
     ]
 
@@ -4397,14 +4431,14 @@ def get_analysis_lessons(today=None):
         ).all()
     return {
         "app": [
-            {"teacher": teacher, "class_name": class_name, "date": _as_day(when),
+            {"teacher": teacher, "class_name": class_name, "date": as_date(when),
              "start": start, "end": end, "student": student,
              "status": _lesson_condition(online, recording, cancelled)}
             for teacher, class_name, when, start, end, student, online, recording, cancelled
             in app_rows
         ],
         "history": [
-            {"teacher": teacher, "class_name": class_name, "date": _as_day(when),
+            {"teacher": teacher, "class_name": class_name, "date": as_date(when),
              "start": start, "end": end, "student": student, "status": status}
             for teacher, class_name, when, start, end, student, status in history_rows
         ],
