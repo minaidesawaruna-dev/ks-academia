@@ -1266,9 +1266,11 @@ def _fold(text: str) -> str:
 
 
 def name_sound(name: str) -> str:
-    """A name as it is said, in any word order: "Chung Jaaeho" and "Jaeho Chung",
-    "Lee Kyuwon" and "Lee Gyuwon" all come out the same."""
-    return " ".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", name)))
+    """A name as it is said, in any word order and spacing, without a nickname
+    in brackets: "Chung Jaaeho" and "Jaeho Chung", "Lee Kyuwon" and "Lee
+    Gyuwon", "Kim Siyeon(Emily)" and "Kim Si Yeon" all come out the same."""
+    bare = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", name)
+    return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", bare)))
 
 
 def _hangul_sounds(hangul: str) -> set[str]:

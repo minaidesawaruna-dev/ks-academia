@@ -1435,6 +1435,11 @@ def students_tab() -> None:
         with st.expander(f"{item['Name']}{contact}{marker}"):
             breakdown = breakdowns.get(item["ID"], {"lines": [], "total": 0.0})
             if breakdown["lines"]:
+                # A subject still on the import's placeholder has no price
+                # anybody chose; showing its $1/h arithmetic as money made a
+                # month of lessons read "$10.00".
+                priced = [line for line in breakdown["lines"] if line["Rate"] > db.UNSET_RATE]
+                unpriced = len(breakdown["lines"]) - len(priced)
                 st.dataframe(
                     [
                         {
@@ -1442,8 +1447,10 @@ def students_tab() -> None:
                             "Teacher": line["Teacher"],
                             "Sessions": line["Sessions"],
                             "Hours": line["Hours"],
-                            "Rate": f"${line['Rate']:,.2f}/h",
-                            "Amount": f"${line['Amount']:,.2f}",
+                            "Rate": (f"${line['Rate']:,.2f}/h" if line["Rate"] > db.UNSET_RATE
+                                     else "no price yet"),
+                            "Amount": (f"${line['Amount']:,.2f}" if line["Rate"] > db.UNSET_RATE
+                                       else "—"),
                         }
                         for line in breakdown["lines"]
                     ],
@@ -1454,7 +1461,10 @@ def students_tab() -> None:
                 figures = st.columns(2) if owed else [st]
                 figures[0].metric(
                     f"Total for {calendar.month_name[month]} {year}",
-                    f"${breakdown['total']:,.2f}",
+                    f"${sum(line['Amount'] for line in priced):,.2f}"
+                    + (" + unpriced" if unpriced else ""),
+                    help=(f"Leaves out {unpriced} subject(s) with no price yet — set "
+                          "one on the Teachers screen." if unpriced else None),
                 )
                 if owed:
                     figures[1].metric(
