@@ -571,6 +571,14 @@ def t_grade_prefix_match():
     finally:
         sb.db.get_all_students = real
     assert found == {"Nam Jiihoon": (4, True), "Lee Kyuwon": (5, True), "Lee Ayoon": (6, False)}, found
+    # A nickname added in brackets is the same child; two tagged apart are two children.
+    lesson = {"attendance": [{"student_name": n} for n in ("Oh Minseok(Mike)", "Choi Doyun(B)")]}
+    try:
+        sb.db.get_all_students = lambda: [{"ID": 7, "Name": "Oh Minseok"}, {"ID": 8, "Name": "Choi Doyun(A)"}]
+        found = {m["parsed_name"]: (m["existing_id"], m["likely_same"]) for m in sb.suggest_student_matches([lesson])}
+    finally:
+        sb.db.get_all_students = real
+    assert found == {"Oh Minseok(Mike)": (7, True), "Choi Doyun(B)": (8, False)}, found
     return "an existing 'G5 Sohee' is offered, and pre-selected, as the match for 'Sohee'"
 
 

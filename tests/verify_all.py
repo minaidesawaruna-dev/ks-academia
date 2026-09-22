@@ -610,6 +610,81 @@ def t_import_prices_by_grade():
     return "G9 at $60/h, G12 at $65/h, a gradeless subject left unpriced"
 
 
+_CREDIT_SCRIPT = '''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+everyone = ["Nam Jihoon", "Oh Minseok", "Seo Yerin"]
+
+def lesson(day, names, cancelled=()):
+    return {"date": day, "class_name": "G11 Test Math", "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Cancelled" if n in cancelled else "Attending"}
+                           for n in names]}
+
+def upload(sessions):
+    sb.backfill({"sessions": sessions}, teacher)
+
+def bill(year, month):
+    out = {}
+    for row in db.get_open_invoice_items_for_month(year, month):
+        _, new_id = db.issue_invoice_for_month(row["Invoice ID"], year, month)
+        out[row["Student"]] = round(db.get_invoice(new_id)["Total"], 2)
+    return out
+
+def owed():
+    return sorted([c["Student"], c["Amount"], c["Status"]] for c in db.get_credits())
+
+sept = [lesson(dt.date(2026, 9, d), everyone) for d in (1, 8, 15, 22)]
+upload(sept)
+result = {"september": bill(2026, 9)}
+changed = sept[:2] + [lesson(dt.date(2026, 9, 15), everyone, cancelled={"Nam Jihoon"}),
+                      lesson(dt.date(2026, 9, 22), ["Nam Jihoon", "Seo Yerin"])]
+upload(changed)
+result["after_changes"] = owed()
+upload(changed)
+result["uploaded_twice"] = owed()
+upload(sept[:2] + [lesson(dt.date(2026, 9, 15), everyone, cancelled={"Nam Jihoon"}), sept[3]])
+result["put_back"] = owed()
+upload(changed)
+upload([lesson(dt.date(2026, 10, 6), everyone),
+        lesson(dt.date(2026, 10, 13), everyone, cancelled={"Seo Yerin"})])
+result["october"] = bill(2026, 10)
+result["settled"] = owed()
+print(json.dumps(result))
+'''
+
+
+def t_cancelled_classes_credited():
+    """A class invoiced and then missed comes off the student's next invoice.
+
+    The academy's rule: a cancelled class is carried forward and deducted from
+    the next invoice. Teachers record an absence either by marking the student
+    cancelled or by taking them off the lesson; both, arriving by re-upload
+    after the month was invoiced, must raise a credit for what was paid --
+    once, however often the schedule is re-uploaded -- that the next invoice
+    settles. Putting the student back takes the credit away. A cancellation
+    known before an invoice goes out is simply never charged.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "credit.db").replace("\\", "/")
+        result = run(["-c", _CREDIT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["september"] == {n: 520.0 for n in ("Nam Jihoon", "Oh Minseok", "Seo Yerin")}, got
+    raised = [["Nam Jihoon", 130.0, "Open"], ["Oh Minseok", 130.0, "Open"]]
+    assert got["after_changes"] == raised, f"credits after the changes: {got['after_changes']}"
+    assert got["uploaded_twice"] == raised, f"uploading again raised more: {got['uploaded_twice']}"
+    assert got["put_back"] == [["Nam Jihoon", 130.0, "Open"]], f"put back: {got['put_back']}"
+    assert got["october"] == {"Nam Jihoon": 130.0, "Oh Minseok": 130.0, "Seo Yerin": 130.0}, got
+    assert got["settled"] == [["Nam Jihoon", 130.0, "Applied"], ["Oh Minseok", 130.0, "Applied"]], got
+    return "cancelled or taken off after invoicing -> credited once, off the next invoice"
+
+
 def t_student_batch_matches_single():
     """The Students screen's figures must not change by being fetched together.
 
@@ -750,6 +825,7 @@ for name, fn in [
     ("batched student figures match single", t_student_batch_matches_single),
     ("long names fit their columns", t_long_names_fit_their_columns),
     ("import prices by grade", t_import_prices_by_grade),
+    ("cancelled classes credited", t_cancelled_classes_credited),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

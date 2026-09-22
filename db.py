@@ -2368,7 +2368,11 @@ def sync_invoice_items(session_id):
     * If their invoice has already been issued the figures are frozen, so
       the correction becomes a credit against their next one instead.
     * A student taken off the class entirely is dropped from any invoice
-      still open; issued invoices are never touched.
+      still open. One already invoiced for it is owed it back, the same as a
+      cancellation: teachers mostly record an absence by taking the student
+      off the lesson and noting why underneath, and a class invoiced ahead
+      of the month that the student then missed must come off their next
+      invoice either way. The issued invoice itself is never touched.
     """
 
     with SessionLocal() as session:
@@ -2398,6 +2402,10 @@ def sync_invoice_items(session_id):
                 if invoice.student_id in cancelled:
                     _raise_credit(
                         session, invoice.student_id, lesson, "Cancelled class"
+                    )
+                elif invoice.student_id not in billable:
+                    _raise_credit(
+                        session, invoice.student_id, lesson, "Taken off the class"
                     )
                 else:
                     _drop_credit(session, invoice.student_id, lesson.id)

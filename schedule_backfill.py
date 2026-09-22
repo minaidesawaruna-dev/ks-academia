@@ -24,7 +24,7 @@ from __future__ import annotations
 import datetime as dt
 import difflib
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Any
 
 import db
@@ -171,6 +171,7 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
     existing = db.get_all_students()
     exact = {item["Name"].casefold() for item in existing}
     sounds = {item["ID"]: name_sound(item["Name"]) for item in existing}
+    bare_names = Counter(_bare(item["Name"]) for item in existing)
 
     parsed_names = sorted(
         {
@@ -223,8 +224,15 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
             # Only a grade apart, and from one student only: that student
             # already has this name's invoices, so saying "new person" by
             # default would bill every one of those classes again.
+            # A nickname added in brackets -- "Gwak Jiseung(Emma)" for the
+            # "Gwak Jiseung" on file -- is the same child, when only one
+            # student on file has that name and theirs carries no tag of its
+            # own (two tagged "Kim Minji(A)" and "(B)" are two children).
+            nickname = (best["reason"] == "tag" and best["tag"] and not best["existing_tag"]
+                        and bare_names[bare_new] == 1)
             best["likely_same"] = (
-                (best["reason"] == "grade" and grade_matches == 1) or best["reason"] == "sound"
+                (best["reason"] == "grade" and grade_matches == 1)
+                or best["reason"] == "sound" or bool(nickname)
             )
             candidates.append(best)
 
