@@ -1271,7 +1271,7 @@ def set_class_rate_for_month(class_id, month_start, hourly_rate):
         return outcome
 
 
-def _apply_month_rate(session, class_id, month_start, hourly_rate):
+def _apply_month_rate(session, class_id, month_start, hourly_rate, periods=None):
     """The month-rate rule itself, inside a caller's transaction.
 
     Shared so the Teachers tab and the Schedule's subject editor price a
@@ -1280,7 +1280,8 @@ def _apply_month_rate(session, class_id, month_start, hourly_rate):
     and, when that date fell before the existing period, left two open-ended
     periods overlapping: the later one then shadowed the price just typed.
 
-    The caller commits.
+    The caller commits. ``periods`` is the subject's rate periods when the
+    caller has already loaded them, and is kept up to date as they change.
     """
     month_start = date(month_start.year, month_start.month, 1)
     month_end = date(
@@ -1288,8 +1289,9 @@ def _apply_month_rate(session, class_id, month_start, hourly_rate):
         month_start.month,
         monthrange(month_start.year, month_start.month)[1],
     )
+    known = periods
     periods = sorted(
-        session.scalars(
+        known if known is not None else session.scalars(
             select(ClassRate).where(ClassRate.class_id == class_id)
         ).all(),
         key=lambda rate: rate.effective_from,
@@ -1305,6 +1307,8 @@ def _apply_month_rate(session, class_id, month_start, hourly_rate):
         for stray in periods:
             if stray is not exact and month_start < stray.effective_from <= month_end:
                 session.delete(stray)
+                if known is not None:
+                    known.remove(stray)
         return "updated"
 
     later = next(
@@ -1318,18 +1322,47 @@ def _apply_month_rate(session, class_id, month_start, hourly_rate):
                 rate.effective_to = month_start - timedelta(days=1)
         elif rate.effective_from <= month_end:
             session.delete(rate)
+            if known is not None:
+                known.remove(rate)
 
-    session.add(
-        ClassRate(
-            class_id=class_id,
-            hourly_rate=hourly_rate,
-            effective_from=month_start,
-            effective_to=(
-                later.effective_from - timedelta(days=1) if later else None
-            ),
-        )
+    added = ClassRate(
+        class_id=class_id,
+        hourly_rate=hourly_rate,
+        effective_from=month_start,
+        effective_to=(
+            later.effective_from - timedelta(days=1) if later else None
+        ),
     )
+    session.add(added)
+    if known is not None:
+        known.append(added)
     return "created"
+
+
+def set_class_rates_for_months(assignments):
+    """Price many subjects at once -- ``[(class_id, month_start, rate)]`` -- all or nothing.
+
+    One at a time, each price is several round trips to a database on the
+    other side of the Pacific, so pricing forty subjects ran for most of a
+    minute, and anything clicked meanwhile stopped it part-way: some teachers
+    priced, the rest not. Here every subject's periods are read in one query
+    and every change goes back in one commit. Returns how many were priced.
+    """
+    items = [(int(class_id), month_start, float(rate))
+             for class_id, month_start, rate in assignments
+             if rate is not None and float(rate) > 0]
+    if not items:
+        return 0
+    with SessionLocal() as session:
+        periods: dict[int, list[ClassRate]] = defaultdict(list)
+        for rate in session.scalars(
+            select(ClassRate).where(ClassRate.class_id.in_({item[0] for item in items}))
+        ).all():
+            periods[rate.class_id].append(rate)
+        for class_id, month_start, rate in items:
+            _apply_month_rate(session, class_id, month_start, rate, periods=periods[class_id])
+        session.commit()
+    return len({item[0] for item in items})
 
 
 def get_class_rates_for_date(class_ids, on_date):

@@ -978,16 +978,17 @@ def _unpriced_everywhere() -> None:
                      key="price_everything", width="stretch"):
             with st.spinner(f"Pricing {len(unpriced)} subject(s)…"):
                 done = set()
-                # A subject priced again part-way through -- placeholder in
-                # spring, a real price in summer, placeholder again since --
-                # still has a gap after one pass; a second closes it.
+                # All in one commit, so nothing clicked meanwhile can leave
+                # half of them priced. A subject priced again part-way
+                # through -- placeholder in spring, a real price in summer,
+                # placeholder again since -- still has a gap after one pass;
+                # a second closes it.
                 for _ in range(3):
-                    for item in unpriced:
-                        year, month = item["Months"][0]
-                        outcome = db.set_class_rate_for_month(
-                            item["Class ID"], dt.date(year, month, 1), rule[item["Class ID"]][0])
-                        if outcome in ("created", "updated"):
-                            done.add(item["Class ID"])
+                    db.set_class_rates_for_months(
+                        (item["Class ID"], dt.date(*item["Months"][0], 1), rule[item["Class ID"]][0])
+                        for item in unpriced
+                    )
+                    done |= {item["Class ID"] for item in unpriced}
                     unpriced = [item for item in db.get_unpriced_subjects()
                                 if item["Class ID"] in rule]
                     if not unpriced:
@@ -1163,10 +1164,10 @@ def _bulk_rate_section(
         key=f"bulk_rate_standard_{scope}",
         width="stretch",
     ):
-        done = 0
-        for class_id, rate in by_grade.items():
-            if _save_subject_rate(class_id, month_start, rate) in ("created", "updated"):
-                done += 1
+        done = db.set_class_rates_for_months(
+            (class_id, month_start, rate) for class_id, rate in by_grade.items()
+        )
+        for class_id in by_grade:
             st.session_state.pop(f"bulk_rate_pick_{scope}_{class_id}", None)
         st.session_state.pop(f"bulk_rate_all_{scope}", None)
         if done:
