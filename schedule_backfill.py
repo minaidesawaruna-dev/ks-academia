@@ -30,7 +30,8 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    JUNIOR_RATE, MERGE_THRESHOLD, SENIOR_RATE, _bare, _suffix, name_sound, standard_rate,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, SENIOR_RATE, _bare, _suffix, name_sound,
+    standard_rate,
 )
 
 __all__ = [
@@ -69,6 +70,9 @@ def apply_review_decisions(
         names, counts = review["names"], review["counts"]
         winner, loser = (names[0], names[1]) if counts[0] >= counts[1] else (names[1], names[0])
         renames[loser.casefold()] = winner
+        # Kept for the import to remember: next month's workbook will spell
+        # the child both ways again, and shouldn't need asking.
+        preview.setdefault("merged_spellings", {})[loser] = winner
 
     sessions = preview.get("sessions") or []
     if renames:
@@ -250,7 +254,7 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
     resolve, same as always.
     """
     existing = db.get_all_students()
-    exact = {item["Name"].casefold() for item in existing}
+    exact = {item["Name"].casefold() for item in existing} | set(db.get_student_aliases())
     sounds = {item["ID"]: name_sound(item["Name"]) for item in existing}
     bare_names = Counter(_bare(item["Name"]) for item in existing)
 
@@ -294,26 +298,52 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                     "tag": _suffix(name) or None,
                     "existing_tag": _suffix(existing_name) or None,
                 }
+        # Said the same way, however far apart the letters: the other order
+        # ("Kim Hayun", "Hayun Kim"), another romanisation ("Sohn Taemin",
+        # "Tae Min Sohn"), a nickname in brackets. Compared letter by letter
+        # these were never close enough to ask about, so each came in as a
+        # new student and the child's bills split in two.
+        sound = name_sound(name)
+        alike = [student for student, said in sounds.items() if sound and said == sound]
+        if alike and (best is None or best["reason"] == "spelling"):
+            said_same = next(item for item in existing if item["ID"] == alike[0])
+            if best is None or best["existing_id"] not in alike:
+                best = {
+                    "parsed_name": name,
+                    "existing_name": said_same["Name"],
+                    "existing_id": said_same["ID"],
+                    "similarity": round(difflib.SequenceMatcher(
+                        None, bare_new, _bare(said_same["Name"])).ratio(), 3),
+                    "reason": "sound",
+                    "tag": _suffix(name) or None,
+                    "existing_tag": _suffix(said_same["Name"]) or None,
+                }
         if best:
-            # Spelled differently but said the same -- Jaaeho and Jaeho, Kyuwon
-            # and Gyuwon -- and by nobody else on file: the same child, so
-            # "new person" by default would split their bills in two.
-            sound = name_sound(name)
-            alike = [student for student, said in sounds.items() if sound and said == sound]
-            if best["reason"] == "spelling" and alike == [best["existing_id"]]:
+            # Spelled differently but said the same -- Jaaemin and Jaemin, Kyubin
+            # and Gyubin -- and by nobody else on file: the same child, so
+            # "new person" by default would split their bills in two. Said
+            # the same as two students, it's still asked, but not assumed.
+            if best["reason"] in ("spelling", "sound") and best["existing_id"] in alike:
                 best["reason"] = "sound"
             # Only a grade apart, and from one student only: that student
             # already has this name's invoices, so saying "new person" by
             # default would bill every one of those classes again.
-            # A nickname added in brackets -- "Gwak Jiseung(Emma)" for the
-            # "Gwak Jiseung" on file -- is the same child, when only one
+            # A nickname added in brackets -- "Park Jisoo(Emma)" for the
+            # "Park Jisoo" on file -- is the same child, when only one
             # student on file has that name and theirs carries no tag of its
-            # own (two tagged "Kim Minji(A)" and "(B)" are two children).
+            # own (two tagged "Park Hana(A)" and "(B)" are two children).
+            # Not a grade in brackets, though: "Nam Jihoon(G9)" is how a
+            # teacher tells a ninth-grader from the Nam Jihoon in grade 12.
             nickname = (best["reason"] == "tag" and best["tag"] and not best["existing_tag"]
-                        and bare_names[bare_new] == 1)
+                        and not GRADE_TAG.match(best["tag"]) and bare_names[bare_new] == 1)
+            # A given name alone -- "Yuna" in one workbook, "Yoona" on file
+            # -- is too common a name to settle it without asking.
+            full_names = all(len(re.findall(r"[A-Za-z]+", re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", n))) >= 2
+                             for n in (name, best["existing_name"]))
             best["likely_same"] = (
                 (best["reason"] == "grade" and grade_matches == 1)
-                or best["reason"] == "sound" or bool(nickname)
+                or (best["reason"] == "sound" and len(alike) == 1 and full_names)
+                or bool(nickname)
             )
             candidates.append(best)
 
@@ -459,7 +489,11 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     # import is what made later imports slower than earlier ones, even
     # though each import's own workload never changed size.
     student_matches = student_matches or {}
-    name_to_id = {item["Name"].casefold(): item["ID"] for item in db.get_all_students()}
+    # A spelling already known to be a student on file -- merged into them,
+    # or confirmed at an earlier import -- is them; their own name wins.
+    name_to_id = {**db.get_student_aliases(),
+                  **{item["Name"].casefold(): item["ID"] for item in db.get_all_students()}}
+    confirmed = []
     for session in sessions:
         for entry in session["attendance"]:
             key = entry["student_name"].casefold()
@@ -467,14 +501,21 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
                 continue
             if key in student_matches:
                 # The admin confirmed this spelling is an existing student --
-                # not a new one, even though it doesn't match exactly.
+                # not a new one, even though it doesn't match exactly. Kept,
+                # so next month's workbook saying it again needs no asking.
                 name_to_id[key] = student_matches[key]
+                confirmed.append((student_matches[key], entry["student_name"]))
                 continue
             if db.create_quick_student(entry["student_name"]) == "created":
                 created["students"] += 1
             new_id = db.get_student_id_by_name(entry["student_name"])
             if new_id is not None:
                 name_to_id[key] = new_id
+    for loser, winner in (preview.get("merged_spellings") or {}).items():
+        if winner.casefold() in name_to_id:
+            confirmed.append((name_to_id[winner.casefold()], loser))
+    if confirmed:
+        db.remember_student_aliases(confirmed)
 
     # 2. Classes, each with its own colour, created with their first class.
     # Scoped to this teacher's own classes only, so a name that collides with

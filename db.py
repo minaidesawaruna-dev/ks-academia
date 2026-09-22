@@ -439,6 +439,107 @@ class LessonHistory(Base):
     )
 
 
+class StudentAlias(Base):
+    """Another spelling a teacher uses for a student already on file.
+
+    Teachers each write a child their own way, every month: once "Kim Hayun"
+    has been merged into "Hayun Kim", or confirmed at an import as the same
+    child, the next workbook that says "Kim Hayun" means her -- not a new
+    student, and not a question for the admin all over again.
+    """
+
+    __tablename__ = "student_aliases"
+
+    id = Column(Integer, primary_key=True)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    alias = Column(String(100), nullable=False, unique=True)
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+
+class DistinctStudents(Base):
+    """Two students an admin said are different children, however alike their names.
+
+    So the "on file twice?" list stops offering them -- two Yunas in one
+    teacher's classes are two girls, and asking every week would bury the
+    pairs that are one child.
+    """
+
+    __tablename__ = "distinct_students"
+    __table_args__ = (UniqueConstraint("first_id", "second_id", name="uq_distinct_pair"),)
+
+    id = Column(Integer, primary_key=True)
+    first_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    second_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+
+def mark_students_distinct(first_id, second_id):
+    """Remember that two students are different children."""
+    first_id, second_id = sorted((int(first_id), int(second_id)))
+    with SessionLocal() as session:
+        if not session.scalar(select(func.count()).select_from(DistinctStudents).where(
+                DistinctStudents.first_id == first_id, DistinctStudents.second_id == second_id)):
+            session.add(DistinctStudents(first_id=first_id, second_id=second_id))
+            session.commit()
+    return "marked"
+
+
+def _alias_key(name: str) -> str:
+    return " ".join(str(name).split()).casefold()
+
+
+def get_student_aliases() -> dict[str, int]:
+    """Every other spelling on file: ``{spelling, casefolded: student id}``."""
+    with SessionLocal() as session:
+        return {
+            _alias_key(alias): student_id
+            for alias, student_id in session.execute(
+                select(StudentAlias.alias, StudentAlias.student_id)
+            ).all()
+        }
+
+
+def _remember_alias(session, student_id, name, ignoring=()) -> bool:
+    """Record ``name`` as another spelling of ``student_id``, if it tells us anything.
+
+    Not when it is the student's own name, and not when another student on
+    file is called exactly that -- then the spelling doesn't pick out one
+    child, and guessing would put lessons on the wrong one. ``ignoring`` is
+    a record about to go, such as the one being merged away.
+    """
+    key = _alias_key(name)
+    student = session.get(Student, student_id)
+    if not key or student is None or _alias_key(student.full_name) == key:
+        return False
+    if session.scalar(
+        select(func.count()).select_from(Student).where(
+            Student.id != student_id, Student.id.not_in(list(ignoring)),
+            func.lower(func.trim(Student.full_name)) == key,
+        )
+    ):
+        return False
+    existing = session.scalars(select(StudentAlias)).all()
+    for row in existing:
+        if _alias_key(row.alias) == key:
+            row.student_id = student_id
+            return True
+    session.add(StudentAlias(student_id=student_id, alias=_fit(" ".join(str(name).split()),
+                                                                StudentAlias.alias)))
+    return True
+
+
+def remember_student_aliases(pairs) -> int:
+    """Record several ``(student_id, spelling)`` pairs at once; returns how many."""
+    with SessionLocal() as session:
+        added = sum(_remember_alias(session, student_id, name) for student_id, name in pairs)
+        session.commit()
+        return added
+
+
 def _schema_is_current() -> bool:
     """Whether every table and column the app expects is already in place.
 
@@ -2062,9 +2163,326 @@ def remove_student(student_id):
         ).all():
             session.delete(row)
 
+        for row in session.scalars(
+            select(StudentAlias).where(StudentAlias.student_id == student_id)
+        ).all():
+            session.delete(row)
+        for row in session.scalars(select(DistinctStudents).where(
+                (DistinctStudents.first_id == student_id) | (DistinctStudents.second_id == student_id))).all():
+            session.delete(row)
+
         session.delete(student)
         session.commit()
         return "deleted"
+
+
+def merge_students(keep_id, drop_id, dry_run=False):
+    """Fold a second record of the same child into the first.
+
+    Teachers spell a child two ways -- "Kim Hayun" and "Hayun Kim", "Kwak" and
+    "Gwak" -- and a workbook read before anyone caught it leaves the child
+    on file twice: their months split across two records, two invoices where
+    there should be one, and two students in the retention figures.
+
+    Everything on the dropped record moves in one go: lessons, subjects,
+    invoices (issued ones keep their numbers and figures, only whose they
+    are changes), credits, and the analysis' past schedules under the
+    dropped spelling. Lessons and invoices have to move together -- credits
+    are worked out from who sat a class against who was invoiced for it --
+    and the child ends up with a single open invoice, where every class
+    still to be billed collects. A parent or note fills in where the kept
+    record has none.
+
+    Refused when the two are ever in the same lesson: one child cannot sit a
+    class twice, so that is two children. ``dry_run`` works everything out
+    and changes nothing, for showing what a merge would do before it is done.
+    """
+    if keep_id == drop_id:
+        return {"status": "same"}
+    with SessionLocal() as session:
+        keep, drop = session.get(Student, keep_id), session.get(Student, drop_id)
+        if keep is None or drop is None:
+            return {"status": "missing"}
+
+        kept_lessons = set(session.scalars(
+            select(SessionAttendance.session_id).where(SessionAttendance.student_id == keep_id)
+        ).all())
+        moving = session.scalars(
+            select(SessionAttendance).where(SessionAttendance.student_id == drop_id)
+        ).all()
+        shared = sorted({row.session_id for row in moving} & kept_lessons)
+        if shared:
+            dates = session.scalars(
+                select(ClassSession.session_date).where(ClassSession.id.in_(shared))
+            ).all()
+            return {"status": "share_a_lesson", "dates": sorted(as_date(d) for d in dates)}
+        for row in moving:
+            row.student_id = keep_id
+
+        kept_subjects = set(session.scalars(
+            select(Enrolment.class_id).where(Enrolment.student_id == keep_id)
+        ).all())
+        subjects = 0
+        for row in session.scalars(select(Enrolment).where(Enrolment.student_id == drop_id)).all():
+            if row.class_id in kept_subjects:
+                session.delete(row)
+            else:
+                row.student_id = keep_id
+                subjects += 1
+
+        invoices = session.scalars(
+            select(Invoice).where(Invoice.student_id.in_([keep_id, drop_id]))
+            .order_by(Invoice.student_id != keep_id, Invoice.id)
+        ).all()
+        issued = [invoice for invoice in invoices
+                  if invoice.status == "Issued" and invoice.student_id == drop_id]
+        for invoice in issued:
+            invoice.student_id = keep_id
+        # One open invoice: the kept record's if it has one, and every class
+        # still to be billed on it.
+        open_ones = [invoice for invoice in invoices if invoice.status == "Open"]
+        open_items = 0
+        if open_ones:
+            target, others = open_ones[0], open_ones[1:]
+            target.student_id = keep_id
+            for other in others:
+                for item in session.scalars(
+                    select(InvoiceItem).where(InvoiceItem.invoice_id == other.id)
+                ).all():
+                    item.invoice_id = target.id
+                    open_items += 1
+            session.flush()
+            for other in others:
+                session.delete(other)
+
+        credits = session.scalars(select(Credit).where(Credit.student_id == drop_id)).all()
+        for credit in credits:
+            credit.student_id = keep_id
+
+        # The dropped spelling, and any the dropped record already answered
+        # to, now mean the kept child: next month's workbook that still says
+        # "Kim Hayun" lands on her, and so do past schedules in the analysis.
+        spellings = [drop.full_name] + [
+            row.alias for row in session.scalars(
+                select(StudentAlias).where(StudentAlias.student_id == drop_id)
+            ).all()
+        ]
+        for row in session.scalars(select(StudentAlias).where(StudentAlias.student_id == drop_id)).all():
+            session.delete(row)
+        session.flush()
+        remembered = [name for name in spellings
+                      if _remember_alias(session, keep_id, name, ignoring=(drop_id,))]
+
+        if keep.parent_id is None and drop.parent_id is not None:
+            keep.parent_id = drop.parent_id
+        notes = [note.strip() for note in (keep.note, drop.note) if note and note.strip()]
+        if len(notes) == 2 and notes[0] != notes[1]:
+            keep.note = _fit(" · ".join(notes), Student.note)
+        elif notes:
+            keep.note = notes[0]
+        keep.is_active = bool(keep.is_active or drop.is_active)
+
+        for row in session.scalars(select(DistinctStudents).where(
+                (DistinctStudents.first_id == drop_id) | (DistinctStudents.second_id == drop_id))).all():
+            session.delete(row)
+
+        summary = {
+            "status": "merged", "kept": keep.full_name, "dropped": drop.full_name,
+            "lessons": len(moving), "subjects": subjects, "invoices": len(issued),
+            "open_items": open_items, "credits": len(credits), "spellings": remembered,
+        }
+        session.flush()
+        session.delete(drop)
+        if dry_run:
+            session.rollback()
+            summary["status"] = "would_merge"
+        else:
+            session.commit()
+        return summary
+
+
+def get_unnamed_subjects(year=None, month=None):
+    """Subjects a workbook gave no name, with enough to tell which each one is.
+
+    A class cell with students and a time but no subject line comes in as
+    "(unnamed class) · Sun 13:30", and that is what the parents' invoices
+    say. Who teaches it, when, and who comes is what lets an admin name it.
+    With ``year`` and ``month``, only those with a class that month.
+    """
+    from schedule_parser import UNNAMED_CLASS
+
+    with SessionLocal() as session:
+        classes = session.execute(
+            select(AcademyClass.id, AcademyClass.name, Teacher.name)
+            .join(Teacher, Teacher.id == AcademyClass.teacher_id)
+            .where(AcademyClass.name.like(UNNAMED_CLASS + "%"))
+            .order_by(Teacher.name, AcademyClass.name)
+        ).all()
+        if not classes:
+            return []
+        ids = [class_id for class_id, _, _ in classes]
+        lessons = session.execute(
+            select(ClassSession.class_id, ClassSession.session_date)
+            .where(ClassSession.class_id.in_(ids))
+        ).all()
+        roster = session.execute(
+            select(ClassSession.class_id, Student.full_name).distinct()
+            .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+            .join(Student, Student.id == SessionAttendance.student_id)
+            .where(ClassSession.class_id.in_(ids))
+        ).all()
+        issued = dict(session.execute(
+            select(ClassSession.class_id, func.count(InvoiceItem.id))
+            .join(ClassSession, ClassSession.id == InvoiceItem.session_id)
+            .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+            .where(Invoice.status == "Issued", ClassSession.class_id.in_(ids))
+            .group_by(ClassSession.class_id)
+        ).all())
+    dates: dict[int, list] = defaultdict(list)
+    for class_id, when in lessons:
+        dates[class_id].append(as_date(when))
+    students: dict[int, set] = defaultdict(set)
+    for class_id, name in roster:
+        students[class_id].add(name)
+    found = []
+    for class_id, name, teacher in classes:
+        days = sorted(dates[class_id])
+        if year and month and not any((d.year, d.month) == (year, month) for d in days):
+            continue
+        found.append({
+            "Class ID": class_id, "Class": name, "Teacher": teacher,
+            "Lessons": len(days), "First": days[0] if days else None,
+            "Last": days[-1] if days else None,
+            "Students": sorted(students[class_id], key=str.casefold),
+            "Issued lines": int(issued.get(class_id, 0)),
+        })
+    return found
+
+
+def name_subjects(names):
+    """Name unnamed subjects: ``{class_id: name}``. Returns ``(result, name)`` for each.
+
+    Invoice lines already issued for them said "(unnamed class) · Sun
+    13:30"; they take the name too, so the next copy a parent is sent reads
+    properly. Only that label changes -- never an amount, a date or a rate.
+    A name another teacher's subject already has gets this teacher's name
+    after it, the way imports tell such subjects apart.
+    """
+    from schedule_parser import UNNAMED_CLASS
+
+    outcome: dict[int, tuple[str, str | None]] = {}
+    relabelled = 0
+    with SessionLocal() as session:
+        taken = {name.casefold(): class_id for class_id, name in
+                 session.execute(select(AcademyClass.id, AcademyClass.name)).all()}
+        for class_id, typed in names.items():
+            academy_class = session.get(AcademyClass, int(class_id))
+            cleaned = " ".join(str(typed or "").split())
+            if academy_class is None:
+                outcome[class_id] = ("not_found", None)
+                continue
+            if not cleaned or cleaned.startswith(UNNAMED_CLASS):
+                outcome[class_id] = ("invalid", None)
+                continue
+            if taken.get(cleaned.casefold(), academy_class.id) != academy_class.id:
+                teacher = session.get(Teacher, academy_class.teacher_id)
+                cleaned = f"{cleaned} ({teacher.name})" if teacher else cleaned
+            cleaned = _fit(cleaned, AcademyClass.name)
+            if taken.get(cleaned.casefold(), academy_class.id) != academy_class.id:
+                outcome[class_id] = ("duplicate", None)
+                continue
+            taken.pop(academy_class.name.casefold(), None)
+            taken[cleaned.casefold()] = academy_class.id
+            academy_class.name = cleaned
+            lessons = select(ClassSession.id).where(ClassSession.class_id == academy_class.id)
+            for item in session.scalars(
+                select(InvoiceItem).where(InvoiceItem.session_id.in_(lessons),
+                                          InvoiceItem.class_name.like(UNNAMED_CLASS + "%"))
+            ).all():
+                item.class_name = _fit(cleaned, InvoiceItem.class_name)
+                relabelled += 1
+            for credit in session.scalars(
+                select(Credit).where(Credit.session_id.in_(lessons),
+                                     Credit.class_name.like(UNNAMED_CLASS + "%"))
+            ).all():
+                credit.class_name = _fit(cleaned, Credit.class_name)
+            outcome[class_id] = ("named", cleaned)
+        session.commit()
+    return {"outcome": outcome, "relabelled": relabelled}
+
+
+def find_duplicate_students():
+    """Pairs of students who may be one child on file twice, likeliest first.
+
+    The same name said the same way -- another order, another romanisation,
+    a nickname in brackets -- or spelled within a letter or two of another.
+    Two records that ever sat the same lesson are left out: that is two
+    children, and merging them is refused anyway. So are two records tagged
+    differently ("Park Hana(A)" and "(B)"), which is how a teacher tells
+    two children of one name apart.
+    """
+    import difflib
+
+    from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, grade_of, name_sound
+
+    with SessionLocal() as session:
+        students = session.execute(select(Student.id, Student.full_name).order_by(Student.id)).all()
+        apart = set(session.execute(select(DistinctStudents.first_id, DistinctStudents.second_id)).all())
+        lessons = session.execute(
+            select(SessionAttendance.student_id, SessionAttendance.session_id,
+                   Teacher.name, AcademyClass.name, ClassSession.session_date)
+            .join(ClassSession, ClassSession.id == SessionAttendance.session_id)
+            .join(Teacher, Teacher.id == ClassSession.teacher_id)
+            .join(AcademyClass, AcademyClass.id == ClassSession.class_id)
+        ).all()
+    sat: dict[int, set] = defaultdict(set)
+    teachers: dict[int, set] = defaultdict(set)
+    latest_grade: dict[int, tuple] = {}
+    for student_id, session_id, teacher, class_name, when in lessons:
+        sat[student_id].add(session_id)
+        teachers[student_id].add(teacher)
+        grade = grade_of(class_name)
+        if grade and (student_id not in latest_grade or as_date(when) > latest_grade[student_id][0]):
+            latest_grade[student_id] = (as_date(when), grade)
+
+    said = {student_id: name_sound(name) for student_id, name in students}
+    bare = {student_id: _bare(name) for student_id, name in students}
+    tags = {student_id: _suffix(name) for student_id, name in students}
+    pairs = []
+    for index, (left_id, left) in enumerate(students):
+        for right_id, right in students[index + 1:]:
+            if (left_id, right_id) in apart:
+                continue
+            if tags[left_id] and tags[right_id] and tags[left_id] != tags[right_id]:
+                continue
+            sound = bool(said[left_id]) and said[left_id] == said[right_id]
+            if sound and sat[left_id] & sat[right_id]:
+                continue
+            matcher = difflib.SequenceMatcher(None, bare[left_id], bare[right_id])
+            # The cheap upper bounds first: most of ~45,000 pairs end there.
+            if not sound and (matcher.real_quick_ratio() < MERGE_THRESHOLD
+                              or matcher.quick_ratio() < MERGE_THRESHOLD):
+                continue
+            ratio = matcher.ratio()
+            if not sound and ratio < MERGE_THRESHOLD:
+                continue
+            if sat[left_id] & sat[right_id]:
+                continue
+            grades = [latest_grade.get(left_id, (None, None))[1], latest_grade.get(right_id, (None, None))[1]]
+            # Two grades apart is two children, however alike the names.
+            if all(grades) and abs(grades[0] - grades[1]) >= 2:
+                continue
+            pairs.append({
+                "ids": [left_id, right_id],
+                "names": [left, right],
+                "reason": "sound" if sound else "spelling",
+                "similarity": round(ratio, 3),
+                "lessons": [len(sat[left_id]), len(sat[right_id])],
+                "teachers": [sorted(teachers[left_id]), sorted(teachers[right_id])],
+                "grades": grades,
+            })
+    pairs.sort(key=lambda pair: (pair["reason"] != "sound", -pair["similarity"]))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -4429,6 +4847,13 @@ def get_analysis_lessons(today=None):
                 LessonHistory.status,
             ).where(LessonHistory.lesson_date <= today)
         ).all()
+        # Past schedules name students as the teacher wrote them; a spelling
+        # known to be a student on file counts as that student.
+        known_as = dict(session.execute(
+            select(StudentAlias.alias, Student.full_name)
+            .join(Student, Student.id == StudentAlias.student_id)
+        ).all())
+    known_as = {_alias_key(alias): name for alias, name in known_as.items()}
     return {
         "app": [
             {"teacher": teacher, "class_name": class_name, "date": as_date(when),
@@ -4439,7 +4864,8 @@ def get_analysis_lessons(today=None):
         ],
         "history": [
             {"teacher": teacher, "class_name": class_name, "date": as_date(when),
-             "start": start, "end": end, "student": student, "status": status}
+             "start": start, "end": end, "student": known_as.get(_alias_key(student), student),
+             "status": status}
             for teacher, class_name, when, start, end, student, status in history_rows
         ],
     }
@@ -4457,6 +4883,10 @@ def get_analysis_data_version():
                 select(func.max(ClassSession.id)).scalar_subquery(),
                 select(func.count(LessonHistory.id)).scalar_subquery(),
                 select(func.max(LessonHistory.id)).scalar_subquery(),
+                # A merge moves lessons without adding any: the student
+                # count and the spellings on file are what change.
+                select(func.count(Student.id)).scalar_subquery(),
+                select(func.count(StudentAlias.id)).scalar_subquery(),
             )
         ).one()
     return tuple(int(value or 0) for value in row)

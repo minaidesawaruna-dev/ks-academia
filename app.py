@@ -664,9 +664,10 @@ def _import_upload_panel() -> None:
     if preview["name_reviews"]:
         st.markdown(f"**Names that need a decision ({len(preview['name_reviews'])})**")
         st.caption(
-            "Nothing is merged automatically — not even a pure capitalisation "
-            "difference — because a bracketed tag can mean two people share a "
-            "name, not that one is an alias of the other. Confirm each one."
+            "Names that differ only in capitalisation, word order or romanisation, "
+            "and never share a class, start on Merge — they are almost always one "
+            "child. Everything else starts on Keep separate: a bracketed tag can "
+            "mean two children share a name. Check each one."
         )
         for index, review in enumerate(preview["name_reviews"]):
             first, second = review["names"]
@@ -675,6 +676,7 @@ def _import_upload_panel() -> None:
                 f"'{first}' ({first_count}×) vs '{second}' ({second_count}×) "
                 f"— {review['reason_text']}",
                 ["Keep separate", "Merge — same person"],
+                index=1 if review.get("likely_same") else 0,
                 horizontal=True,
                 key=f"import_review_{generation}_{index}",
             )
@@ -901,6 +903,57 @@ def _price_all_button(unpriced: list[dict], key: str) -> None:
             done, left = schedule_backfill.price_by_rule(unpriced)
         _flash(f"Priced {done} subject(s) by grade."
                + (f" {len(left)} still have no price." if left else ""))
+        _rerun()
+
+
+def _unnamed_subjects(key: str, year: int | None = None, month: int | None = None) -> None:
+    """Subjects a workbook left without a name, in plain sight with a box to name each.
+
+    Parents' invoices call such a subject "(unnamed class) · Sun 13:30".
+    Asked about once at import, then never again, a few got through that
+    way and nothing on any screen said so.
+    """
+    unnamed = db.get_unnamed_subjects(year, month)
+    if not unnamed:
+        return
+    issued = sum(item["Issued lines"] for item in unnamed)
+    where = f" with classes in {calendar.month_name[month]} {year}" if month else ""
+    st.warning(
+        f"**{len(unnamed)} subject(s){where} have no name** — the workbook gave none, so "
+        "invoices call them “(unnamed class) · Sun 13:30”."
+        + (f" {issued} line(s) already sent read that way." if issued else "")
+        + " Name them here."
+    )
+    st.caption(
+        "Who teaches it, when, and who comes — enough to tell which subject it is. "
+        "Invoices already sent take the new name on their next copy; no amount changes."
+    )
+    typed: dict[int, str] = {}
+    for item in unnamed:
+        slot = item["Class"].split("·", 1)[-1].strip() if "·" in item["Class"] else ""
+        who = ", ".join(item["Students"][:4]) + (" …" if len(item["Students"]) > 4 else "")
+        span = (f"{item['First']:%d %b}–{item['Last']:%d %b}" if item["First"] else "no classes")
+        typed[item["Class ID"]] = st.text_input(
+            f"{item['Teacher']} · {slot or 'no time'} · {item['Lessons']} class(es), {span} · {who}",
+            key=f"name_subject_{key}_{item['Class ID']}",
+            placeholder="Subject name, e.g. G9 English",
+        )
+    chosen = {class_id: name for class_id, name in typed.items() if name.strip()}
+    if st.button(
+        f"Save {len(chosen)} name(s)" if chosen else "Save names",
+        key=f"name_subjects_{key}", type="primary", disabled=not chosen,
+    ):
+        result = db.name_subjects(chosen)
+        named = [name for status, name in result["outcome"].values() if status == "named"]
+        refused = [class_id for class_id, (status, _) in result["outcome"].items() if status != "named"]
+        for class_id in chosen:
+            if class_id not in refused:
+                st.session_state.pop(f"name_subject_{key}_{class_id}", None)
+        _flash(
+            f"Named {len(named)} subject(s): {', '.join(named)}."
+            + (f" {result['relabelled']} line(s) already sent now show the name." if result["relabelled"] else "")
+            + (f" {len(refused)} couldn't be named — that name is taken twice over." if refused else "")
+        )
         _rerun()
 
 
@@ -1371,6 +1424,7 @@ def teachers_tab() -> None:
             _rerun()
 
     _unpriced_everywhere()
+    _unnamed_subjects("teachers")
     st.markdown("#### Teacher detail")
     _teacher_drilldown(teachers)
 
@@ -1378,6 +1432,97 @@ def teachers_tab() -> None:
 # ---------------------------------------------------------------------------
 # Students
 # ---------------------------------------------------------------------------
+
+
+def _merge_students_section(all_students: list[dict]) -> None:
+    """Two records of one child -- spelled two ways by two teachers -- made one.
+
+    Behind a tick box: looking compares every student with every other, and
+    this screen is opened far more often than anyone merges.
+    """
+    if not st.checkbox("Same child on file twice? Find and merge them", key="students_dupes_open"):
+        return
+    st.caption(
+        "Teachers each spell a child their own way — “Kim Hayun” and “Hayun Kim”. Merging "
+        "moves every class, invoice and credit onto one record; invoices already sent keep "
+        "their numbers and amounts. The other spelling is remembered, so next month's "
+        "workbook lands on the same child."
+    )
+    names = {item["ID"]: item["Name"] for item in all_students}
+
+    def merge(keep: int, drop: int) -> None:
+        result = db.merge_students(keep, drop)
+        if result["status"] == "merged":
+            for key in ("merge_keep", "merge_drop"):
+                st.session_state.pop(key, None)
+            _flash(
+                f"Merged {result['dropped']} into {result['kept']}: {result['lessons']} class(es), "
+                f"{result['invoices']} invoice(s) sent and {result['credits']} credit(s) moved."
+                + (f" “{result['dropped']}” in a workbook now means {result['kept']}."
+                   if result["spellings"] else "")
+            )
+            _rerun()
+        elif result["status"] == "share_a_lesson":
+            st.warning(
+                "They sat the same class on "
+                + ", ".join(f"{day:%d %b %Y}" for day in result["dates"][:3])
+                + " — one child can't be in a class twice, so these are two children."
+            )
+        else:
+            st.warning("One of them is no longer on file — refresh the page.")
+
+    pairs = db.find_duplicate_students()
+    if pairs:
+        st.markdown(f"###### Possibly one child ({len(pairs)})")
+    else:
+        st.caption("Nobody looks like the same child on file twice.")
+
+    def about(index: int, pair: dict) -> str:
+        grade = pair["grades"][index]
+        return (f"{pair['lessons'][index]} class(es)"
+                + (f", {', '.join(pair['teachers'][index])}" if pair["teachers"][index] else "")
+                + (f", G{grade}" if grade else ""))
+
+    for pair in pairs[:30]:
+        (first, second), (first_lessons, second_lessons) = pair["ids"], pair["lessons"]
+        keep, drop = (first, second) if first_lessons >= second_lessons else (second, first)
+        why = ("exactly the same name" if pair["names"][0].casefold() == pair["names"][1].casefold()
+               else "same name, written another way" if pair["reason"] == "sound"
+               else "a letter or two apart")
+        columns = st.columns([6, 2.2, 1.8])
+        columns[0].markdown(
+            f"**{pair['names'][0]}** ({about(0, pair)}) · **{pair['names'][1]}** "
+            f"({about(1, pair)}) — {why}"
+        )
+        if columns[1].button(f"Merge into {names.get(keep, '')}", key=f"dupe_merge_{first}_{second}"):
+            merge(keep, drop)
+        if columns[2].button("Different children", key=f"dupe_apart_{first}_{second}"):
+            db.mark_students_distinct(first, second)
+            _flash(f"{pair['names'][0]} and {pair['names'][1]} kept apart; they won't be suggested again.")
+            _rerun()
+
+    st.markdown("###### Merge any two")
+    options = sorted(names, key=lambda student_id: names[student_id].casefold())
+    columns = st.columns(2)
+    keep = columns[0].selectbox("Keep", options, index=None, format_func=names.get,
+                                placeholder="The record to keep", key="merge_keep")
+    drop = columns[1].selectbox("Fold into it", [i for i in options if i != keep], index=None,
+                                format_func=names.get, placeholder="The other record", key="merge_drop")
+    if keep and drop:
+        preview = db.merge_students(keep, drop, dry_run=True)
+        if preview["status"] == "share_a_lesson":
+            st.warning(
+                "They sat the same class on "
+                + ", ".join(f"{day:%d %b %Y}" for day in preview["dates"][:3])
+                + " — one child can't be in a class twice, so these are two children."
+            )
+        elif preview["status"] == "would_merge":
+            st.caption(
+                f"{names[drop]}'s {preview['lessons']} class(es), {preview['invoices']} invoice(s) sent "
+                f"and {preview['credits']} credit(s) move to {names[keep]}, and {names[drop]} is removed."
+            )
+            if st.button(f"Merge {names[drop]} into {names[keep]}", type="primary", key="merge_go"):
+                merge(keep, drop)
 
 
 def students_tab() -> None:
@@ -1437,6 +1582,7 @@ def students_tab() -> None:
     if not all_students:
         st.info("No students yet.")
         return
+    _merge_students_section(all_students)
 
     student_notes = {item["ID"]: item["Note"] for item in all_students if item["Note"]}
     show_all = st.checkbox(
@@ -2954,6 +3100,7 @@ def invoices_tab() -> None:
     # every time would just be noise above an empty list.
     if month_items:
         _unpriced_warning(year, month)
+        _unnamed_subjects("invoices", year, month)
 
     if not month_items:
         st.info(

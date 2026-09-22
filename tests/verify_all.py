@@ -622,7 +622,7 @@ import db, schedule_backfill
 db.initialise_database()
 db.create_teacher("Teacher A")
 teacher = db.get_all_teachers()[0]["ID"]
-names = ["Nam Jihoon", "Oh Minseok", "Seo Yerin", "Choi Doyun", "Lee Kyuwon", "Park Hana"]
+names = ["Nam Jihoon", "Oh Minseok", "Seo Yerin", "Choi Doyun", "Jang Kyubin", "Park Hana"]
 def preview():
     return {"name_reviews": [], "sessions": [
         {"class_name": f"G9 Group {i % 3}", "date": dt.date(2026, 9, 1 + i), "start_time": dt.time(9),
@@ -678,6 +678,192 @@ def t_double_import():
     assert len(got["on_file"]) == 6 and got["lessons"] == 8, got
     assert got["numbers"] == sorted(got["numbers"], reverse=True), f"not newest first: {got['numbers']}"
     return f"6 students once each, 8 lessons, {len(got['numbers'])} invoices newest first"
+
+
+_SPLIT_MONTH_SCRIPT = '''
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import func, select
+db.initialise_database()
+db.create_teacher("Teacher A"); db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, start, end, names, cancelled=()):
+    return {"date": day, "class_name": subject, "start_time": dt.time(start), "end_time": dt.time(end),
+            "warnings": [], "attendance": [
+                {"student_name": n, "status": "Cancelled" if n in cancelled else "Attending"} for n in names]}
+
+def maths(names_by_day, cancelled_by_day={}):
+    return [lesson(dt.date(2026, 9, d), "G11 Test Math", 16, 18, names, cancelled_by_day.get(d, ()))
+            for d, names in names_by_day.items()]
+
+def chem(names_by_day, cancelled_by_day={}):
+    return [lesson(dt.date(2026, 9, d), "G11 Test Chem", 16, 17, names, cancelled_by_day.get(d, ()))
+            for d, names in names_by_day.items()]
+
+def bill(year, month):
+    out = {}
+    for row in db.get_open_invoice_items_for_month(year, month):
+        _, new_id = db.issue_invoice_for_month(row["Invoice ID"], year, month)
+        out[row["Student"]] = round(db.get_invoice(new_id)["Total"], 2)
+    return out
+
+def owed():
+    return sorted([c["Student"], c["Amount"], c["Status"]] for c in db.get_credits())
+
+both = ["Nam Jihoon", "Oh Minseok"]
+b_both = ["Nam Jihoon", "Minseok Oh"]
+a_sept = maths({1: both, 8: both, 15: both, 22: both})
+b_sept = chem({3: b_both, 10: b_both, 17: b_both, 24: b_both})
+# Teacher A's September goes out first; Teacher B's comes in later, and the
+# same children get a second September invoice. B spells Oh Minseok the
+# other way round, and it came in as a new student.
+sb.backfill({"sessions": a_sept}, ids["Teacher A"])
+result = {"first": bill(2026, 9)}
+sb.backfill({"sessions": b_sept}, ids["Teacher B"])
+result["second"] = bill(2026, 9)
+students = {s["Name"]: s["ID"] for s in db.get_all_students()}
+result["merge"] = db.merge_students(students["Oh Minseok"], students["Minseok Oh"])["status"]
+# After both went out: Nam Jihoon cancels A's 15th; B takes Oh Minseok off
+# the 17th and marks him cancelled on the 24th -- still spelling him "Minseok Oh".
+a_changed = maths({1: both, 8: both, 15: both, 22: both}, {15: {"Nam Jihoon"}})
+b_changed = chem({3: b_both, 10: b_both, 17: ["Nam Jihoon"], 24: b_both}, {24: {"Minseok Oh"}})
+sb.backfill({"sessions": a_changed}, ids["Teacher A"])
+sb.backfill({"sessions": b_changed}, ids["Teacher B"])
+result["after_changes"] = owed()
+result["students"] = sorted(s["Name"] for s in db.get_all_students())
+sb.backfill({"sessions": a_changed}, ids["Teacher A"])
+sb.backfill({"sessions": b_changed}, ids["Teacher B"])
+result["uploaded_twice"] = owed()
+sb.backfill({"sessions": [lesson(dt.date(2026, 10, d), "G11 Test Math", 16, 18, both) for d in (6, 13)]},
+            ids["Teacher A"])
+result["october"] = bill(2026, 10)
+result["settled"] = owed()
+with db.SessionLocal() as session:
+    items = session.scalar(select(func.count()).select_from(db.InvoiceItem))
+    credits = session.scalar(select(func.count()).select_from(db.Credit))
+    lessons = [row for row in session.scalars(select(db.ClassSession.id)).all()]
+for lesson_id in lessons:
+    db.sync_invoice_items(lesson_id)
+with db.SessionLocal() as session:
+    result["resync_changes"] = [
+        session.scalar(select(func.count()).select_from(db.InvoiceItem)) - items,
+        session.scalar(select(func.count()).select_from(db.Credit)) - credits]
+print(json.dumps(result))
+'''
+
+
+def t_two_invoices_one_month():
+    """Credits come off right when a month went out as two invoices, and after a merge.
+
+    A teacher brought on part-way through a month gives the same children a
+    second invoice for it. A class on either one missed afterwards is still
+    owed back once, off the next invoice -- including for a child whose two
+    records were merged, and whose teacher still spells them the old way.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "split.db").replace("\\", "/")
+        result = run(["-c", _SPLIT_MONTH_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["first"] == {"Nam Jihoon": 520.0, "Oh Minseok": 520.0}, got["first"]
+    assert got["second"] == {"Nam Jihoon": 260.0, "Minseok Oh": 260.0}, got["second"]
+    assert got["merge"] == "merged", got["merge"]
+    raised = [["Nam Jihoon", 130.0, "Open"], ["Oh Minseok", 65.0, "Open"], ["Oh Minseok", 65.0, "Open"]]
+    assert got["after_changes"] == raised, f"credits after the changes: {got['after_changes']}"
+    assert got["students"] == ["Nam Jihoon", "Oh Minseok"], f"old spelling came back: {got['students']}"
+    assert got["uploaded_twice"] == raised, f"uploading again raised more: {got['uploaded_twice']}"
+    assert got["october"] == {"Nam Jihoon": 130.0, "Oh Minseok": 130.0}, got["october"]
+    assert all(status == "Applied" for _, _, status in got["settled"]), got["settled"]
+    assert got["resync_changes"] == [0, 0], f"re-syncing changed lines/credits: {got['resync_changes']}"
+    return "two September invoices, a merge, then 3 missed classes: each credited once, off October"
+
+
+_MERGE_AND_NAME_SCRIPT = '''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A"); db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, names):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": dt.time(13, 30),
+            "end_time": dt.time(15, 30), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sb.backfill({"sessions": [lesson(6, "G9 Test Eng", ["Hayun Kim", "Nam Jihoon", "Seo Yerin"]),
+                          lesson(13, "G9 Test Eng", ["Kim Hayun", "Nam Jihoon", "Seo Yerin"]),
+                          lesson(20, "(unnamed class) · Sun 13:30", ["Oh Minseok"]),
+                          lesson(27, "(unnamed class) · Sun 13:30", ["Oh Minseok"])]}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(7, "Reading", ["Choi Doyun"])]}, ids["Teacher B"])
+people = lambda: {s["Name"]: s["ID"] for s in db.get_all_students()}
+who = people()
+result = {"pairs": [sorted(p["names"]) for p in db.find_duplicate_students()]}
+before = len(who)
+result["dry_run"] = db.merge_students(who["Hayun Kim"], who["Kim Hayun"], dry_run=True)["status"]
+result["after_dry_run"] = len(people()) == before
+result["together"] = db.merge_students(who["Nam Jihoon"], who["Seo Yerin"])["status"]
+result["merge"] = db.merge_students(who["Hayun Kim"], who["Kim Hayun"])["status"]
+result["alias"] = db.get_student_aliases().get("kim hayun") == who["Hayun Kim"]
+# Next month's workbook still says "Kim Hayun": no new student, no question.
+sb.backfill({"sessions": [dict(lesson(6, "G9 Test Eng", ["Kim Hayun"]), date=dt.date(2026, 10, 4))]},
+            ids["Teacher A"])
+result["students_after_october"] = sorted(people())
+result["asked_again"] = [m["parsed_name"] for m in sb.suggest_student_matches(
+    [{"attendance": [{"student_name": "Kim Hayun"}]}])]
+# Unnamed: issued as the placeholder, then named -- "Reading" is Teacher B's.
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+unnamed = db.get_unnamed_subjects(2026, 9)
+result["unnamed"] = [(u["Teacher"], u["Lessons"], u["Students"], u["Issued lines"]) for u in unnamed]
+result["unnamed_in_august"] = db.get_unnamed_subjects(2026, 8)
+invoice_id = next(i["ID"] for i in db.get_invoices(status="Issued") if i["Student"] == "Oh Minseok")
+total_before = db.get_invoice(invoice_id)["Total"]
+named = db.name_subjects({unnamed[0]["Class ID"]: "Reading"})
+result["named"] = [list(v) for v in named["outcome"].values()]
+result["relabelled"] = named["relabelled"]
+detail = db.get_invoice(invoice_id)
+result["lines"] = sorted({line["Subject"] for line in detail["Lines"]})
+result["same_total"] = detail["Total"] == total_before
+result["left_unnamed"] = len(db.get_unnamed_subjects())
+print(json.dumps(result))
+'''
+
+
+def t_merge_and_name():
+    """One child on file twice is merged whole; a subject with no name gets one.
+
+    The search offers "Hayun Kim" and "Kim Hayun" but never two children who sat
+    a class together, which the merge refuses too. A dry run changes nothing;
+    the merged-away spelling is remembered, so next month's workbook neither
+    brings the second record back nor asks about it. An unnamed subject,
+    issued as "(unnamed class) · Sun 13:30", is named -- after its teacher
+    when another teacher already has the name -- and its issued lines take
+    the name without a cent changing.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "merge.db").replace("\\", "/")
+        result = run(["-c", _MERGE_AND_NAME_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert ["Hayun Kim", "Kim Hayun"] in got["pairs"], got["pairs"]
+    assert ["Nam Jihoon", "Seo Yerin"] not in got["pairs"], got["pairs"]
+    assert got["dry_run"] == "would_merge" and got["after_dry_run"], got
+    assert got["together"] == "share_a_lesson", got["together"]
+    assert got["merge"] == "merged" and got["alias"], got
+    assert got["students_after_october"] == ["Choi Doyun", "Hayun Kim", "Nam Jihoon", "Oh Minseok",
+                                             "Seo Yerin"], got["students_after_october"]
+    assert got["asked_again"] == [], got["asked_again"]
+    assert got["unnamed"] == [["Teacher A", 2, ["Oh Minseok"], 2]], got["unnamed"]
+    assert got["unnamed_in_august"] == [], got["unnamed_in_august"]
+    assert got["named"] == [["named", "Reading (Teacher A)"]], got["named"]
+    assert got["relabelled"] == 2 and got["lines"] == ["Reading (Teacher A)"], got
+    assert got["same_total"] and got["left_unnamed"] == 0, got
+    return "merged whole, remembered next month; unnamed subject named on its sent lines too"
 
 
 _CREDIT_SCRIPT = '''
@@ -909,6 +1095,8 @@ for name, fn in [
     ("import prices by grade", t_import_prices_by_grade),
     ("cancelled classes credited", t_cancelled_classes_credited),
     ("two imports at once", t_double_import),
+    ("two invoices in one month", t_two_invoices_one_month),
+    ("merge a child, name a subject", t_merge_and_name),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

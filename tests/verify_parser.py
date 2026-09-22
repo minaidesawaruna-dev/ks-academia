@@ -3,12 +3,17 @@ from __future__ import annotations
 
 import datetime as dt
 import io
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
+# The import-matching checks read students from the database: an empty one of
+# their own, never whatever database this machine happens to point at.
+os.environ["DATABASE_URL"] = "sqlite:///" + Path(tempfile.mkdtemp(), "parser.db").as_posix()
 
 from openpyxl import Workbook  # noqa: E402
 
@@ -207,6 +212,7 @@ def t_parse_workbook_multi():
 
 def t_backfill_suggestions():
     import schedule_backfill as sb
+    sb.db.initialise_database()
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     merges = sb.suggest_subject_merges(out["sessions"])
     matches = sb.suggest_student_matches(out["sessions"])
@@ -547,39 +553,96 @@ def t_generic_sheet_names():
     return "'Sheet2' and '시트3' are not February and March"
 
 
+def _suggested(on_file, parsed, aliases=None):
+    """What the import would ask about ``parsed`` names, given students ``on_file``."""
+    import schedule_backfill as sb
+    real = sb.db.get_all_students, sb.db.get_student_aliases
+    try:
+        sb.db.get_all_students = lambda: [{"ID": i, "Name": n} for i, n in on_file.items()]
+        sb.db.get_student_aliases = lambda: dict(aliases or {})
+        lesson = {"attendance": [{"student_name": n} for n in parsed]}
+        return {m["parsed_name"]: (m["existing_id"], m["likely_same"])
+                for m in sb.suggest_student_matches([lesson])}
+    finally:
+        sb.db.get_all_students, sb.db.get_student_aliases = real
+
+
 def t_grade_prefix_match():
     import schedule_backfill as sb
     for name, want in {"g5 sohee": "sohee", "Grade 7 Nam Jihoon": "Nam Jihoon",
                        "Yerin": "Yerin", "G11": "G11"}.items():
         assert sb._without_grade(name) == want, (name, sb._without_grade(name))
-    real = sb.db.get_all_students
-    lesson = {"attendance": [{"student_name": "Sohee"}, {"student_name": "Yerin"}]}
-    try:
-        sb.db.get_all_students = lambda: [{"ID": 1, "Name": "G5 Sohee"}, {"ID": 2, "Name": "G6 Yerin"},
-                                          {"ID": 3, "Name": "G7 Yerin"}]
-        found = {m["parsed_name"]: (m["existing_id"], m["likely_same"]) for m in sb.suggest_student_matches([lesson])}
-    finally:
-        sb.db.get_all_students = real
     # One grade-apart match is taken as the same student by default; two are left to the admin.
+    found = _suggested({1: "G5 Sohee", 2: "G6 Yerin", 3: "G7 Yerin"}, ["Sohee", "Yerin"])
     assert found == {"Sohee": (1, True), "Yerin": (2, False)}, found
     # Spelled another way but said the same is the same child; a different name is not.
-    lesson = {"attendance": [{"student_name": n} for n in ("Nam Jiihoon", "Lee Kyuwon", "Lee Ayoon")]}
-    try:
-        sb.db.get_all_students = lambda: [{"ID": 4, "Name": "Nam Jihoon"}, {"ID": 5, "Name": "Lee Gyuwon"},
-                                          {"ID": 6, "Name": "Lee Jaeyoon"}]
-        found = {m["parsed_name"]: (m["existing_id"], m["likely_same"]) for m in sb.suggest_student_matches([lesson])}
-    finally:
-        sb.db.get_all_students = real
-    assert found == {"Nam Jiihoon": (4, True), "Lee Kyuwon": (5, True), "Lee Ayoon": (6, False)}, found
+    found = _suggested({4: "Nam Jihoon", 5: "Jang Gyubin", 6: "Jang Jaeyeon"},
+                       ["Nam Jiihoon", "Jang Kyubin", "Jang Ayeon"])
+    assert found == {"Nam Jiihoon": (4, True), "Jang Kyubin": (5, True), "Jang Ayeon": (6, False)}, found
     # A nickname added in brackets is the same child; two tagged apart are two children.
-    lesson = {"attendance": [{"student_name": n} for n in ("Oh Minseok(Mike)", "Choi Doyun(B)")]}
-    try:
-        sb.db.get_all_students = lambda: [{"ID": 7, "Name": "Oh Minseok"}, {"ID": 8, "Name": "Choi Doyun(A)"}]
-        found = {m["parsed_name"]: (m["existing_id"], m["likely_same"]) for m in sb.suggest_student_matches([lesson])}
-    finally:
-        sb.db.get_all_students = real
+    found = _suggested({7: "Oh Minseok", 8: "Choi Doyun(A)"}, ["Oh Minseok(Mike)", "Choi Doyun(B)"])
     assert found == {"Oh Minseok(Mike)": (7, True), "Choi Doyun(B)": (8, False)}, found
     return "an existing 'G5 Sohee' is offered, and pre-selected, as the match for 'Sohee'"
+
+
+def t_same_name_said_differently():
+    # The other word order, and a romanisation split into three, were never
+    # close enough letter by letter to be asked about: each came in new.
+    found = _suggested({1: "Ahn Seojin", 2: "Sohn Taemin", 3: "Park Hana"},
+                       ["Seojin Ahn", "Tae Min Sohn", "Hana"])
+    assert found == {"Seojin Ahn": (1, True), "Tae Min Sohn": (2, True)}, found
+    # Said the same as two students on file: asked, but not assumed.
+    found = _suggested({4: "Ahn Seojin", 5: "Seojin Ahn"}, ["Ahn Seo Jin"])
+    assert set(found) == {"Ahn Seo Jin"} and found["Ahn Seo Jin"][1] is False, found
+    # A spelling already known to be a student is simply them: no question.
+    found = _suggested({6: "Ahn Seojin"}, ["Seojin Ahn"], aliases={"seojin ahn": 6})
+    assert found == {}, found
+    return "'Seojin Ahn' found as 'Ahn Seojin'; a known other spelling asks nothing"
+
+
+def t_absence_written_on_the_name():
+    def read(line):
+        cell = sp.parse_cell("G9 Science\n5pm-7pm\n" + line)
+        return [(e["name"], e["status"]) for e in cell["entries"]]
+    # Each of these was read as attending, and would have been billed.
+    assert read("Nam Jihoon(Absent)") == [("Nam Jihoon", "Cancelled")], read("Nam Jihoon(Absent)")
+    assert read("Oh Minseok없었음\nSeo Yerin") == [("Oh Minseok", "Cancelled"), ("Seo Yerin", None)]
+    assert read("Seo Yerin 안옴") == [("Seo Yerin", "Cancelled")]
+    # One student's word is theirs alone: the others on the line came.
+    assert read("Nam Jihoon 결석, Seo Yerin") == [("Nam Jihoon", "Cancelled"), ("Seo Yerin", None)]
+    assert read("Oh Minseok(online), Seo Yerin") == [("Oh Minseok", "Online"), ("Seo Yerin", None)]
+    # A word leading the line still labels everyone on it.
+    assert read("Online: Oh Minseok, Seo Yerin") == [("Oh Minseok", "Online"), ("Seo Yerin", "Online")]
+    return "'(Absent)', '없었음', '안옴' cancel that student; a word after one name is theirs alone"
+
+
+def t_grade_tag_is_not_a_nickname():
+    # "(G9)" tells a ninth-grader from the Nam Jihoon on file -- asked, not assumed.
+    found = _suggested({1: "Nam Jihoon"}, ["Nam Jihoon(G9)"])
+    assert found == {"Nam Jihoon(G9)": (1, False)}, found
+    # A given name alone is asked about too, however alike it sounds.
+    found = _suggested({2: "Yoona"}, ["Yuna"])
+    assert found in ({}, {"Yuna": (2, False)}), found
+    return "'Nam Jihoon(G9)' and a lone 'Yuna' are asked about, never pre-matched"
+
+
+def t_sound_alike_reviews():
+    def session(anchor, names):
+        return {"coordinate": anchor, "attendance": [
+            {"student_name": n, "source": anchor} for n in names]}
+    reviews = sp.canonicalise_names([
+        session("B3", ["Seojin Ahn", "Nam Jihoon"]),
+        session("C3", ["Ahn Seojin"]),
+        session("D3", ["Kim Hana(A)", "Hana Kim(B)"]),
+    ])["reviews"]
+    found = {tuple(r["names"]): (r["reason"], r["likely_same"]) for r in reviews}
+    assert found.get(("Ahn Seojin", "Seojin Ahn")) == ("sound", True), found
+    # Tagged apart: two children, not a question.
+    assert not any("Kim Hana(A)" in pair and "Hana Kim(B)" in pair for pair in found), found
+    # Said the same but on one roster together: asked, starting on "keep separate".
+    together = sp.canonicalise_names([session("B3", ["Seojin Ahn", "Ahn Seojin"])])["reviews"]
+    assert [(r["reason"], r["likely_same"]) for r in together] == [("sound", False)], together
+    return "'Ahn Seojin' / 'Seojin Ahn' flagged and pre-set to merge; roster-mates never"
 
 
 def t_time_shares_a_line():
@@ -659,11 +722,11 @@ def t_absence_notes():
     def fit(note, name):
         return max((sp._answers_to(readings, sp._roster_sounds(name))
                     for _, readings in sp._note_people(note)), default=0)
-    assert fit("우진결석", "Kim Woojin") and fit("아윤,찬혁 캔슬", "Chanhyuk Ahn")
+    assert fit("태우결석", "Kim Taewoo") and fit("아윤,찬우 캔슬", "Chanwoo Ahn")
     assert fit("에스더 결석", "Esther Nam"), "an English name written in Hangul"
     assert fit("민이 급한국행", "Min"), "a name with the fond 이 on the end"
-    assert fit("홍서현 여행", "Hong Seohyun") == 2 and fit("홍서현 여행", "Seohyun") == 1
-    assert not fit("서현결석", "Suhyun"), "서현 and 수현 are two different children"
+    assert fit("홍다혜 여행", "Hong Dahye") == 2 and fit("홍다혜 여행", "Dahye") == 1
+    assert not fit("다혜결석", "Dohye"), "다혜 and 도혜 are two different children"
     assert not fit("Cancelled", "Nam Jihoon")
 
     day = dt.date(2026, 8, 24)
@@ -712,6 +775,10 @@ for name, fn in [
     ("Korean student parsed", t_korean_student_parsed),
     ("multi-sheet + missing sheet", t_parse_workbook_multi),
     ("backfill suggestions run", t_backfill_suggestions),
+    ("same name said differently", t_same_name_said_differently),
+    ("sound-alike names in one workbook", t_sound_alike_reviews),
+    ("absence written on the name", t_absence_written_on_the_name),
+    ("grade tag is not a nickname", t_grade_tag_is_not_a_nickname),
     ("month ranges in sheet names", t_month_ranges_in_names),
     ("month labels read, notes ignored", t_month_labels),
     ("whole-year sheet by its labels", t_whole_year_sheet),

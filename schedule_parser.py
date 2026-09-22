@@ -187,7 +187,16 @@ _ABSENCE_WORD = re.compile(
 )
 # Of those, the words that say the student was absent. "한국" (in Korea) and
 # the rest only say where someone was -- they may well have joined online.
-_ABSENT_NOTE = re.compile(r"병가|아파|캔슬|휴가|여행")
+# "Seo Yerin(Absent)", "Oh Minseok없었음" (wasn't there), "결석" (absent), "안옴"
+# (didn't come), "불참" (didn't attend) were read as attending, and billed;
+# the Hangul runs on to the end of the word, so "없었음" is taken whole.
+_ABSENT_NOTE = re.compile(
+    r"(?:병가|아파|캔슬|휴가|여행|결석|없었|안\s*옴|안\s*왔|불참)[\uac00-\ud7a3]*|absent\w*",
+    re.I,
+)
+# A bracket that holds a grade -- "Nam Jihoon(G9)" -- tells one child of a
+# name from another, the opposite of a nickname.
+GRADE_TAG = re.compile(r"(?i)^\s*(?:g|gr\.?|grade|y|yr|year)\s*\d{1,2}\s*$")
 
 # Zero-width and non-breaking characters that survive copy-paste into Excel and
 # make two visually identical names compare as different strings.
@@ -712,6 +721,28 @@ def standard_rate(class_name: str) -> float | None:
     return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
 
 
+def _own_tagged_status(text: str, status: str) -> dict[str, Any] | None:
+    """One student with their status in brackets -- "Jihoon(당일취소)" -- or None."""
+    tag = re.search(r"[\(\[]([^\)\]]*)[\)\]]", text)
+    if not tag or status_from_line(tag.group(1))[0] != status:
+        return None
+    name = (text[: tag.start()] + text[tag.end():]).strip()
+    if not name or not _is_person_line(name):
+        return None
+    extra = status_from_line(tag.group(1))[1]
+    return {"name": name, "status": status, "note": tag.group(1).strip() if extra else None}
+
+
+def _status_part(part: str, current: str | None, notes: list[str]) -> list[dict[str, Any]]:
+    """The students one comma-separated part names, with any status of its own."""
+    own, rest = status_from_line(part)
+    tagged = _own_tagged_status(part, own) if own else None
+    if tagged:
+        return [tagged]
+    return [{"name": name, "status": own_status or own or current, "note": note}
+            for name, note, own_status in _roster_names(rest if own else part, notes)]
+
+
 def status_from_line(line: str) -> tuple[str | None, str]:
     """Return ``(status, leftover_text)`` for a possible status label line."""
     for status, pattern in STATUS_PATTERNS:
@@ -971,16 +1002,27 @@ def parse_cell(text: str) -> dict[str, Any]:
                 # A label on its own line -- "Online" -- and the students under it.
                 current_status = status
                 continue
+            # Several students on the line, and the word after one of them --
+            # "Minseok 결석, Yerin", "Sohee(online), Yerin" -- is that one's
+            # alone: Yerin was there, in the room. Carried across the line it
+            # cancelled a student who came, or made "Sohee, Yerin" one name.
+            # Only a word leading the line, "Online: Sohee, Yerin", labels all;
+            # so does a bare word of its own, "Sohee, Yerin, 결석".
+            parts = [part.strip() for part in re.split(r"\s*[,，]\s*", line) if part.strip()]
+            word = next(m for _, p in STATUS_PATTERNS if (m := p.search(line)))
+            leads = not re.sub(r"[\s\-:\(\[.]", "", line[: word.start()])
+            if (len(parts) > 1 and not leads
+                    and all(status_from_line(part)[1] for part in parts
+                            if status_from_line(part)[0] is not None)):
+                for part in parts:
+                    entries.extend(_status_part(part, current_status, notes))
+                continue
             # A status on a student's own line -- "Sohee(Online)", "Jihoon(당일취소)" --
             # is theirs alone. Carried down, it billed nobody below a sick student.
-            tag = re.search(r"[\(\[]([^\)\]]*)[\)\]]", line)
-            if tag and status_from_line(tag.group(1))[0] == status:
-                name = (line[: tag.start()] + line[tag.end():]).strip()
-                if name and _is_person_line(name):
-                    extra = status_from_line(tag.group(1))[1]
-                    entries.append({"name": name, "status": status,
-                                    "note": tag.group(1).strip() if extra else None})
-                    continue
+            own = _own_tagged_status(line, status)
+            if own:
+                entries.append(own)
+                continue
             for name, note, own_status in _roster_names(leftover, []):
                 entries.append({"name": name, "status": own_status or status,
                                 "note": note})
@@ -1159,8 +1201,8 @@ def _row_step_minutes(row_times: dict[int, dt.time]) -> int:
 # --------------------------------------------------------------------------
 # Absence notes: who a note under the grid is about
 # --------------------------------------------------------------------------
-# A note like "우진결석" (Woojin absent) names the student in Hangul, while the
-# lessons list them in English letters -- "Kim Woojin". To see they are the
+# A note like "태우결석" (Taewoo absent) names the student in Hangul, while the
+# lessons list them in English letters -- "Kim Taewoo". To see they are the
 # same person, the Hangul is spelled out every way families actually write
 # it in English (현 as Hyun or Hyeon, 우 as Woo or U), both sides are folded
 # over spellings that never tell two names apart (K/G, oo/u, a doubled
@@ -1220,7 +1262,7 @@ _KO_ENGLISH = {
 }
 # Words a note wraps round a name -- dates, "teacher", reasons for being away,
 # "make-up class", "checked" -- taken out before looking for names, so
-# "서현결석 /토요일보강" (Seohyun absent, make-up on Saturday) is about 서현
+# "다혜결석 /토요일보강" (Dahye absent, make-up on Saturday) is about 다혜
 # and nobody called 토요일.
 _NOTE_WORDS = re.compile(
     r"\(\s*[월화수목금토일]\s*\)|\d+\s*[월일]|[월화수목금토일]요일|[가-힣]*(?:쌤|선생님)"
@@ -1267,8 +1309,8 @@ def _fold(text: str) -> str:
 
 def name_sound(name: str) -> str:
     """A name as it is said, in any word order and spacing, without a nickname
-    in brackets: "Chung Jaaeho" and "Jaeho Chung", "Lee Kyuwon" and "Lee
-    Gyuwon", "Kim Siyeon(Emily)" and "Kim Si Yeon" all come out the same."""
+    in brackets: "Choi Jaaemin" and "Jaemin Choi", "Jang Kyubin" and "Jang
+    Gyubin", "Kim Daeun(Emily)" and "Kim Da Eun" all come out the same."""
     bare = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", name)
     return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", bare)))
 
@@ -1317,8 +1359,8 @@ def _roster_sounds(name: str) -> tuple[frozenset, frozenset]:
 def _note_people(text: str) -> list[tuple[str, list[tuple[frozenset | None, frozenset]]]]:
     """The people a note names, each as written with the ways it could be read.
 
-    A name is often run together with the reason -- "재호말레이시아결석",
-    Jaeho absent in Malaysia, or "경시대회준환" -- so a long run of Hangul is
+    A name is often run together with the reason -- "태우말레이시아결석",
+    Taewoo absent in Malaysia, or "경시대회다혜" -- so a long run of Hangul is
     also tried by its first and last two and three syllables, which is how
     long a Korean name is.
     """
@@ -1447,7 +1489,7 @@ def _absence_note_warnings(notes, sessions, sheet_name: str) -> list[dict[str, A
                 continue
             known = True
             # Where the note gives a surname, a student it fits beats one
-            # whose surname nobody wrote: 홍서현 is Hong Seohyun, not Seohyun.
+            # whose surname nobody wrote: 홍다혜 is Hong Dahye, not Dahye.
             chosen = {name for name, fit in fits.items() if fit == best}
             listed += [(written, s, a) for s in lessons for a in s["attendance"]
                        if a["student_name"] in chosen and a.get("status") != CANCELLED]
@@ -2067,7 +2109,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
 
 # Punctuation that can only be a leftover from typing several names into one
 # cell -- a stray comma, a dangling slash. Never part of a person's name, and
-# leaving it attached turns "Woojin" and "Woojin," into two different students.
+# leaving it attached turns "Taewoo" and "Taewoo," into two different students.
 _EDGE_PUNCTUATION = " -,;/·•"
 
 
@@ -2090,13 +2132,14 @@ def _suffix(name: str) -> str:
 _REASON_TEXT = {
     "capitalisation": "differ only by capitalisation",
     "tag": "same name, tagged differently",
+    "sound": "same name, written another way (word order or romanisation)",
     "spelling": "similar spelling",
 }
 
 # Shown worst-first: a tag difference is the one most likely to be two real
 # people sharing a name (confirmed by the academy -- a bracketed tag is not
 # reliably an alias), so it's surfaced ahead of a probably-safe typo.
-_REASON_ORDER = {"tag": 0, "spelling": 1, "capitalisation": 2}
+_REASON_ORDER = {"tag": 0, "spelling": 1, "sound": 2, "capitalisation": 3}
 
 
 def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2106,14 +2149,23 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     A workbook mixes three kinds of variation, and none of them is safe to
     assume is the same person on its own:
 
-    * Pure case/spacing differences (``Bae Sujin`` vs ``han seoyoung``)
+    * Pure case/spacing differences (``Bae Sujin`` vs ``bae sujin``)
       are usually a typo, but "usually" isn't "always".
     * A bracketed tag (``Seo Yerin`` vs ``Seo Yerin(UWC D)``) is *not*
       assumed to be an alias on one person -- two students can share a name
       and be told apart only by a tag, so a tag difference is flagged, not
       silently stripped and merged.
-    * A similar-but-not-identical spelling (``Bae Sujin`` / ``Han
-      Seyoung``) is flagged the same way.
+    * A similar-but-not-identical spelling (``Bae Sujin`` / ``Bae
+      Sujeong``) is flagged the same way.
+    * The same name said the same way -- the other word order (``Kim
+      Hayun`` / ``Hayun Kim``), another romanisation (``Sohn Taemin`` / ``Tae
+      Min Sohn``), a nickname added in brackets -- is flagged too. Compared
+      letter by letter these were never close enough to ask about, and
+      each came in as a second student.
+
+    A capitalisation or sound match between two names that never share a
+    class is marked ``likely_same``: the review starts on "merge" for those,
+    and on "keep separate" for everything else -- the admin still decides.
 
     Attendance entries get only cosmetic clean-up here (invisible
     characters, extra whitespace) -- nothing is renamed until a human
@@ -2148,8 +2200,12 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                 reason, ratio = "capitalisation", 1.0
             else:
                 bare_left, bare_right = _bare(left), _bare(right)
+                tagged_apart = _suffix(left) and _suffix(right) and _suffix(left) != _suffix(right)
                 if bare_left == bare_right:
                     reason, ratio = "tag", 1.0
+                elif not tagged_apart and name_sound(left) and name_sound(left) == name_sound(right):
+                    reason = "sound"
+                    ratio = difflib.SequenceMatcher(None, bare_left, bare_right).ratio()
                 else:
                     ratio = difflib.SequenceMatcher(None, bare_left, bare_right).ratio()
                     reason = "spelling" if ratio >= MERGE_THRESHOLD else None
@@ -2159,9 +2215,10 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             detail = _REASON_TEXT[reason]
             if reason == "tag":
                 detail += f" ('{_suffix(left) or 'no tag'}' vs '{_suffix(right) or 'no tag'}')"
+            together = right in roster_mates[left]
             detail += (
                 " -- they appear on the same roster together"
-                if right in roster_mates[left]
+                if together
                 else " -- they never share a class"
             )
 
@@ -2172,6 +2229,8 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason": reason,
                     "reason_text": detail,
                     "counts": [counts[left], counts[right]],
+                    # Two names in one class are two children, however alike.
+                    "likely_same": reason in ("capitalisation", "sound") and not together,
                 }
             )
 
