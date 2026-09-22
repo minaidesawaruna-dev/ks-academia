@@ -734,6 +734,48 @@ def get_all_teachers():
         ]
 
 
+def get_subject_student_grades(class_ids):
+    """The grade of each student on each subject, read from the rest of their lessons.
+
+    "LC Advanced A" says nothing about who it is for, but its students also
+    sit "G9 Add math" and "G10 English" -- and the academy's price follows
+    the grade. Each student is taken at the grade their most recent graded
+    lesson names, since a grade moves up once a school year. A student with
+    no graded lesson anywhere is left out.
+    """
+    from schedule_parser import grade_of
+
+    ids = [int(value) for value in class_ids]
+    if not ids:
+        return {}
+    with SessionLocal() as session:
+        on_subject = session.execute(
+            select(ClassSession.class_id, SessionAttendance.student_id)
+            .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+            .where(ClassSession.class_id.in_(ids))
+            .distinct()
+        ).all()
+        students = {student_id for _, student_id in on_subject}
+        if not students:
+            return {class_id: [] for class_id in ids}
+        lessons = session.execute(
+            select(SessionAttendance.student_id, AcademyClass.name, ClassSession.session_date)
+            .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+            .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
+            .where(SessionAttendance.student_id.in_(students))
+        ).all()
+    latest: dict[int, tuple[date, int]] = {}
+    for student_id, class_name, when in lessons:
+        grade = grade_of(class_name)
+        if grade and (student_id not in latest or _as_day(when) > latest[student_id][0]):
+            latest[student_id] = (_as_day(when), grade)
+    grades: dict[int, list[int]] = {class_id: [] for class_id in ids}
+    for class_id, student_id in on_subject:
+        if student_id in latest:
+            grades[class_id].append(latest[student_id][1])
+    return grades
+
+
 def get_teacher_session_counts(year, month):
     """How many classes each teacher has in a month, by teacher id."""
     first_day = date(int(year), int(month), 1)

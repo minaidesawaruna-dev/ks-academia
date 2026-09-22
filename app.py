@@ -898,6 +898,19 @@ def _import_upload_panel() -> None:
             st.warning(f"Nothing imported ({result['status']}).")
 
 
+def _grade_rate(grade: int) -> float:
+    return schedule_parser.JUNIOR_RATE if grade <= 10 else schedule_parser.SENIOR_RATE
+
+
+def _grades(grades: list[int]) -> str:
+    """[9, 10] -> "Grades 9–10"; [9, 11] -> "Grades 9 and 11"; [12] -> "Grade 12"."""
+    if len(grades) == 1:
+        return f"Grade {grades[0]}"
+    if grades == list(range(grades[0], grades[-1] + 1)):
+        return f"Grades {grades[0]}–{grades[-1]}"
+    return "Grades " + ", ".join(map(str, grades[:-1])) + f" and {grades[-1]}"
+
+
 def _save_subject_rate(class_id: int, month_start: dt.date, rate: float) -> str:
     """Price one subject from a whole calendar month onward.
 
@@ -982,6 +995,28 @@ def _bulk_rate_section(
         if priced_from.get(row["Class ID"], dt.date.min) < starts:
             priced_from[row["Class ID"]] = starts
 
+    # What the price rule makes each subject: from the grade in its name, or
+    # failing that from its students' grades when they all fall on one side
+    # of the line. A group straddling it, or whose students' grades nobody
+    # has recorded, is left for a person to price rather than guessed at.
+    ungraded = [item["Class ID"] for item in subjects
+                if not schedule_parser.standard_rate(item["Class"])]
+    student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
+    rule: dict[int, tuple[float | None, str]] = {}
+    for item in subjects:
+        named = schedule_parser.standard_rate(item["Class"])
+        grades = sorted(set(student_grades.get(item["Class ID"], [])))
+        bands = {_grade_rate(grade) for grade in grades}
+        if named:
+            rule[item["Class ID"]] = (named, "")
+        elif len(bands) == 1:
+            rule[item["Class ID"]] = (bands.pop(), f"its students are in {_grades(grades)}")
+        elif grades:
+            rule[item["Class ID"]] = (None, f"students in {_grades(grades)}, either side of "
+                                            "the $60/$65 line: set a price")
+        else:
+            rule[item["Class ID"]] = (None, "")
+
     selected_ids: list[int] = []
     for item in subjects:
         class_id = item["Class ID"]
@@ -1001,15 +1036,17 @@ def _bulk_rate_section(
                 f"${month_rate:,.2f}/h carried over from "
                 f"{calendar.month_name[starts.month]} {starts.year}"
             )
-        who = f" ({item['Teacher']})" if show_teacher and item.get("Teacher") else ""
-        # What the grade in the subject's name says it costs, when that
-        # differs from what it is on now: the price is a rule, and a screen
-        # that knows the rule should say so rather than leave it to memory.
-        standard = schedule_parser.standard_rate(item["Class"])
-        suggestion = (
-            f" — standard ${standard:,.2f}/h"
-            if standard and abs((month_rate or 0) - standard) > 0.005 else ""
-        )
+        # Not when an import already named the subject for its teacher.
+        who = (f" ({item['Teacher']})" if show_teacher and item.get("Teacher")
+               and not item["Class"].endswith(f"({item['Teacher']})") else "")
+        # What the rule says it costs, when that differs from what it is on
+        # now: the price is a rule, and a screen that knows the rule should
+        # say so rather than leave it to memory.
+        standard, why = rule[class_id]
+        if standard and abs((month_rate or 0) - standard) > 0.005:
+            suggestion = f" — standard ${standard:,.2f}/h" + (f", as {why}" if why else "")
+        else:
+            suggestion = f" — {why}" if not standard and why else ""
         checked = st.checkbox(
             f"{item['Class']}{who} — {rate_text}, {item['Sessions']} session(s){suggestion}",
             key=f"bulk_rate_pick_{scope}_{class_id}",
@@ -1024,14 +1061,19 @@ def _bulk_rate_section(
         "New hourly rate ($) for the selected subjects",
         min_value=0.0, step=1.0, key=f"bulk_rate_value_{base}",
     )
+    # Only where the rule would change something, and across everything
+    # listed unless some are ticked -- pricing a month by the rule is one
+    # click, not thirty ticks and a click.
     by_grade = {
-        class_id: schedule_parser.standard_rate(name)
-        for class_id, name in {item["Class ID"]: item["Class"] for item in subjects}.items()
-        if class_id in selected_ids and schedule_parser.standard_rate(name)
+        item["Class ID"]: rule[item["Class ID"]][0]
+        for item in subjects
+        if rule[item["Class ID"]][0]
+        and (not selected_ids or item["Class ID"] in selected_ids)
+        and abs((month_rates.get(item["Class ID"]) or 0) - rule[item["Class ID"]][0]) > 0.005
     }
     if by_grade and st.button(
-        f"Or apply the standard rate by grade to {len(by_grade)} of them "
-        f"(${schedule_parser.JUNIOR_RATE:,.0f}/h to Grade 10 and below, "
+        f"Price {len(by_grade)} {'ticked ' if selected_ids else ''}subject(s) by grade "
+        f"(${schedule_parser.JUNIOR_RATE:,.0f}/h Grade 10 and below, "
         f"${schedule_parser.SENIOR_RATE:,.0f}/h above)",
         key=f"bulk_rate_standard_{scope}",
         width="stretch",
@@ -3437,6 +3479,9 @@ def _history_view() -> None:
         st.rerun()
 
 
+_COMPARE_MAX = 8
+
+
 def _per_hour(invoiced: float, hours: float) -> str:
     return f"${invoiced / hours:,.0f}" if hours else "—"
 
@@ -3474,59 +3519,83 @@ def data_tab() -> None:
         st.info(f"No classes recorded in {year} up to the end of {label}.")
         return
 
-    names = sorted({row["Teacher"] for row in trend})
-    everyone = st.checkbox(
-        f"All teachers ({len(names)})", value=True, key="data_all_teachers"
+    frame = pd.DataFrame(trend)
+    order = [calendar.month_abbr[m] for m in range(1, month + 1)]
+
+    # The academy as a whole first: one bar a month, whoever taught it.
+    st.markdown(f"#### Invoiced by month — January to {calendar.month_name[month]} {year}")
+    totals = frame.groupby("Month name", as_index=False)[["Invoiced", "Hours"]].sum()
+    st.altair_chart(
+        alt.Chart(totals)
+        .mark_bar(color="#2a78d6")
+        .encode(
+            x=alt.X("Month name:N", sort=order, title=None),
+            y=alt.Y("Invoiced:Q", title="Invoiced, all teachers", axis=alt.Axis(format="$,.0f")),
+            tooltip=[alt.Tooltip("Month name:N", title="Month"),
+                     alt.Tooltip("Invoiced:Q", format="$,.2f"),
+                     alt.Tooltip("Hours:Q", title="Hours taught")],
+        )
+        .properties(height=220),
+        width="stretch",
+    )
+
+    # Then teachers side by side. A line each for two dozen teachers was a
+    # tangle -- ten colours between them, a key twice the chart's height and
+    # cut off, most lines lying flat at $0 -- so only the teachers picked are
+    # drawn, and at most eight, which is as many colours as stay distinct.
+    by_teacher = frame.groupby("Teacher")["Invoiced"].sum().sort_values(ascending=False)
+    names = sorted(by_teacher.index, key=str.casefold)
+    earning = [name for name, total in by_teacher.items() if total > 0]
+    # Picks from another year or month can name a teacher not on this list,
+    # which the widget refuses; keep only the ones it can still show. And
+    # Streamlit forgets a widget's value on any run it isn't drawn -- a year
+    # with nothing recorded -- so a copy is kept to come back to.
+    kept = st.session_state.get("data_compare", st.session_state.get("_data_compare_kept"))
+    st.session_state["data_compare"] = (
+        [name for name in kept if name in names] if kept is not None
+        else earning[:_COMPARE_MAX]
     )
     picked = st.multiselect(
         "Compare teachers",
         options=names,
-        default=names,
-        key="data_teachers",
-        disabled=everyone,
-        help="Untick 'All teachers' to compare a few side by side.",
+        key="data_compare",
+        max_selections=_COMPARE_MAX,
+        placeholder="Pick teachers to compare",
+        help=f"Up to {_COMPARE_MAX} at a time, so each keeps its own colour.",
     )
-    chosen = set(names) if everyone else set(picked)
-    if not chosen:
-        st.info("Pick at least one teacher to compare.")
-        return
-
-    frame = pd.DataFrame([row for row in trend if row["Teacher"] in chosen])
-    order = [calendar.month_abbr[m] for m in range(1, month + 1)]
-
-    st.markdown(f"#### Invoiced by month — January to {calendar.month_name[month]} {year}")
-    st.altair_chart(
-        alt.Chart(frame)
-        .mark_line(point=True)
-        .encode(
-            x=alt.X("Month name:N", sort=order, title=None),
-            y=alt.Y("Invoiced:Q", title="Invoiced", axis=alt.Axis(format="$,.0f")),
-            color=alt.Color("Teacher:N", legend=alt.Legend(title="Teacher")),
-            tooltip=[
-                alt.Tooltip("Teacher:N"),
-                alt.Tooltip("Month name:N", title="Month"),
-                alt.Tooltip("Invoiced:Q", format="$,.2f"),
-                alt.Tooltip("Hours:Q", title="Hours taught"),
-            ],
+    st.session_state["_data_compare_kept"] = picked
+    if picked:
+        st.altair_chart(
+            alt.Chart(frame[frame["Teacher"].isin(picked)])
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Month name:N", sort=order, title=None),
+                y=alt.Y("Invoiced:Q", title="Invoiced", axis=alt.Axis(format="$,.0f")),
+                color=alt.Color("Teacher:N", sort=picked, legend=alt.Legend(
+                    title=None, orient="bottom", columns=4, labelLimit=0)),
+                tooltip=[
+                    alt.Tooltip("Teacher:N"),
+                    alt.Tooltip("Month name:N", title="Month"),
+                    alt.Tooltip("Invoiced:Q", format="$,.2f"),
+                    alt.Tooltip("Hours:Q", title="Hours taught"),
+                ],
+            )
+            .properties(height=260),
+            width="stretch",
         )
-        .properties(height=320),
-        width="stretch",
-    )
+    idle = len(names) - len(earning)
     st.caption(
-        f"{year} only — a year is a trend of its own, so December is never "
-        "drawn beside the following January."
+        f"{year} only, so December is never drawn beside the next January."
+        + (f" {idle} of the {len(names)} teachers have nothing invoiced this year yet."
+           if idle else "")
     )
 
     st.divider()
     # Both this and the trend price their classes through the same helper, so
     # the figures below always match the last point on the line above.
-    stats = [
-        row
-        for row in db.get_teacher_month_stats(year, month)
-        if row["Teacher"] in chosen
-    ]
+    stats = db.get_teacher_month_stats(year, month)
     if not stats:
-        st.info(f"None of the teachers selected taught in {label}.")
+        st.info(f"Nobody taught in {label}.")
         return
 
     snapshot = pd.DataFrame(stats)
@@ -3568,8 +3637,9 @@ def data_tab() -> None:
     # slivers and a colour key you have to look things up in. Height grows
     # with the roster so nothing is squeezed.
     st.markdown("##### Invoiced")
+    invoiced = snapshot[snapshot["Invoiced"] > 0]
     st.altair_chart(
-        alt.Chart(snapshot)
+        alt.Chart(invoiced if len(invoiced) else snapshot)
         .mark_bar(color="#2a78d6")
         .encode(
             y=alt.Y("Teacher:N", sort="-x", title=None, axis=alt.Axis(labelLimit=0)),
@@ -3582,7 +3652,7 @@ def data_tab() -> None:
                 alt.Tooltip("Students:Q"),
             ],
         )
-        .properties(height=max(120, 26 * len(snapshot))),
+        .properties(height=max(120, 26 * max(len(invoiced), 1))),
         width="stretch",
     )
 
