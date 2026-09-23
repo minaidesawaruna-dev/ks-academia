@@ -148,15 +148,6 @@ def _show_flash() -> None:
         st.toast(message, icon=_TOAST_ICONS.get(kind), duration="long")
 
 
-def _local_time(stamp: dt.datetime) -> dt.datetime:
-    """A time the database stamped in UTC, in the academy's own time.
-
-    Both databases stamp UTC, so an upload made at 7.30am showed as 23:30
-    the night before.
-    """
-    return stamp.replace(tzinfo=dt.timezone.utc).astimezone()
-
-
 def _hours(start: dt.time, end: dt.time) -> float:
     minutes = (end.hour * 60 + end.minute) - (start.hour * 60 + start.minute)
     return round(max(minutes, 0) / 60, 2)
@@ -249,35 +240,6 @@ def _floating_back_to_top() -> None:
         # up space. st.iframe rejects a height of 0, and "content"
         # measures an empty body at 150px, so: the smallest legal box.
         height=1,
-    )
-
-
-def _inline_back_to_top() -> None:
-    """A 'back to top' button at the foot of a tab's own content.
-
-    A plain HTML button in its own iframe rather than an
-    ``st.button``: clicking an ``st.button`` reruns the script, and a rerun
-    sends Streamlit back to the first tab, so you would be scrolled to the top
-    of Teachers instead of the top of whatever you were reading.  The frame is
-    left transparent so it does not paint a white strip under a dark theme.
-    """
-    st.iframe(
-        """<style>
-          html, body { margin: 0; background: transparent; }
-          #inline-top {
-            font-family: system-ui, -apple-system, sans-serif;
-            font-size: 13px; font-weight: 600; letter-spacing: .01em;
-            padding: 8px 16px; border-radius: 8px; cursor: pointer;
-            border: 1px solid rgba(128, 128, 128, .4);
-            background: transparent; color: #ff4b4b;
-          }
-          #inline-top:hover { border-color: #ff4b4b; background: rgba(255, 75, 75, .08); }
-        </style>
-        <button id="inline-top">&uarr; Back to top</button>
-        <script>
-        document.getElementById('inline-top').onclick = function () {""" + _SCROLL_TOP_JS + """};
-        </script>""",
-        height=46,
     )
 
 
@@ -423,11 +385,7 @@ def _import_detail(preview: dict) -> None:
     if unnamed:
         st.warning(
             f"**{len(unnamed)} class(es) have no subject name in the sheet.** "
-            "Each imports under a placeholder named for its student or weekly "
-            f"slot, such as \u201c{UNNAMED_CLASS} \u00b7 Sun 11:30\u201d, "
-            "unless named below. The subject belongs on the line "
-            "above the time range \u2014 add it in Excel and upload again, or "
-            "rename the subject afterwards on the Teachers screen."
+            "Name them below, or later on the Teachers screen."
         )
         for item in sorted(unnamed, key=lambda x: (x["date"], x["start_time"])):
             st.caption(
@@ -531,11 +489,7 @@ def _warning_panel(preview: dict) -> None:
         title += f" \u2014 {placed} cell(s) to look at"
 
     with st.expander(title):
-        st.caption(
-            "Each block names the cell it came from and shows what that cell "
-            "holds \u2014 open that reference in Excel to fix it at source, or "
-            "import as-is and correct it on the other screens."
-        )
+        st.caption("Each names its Excel cell. Fix it there and upload again, or import as is.")
         for (sheet, coordinate), items in groups.items():
             with st.container(border=True):
                 date = next((item["date"] for item in items if item["date"]), None)
@@ -663,12 +617,7 @@ def _import_upload_panel() -> None:
     decisions: dict[int, str] = {}
     if preview["name_reviews"]:
         st.markdown(f"**Names that need a decision ({len(preview['name_reviews'])})**")
-        st.caption(
-            "Names that differ only in capitalisation, word order or romanisation, "
-            "and never share a class, start on Merge — they are almost always one "
-            "child. Everything else starts on Keep separate: a bracketed tag can "
-            "mean two children share a name. Check each one."
-        )
+        st.caption("The likely answer is picked for you — check each one.")
         for index, review in enumerate(preview["name_reviews"]):
             first, second = review["names"]
             first_count, second_count = review["counts"]
@@ -686,11 +635,7 @@ def _import_upload_panel() -> None:
     match_candidates = schedule_backfill.suggest_student_matches(preview["sessions"])
     if match_candidates:
         st.markdown(f"**Possible existing students ({len(match_candidates)})**")
-        st.caption(
-            "These parsed names don't exactly match anyone already on file, "
-            "but look close to someone who is. Confirm whether each one is "
-            "that existing student under a different spelling, or a new one."
-        )
+        st.caption("Close to a student already on file — the same child, or someone new?")
         for index, candidate in enumerate(match_candidates):
             reason_text = {
                 "tag": "same name, tagged differently",
@@ -728,13 +673,7 @@ def _import_upload_panel() -> None:
                 f"**Give the unnamed classes a subject ({len(unnamed_groups)} "
                 f"class(es), {lesson_count} lesson(s))**"
             )
-            st.caption(
-                "The sheet has a time and a roster but no subject above them. "
-                "Lessons are grouped by their student, or by weekly slot when "
-                "several students share one. Give two groups the same name to "
-                "make them one class; leave a box blank to keep the placeholder "
-                "and rename it later."
-            )
+            st.caption("Give two groups the same name to make them one class; leave blank to name later.")
             for placeholder, items in sorted(unnamed_groups.items()):
                 items.sort(key=lambda x: (x["date"], x["start_time"]))
                 students = sorted({a["student_name"] for x in items for a in x["attendance"]})
@@ -758,12 +697,7 @@ def _import_upload_panel() -> None:
         merges = schedule_backfill.suggest_subject_merges(preview["sessions"])
         if merges:
             st.markdown(f"**Subjects typed two ways ({len(merges)})**")
-            st.caption(
-                "These are identical once capitalisation, spaces and "
-                "punctuation are ignored — almost always one subject typed "
-                "inconsistently. Merging keeps the billing together; keeping "
-                "them separate makes two subjects, each needing its own rate."
-            )
+            st.caption("Same subject typed differently — merging keeps its billing together.")
             for index, item in enumerate(merges):
                 keep, drop = item["keep"], item["drop"]
                 kept_n, drop_n = item["counts"]
@@ -790,10 +724,7 @@ def _import_upload_panel() -> None:
         renames = schedule_backfill.suggest_class_renames(effective, teacher_name)
         if renames:
             st.markdown("**Class names already used by another teacher**")
-            st.caption(
-                "A subject's name has to be unique across the whole academy — "
-                "these collide with a class taught by someone else."
-            )
+            st.caption("Each subject name must be unique across the academy.")
             for original, suggestion in renames.items():
                 new_name = st.text_input(
                     f"Rename '{original}'",
@@ -916,17 +847,10 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
     unnamed = db.get_unnamed_subjects(year, month)
     if not unnamed:
         return
-    issued = sum(item["Issued lines"] for item in unnamed)
     where = f" with classes in {calendar.month_name[month]} {year}" if month else ""
     st.warning(
-        f"**{len(unnamed)} subject(s){where} have no name** — the workbook gave none, so "
-        "invoices call them “(unnamed class) · Sun 13:30”."
-        + (f" {issued} line(s) already sent read that way." if issued else "")
-        + " Name them here."
-    )
-    st.caption(
-        "Who teaches it, when, and who comes — enough to tell which subject it is. "
-        "Invoices already sent take the new name on their next copy; no amount changes."
+        f"**{len(unnamed)} subject(s){where} have no name**, so invoices say “(unnamed class)”. "
+        "Name them here; invoices already sent update too, amounts unchanged."
     )
     typed: dict[int, str] = {}
     for item in unnamed:
@@ -1090,14 +1014,12 @@ def _bulk_rate_section(
         # The placeholder an import seeds is not a price anybody chose, so it
         # reads as unset here -- same as it does in the Invoices warning.
         if not (month_rate and month_rate > db.UNSET_RATE):
-            rate_text = "no price set"
+            rate_text = "no price"
         elif starts is None or starts == month_start:
-            rate_text = f"${month_rate:,.2f}/h set for this month"
+            rate_text = f"${month_rate:,.0f}/h"
         else:
-            rate_text = (
-                f"${month_rate:,.2f}/h carried over from "
-                f"{calendar.month_name[starts.month]} {starts.year}"
-            )
+            rate_text = f"${month_rate:,.0f}/h since {calendar.month_abbr[starts.month]}" + (
+                f" {starts.year}" if starts.year != year else "")
         # Not when an import already named the subject for its teacher.
         who = (f" ({item['Teacher']})" if show_teacher and item.get("Teacher")
                and not item["Class"].endswith(f"({item['Teacher']})") else "")
@@ -1107,13 +1029,13 @@ def _bulk_rate_section(
         standard, why, certain = rule[class_id]
         unset = not (month_rate and month_rate > db.UNSET_RATE)
         if certain and abs((month_rate or 0) - standard) > 0.005:
-            suggestion = f" — standard ${standard:,.2f}/h" + (f", as {why}" if why else "")
+            suggestion = f" (standard ${standard:,.0f}" + (f", {why})" if why else ")")
         elif not certain and unset:
-            suggestion = f" — ${standard:,.2f}/h by default, {why}"
+            suggestion = f" (${standard:,.0f} by default, {why})"
         else:
             suggestion = ""
         checked = st.checkbox(
-            f"{item['Class']}{who} — {rate_text}, {item['Sessions']} session(s){suggestion}",
+            f"{item['Class']}{who} — {rate_text} · {item['Sessions']} classes{suggestion}",
             key=f"bulk_rate_pick_{scope}_{class_id}",
         )
         if checked:
@@ -1123,7 +1045,7 @@ def _bulk_rate_section(
     # Keyed on `base`, not `scope`, so the rate typed here survives applying
     # -- handy when the same price is being set for another month next.
     bulk_rate = columns[0].number_input(
-        "New hourly rate ($) for the selected subjects",
+        "New rate ($ per hour)",
         min_value=0.0, step=1.0, key=f"bulk_rate_value_{base}",
     )
     # Only where the rule would change something, and across everything
@@ -1141,8 +1063,7 @@ def _bulk_rate_section(
             by_grade[item["Class ID"]] = rate
     if by_grade and st.button(
         f"Price {len(by_grade)} {'ticked ' if selected_ids else ''}subject(s) by grade "
-        f"(${schedule_parser.SENIOR_RATE:,.0f}/h Grade 11 and above, "
-        f"${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise)",
+        f"(G11+ ${schedule_parser.SENIOR_RATE:,.0f}, else ${schedule_parser.JUNIOR_RATE:,.0f})",
         key=f"bulk_rate_standard_{scope}",
         width="stretch",
     ):
@@ -1207,12 +1128,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
         return
 
     with st.expander(f"Delete subjects from {teacher_name}"):
-        st.caption(
-            "Deletes the subject, its classes and its rosters. A charge on an "
-            "invoice that has not gone out is simply dropped; one already sent "
-            "is credited back to that student's next invoice, so nothing a "
-            "parent has received is rewritten."
-        )
+        st.caption("Removes the subject and its classes. Anything already invoiced is credited back.")
         generation = st.session_state.get(f"del_subj_gen_{teacher_id}", 0)
         scope = f"{teacher_id}_{generation}"
 
@@ -1368,60 +1284,66 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
 
 
 def teachers_tab() -> None:
-    st.subheader("Teachers")
 
     teachers = db.get_all_teachers()
 
     with st.expander("Upload an Excel schedule", expanded=not teachers):
         _import_upload_panel()
 
-    with st.form("add_teacher", clear_on_submit=True):
-        name = st.text_input("Teacher name", key="teacher_new")
-        if st.form_submit_button("Add teacher", type="primary"):
-            if db.create_teacher(name):
-                _flash(f"Added {name.strip()}.")
+    # Imports add teachers by themselves, so adding, renaming and retiring
+    # one is occasional -- kept out of the way of what needs doing today.
+    with st.expander(f"Manage teachers ({len(teachers)})" if teachers else "Add a teacher",
+                     expanded=not teachers):
+        with st.form("add_teacher", clear_on_submit=True, border=False):
+            columns = st.columns([3, 1])
+            name = columns[0].text_input("New teacher", key="teacher_new",
+                                         placeholder="Name", label_visibility="collapsed")
+            if columns[1].form_submit_button("Add teacher", width="stretch"):
+                if db.create_teacher(name):
+                    _flash(f"Added {name.strip()}.")
+                    _rerun()
+                else:
+                    st.warning("Enter a name that is not already on the list.")
+        if teachers:
+            per_teacher: dict = {}
+            for item in db.get_all_classes():
+                per_teacher[item["Teacher"]] = per_teacher.get(item["Teacher"], 0) + 1
+            st.dataframe(
+                [
+                    {
+                        "Teacher": item["Name"],
+                        "Subjects": per_teacher.get(item["Name"], 0),
+                        "Active": item["Active"],
+                    }
+                    for item in teachers
+                ],
+                width="stretch",
+                hide_index=True,
+                height=250,
+            )
+            st.markdown("###### Rename or retire")
+            columns = st.columns([2, 2, 1, 1])
+            chosen = columns[0].selectbox(
+                "Teacher", [item["Name"] for item in teachers], key="teacher_pick",
+                label_visibility="collapsed",
+            )
+            record = next(item for item in teachers if item["Name"] == chosen)
+            new_name = columns[1].text_input("New name", value=record["Name"], key="teacher_rename",
+                                             label_visibility="collapsed")
+            if columns[2].button("Rename", key="teacher_save", width="stretch"):
+                if db.update_teacher_name(record["ID"], new_name):
+                    _flash("Renamed.")
+                    _rerun()
+                else:
+                    st.warning("That name is not available.")
+            label = "Retire" if record["Active"] else "Reactivate"
+            if columns[3].button(label, key="teacher_toggle", width="stretch"):
+                db.update_teacher_status(record["ID"], not record["Active"])
                 _rerun()
-            else:
-                st.warning("Enter a name that is not already on the list.")
 
     if not teachers:
-        st.info("No teachers yet. Add one above, or upload a schedule to create one.")
+        st.info("No teachers yet. Upload a schedule, or add one above.")
         return
-
-    per_teacher: dict = {}
-    for item in db.get_all_classes():
-        per_teacher[item["Teacher"]] = per_teacher.get(item["Teacher"], 0) + 1
-
-    st.dataframe(
-        [
-            {
-                "Teacher": item["Name"],
-                "Subjects": per_teacher.get(item["Name"], 0),
-                "Active": item["Active"],
-            }
-            for item in teachers
-        ],
-        width="stretch",
-        hide_index=True,
-    )
-
-    with st.expander("Rename or retire a teacher"):
-        chosen = st.selectbox(
-            "Teacher", [item["Name"] for item in teachers], key="teacher_pick"
-        )
-        record = next(item for item in teachers if item["Name"] == chosen)
-        new_name = st.text_input("New name", value=record["Name"], key="teacher_rename")
-        columns = st.columns(3)
-        if columns[0].button("Save name", key="teacher_save"):
-            if db.update_teacher_name(record["ID"], new_name):
-                _flash("Renamed.")
-                _rerun()
-            else:
-                st.warning("That name is not available.")
-        label = "Mark inactive" if record["Active"] else "Mark active"
-        if columns[1].button(label, key="teacher_toggle"):
-            db.update_teacher_status(record["ID"], not record["Active"])
-            _rerun()
 
     _unpriced_everywhere()
     _unnamed_subjects("teachers")
@@ -1445,16 +1367,13 @@ def _two_children(dates: list[dt.date]) -> None:
 def _merge_students_section(all_students: list[dict]) -> None:
     """Two records of one child -- spelled two ways by two teachers -- made one.
 
-    Behind a tick box: looking compares every student with every other, and
-    this screen is opened far more often than anyone merges.
+    Shown only when asked for (the tick box on the Students screen): looking
+    compares students' names, and this screen is opened far more often than
+    anyone merges.
     """
-    if not st.checkbox("Same child on file twice? Find and merge them", key="students_dupes_open"):
-        return
     st.caption(
-        "Teachers each spell a child their own way — “Kim Hayun” and “Hayun Kim”. Merging "
-        "moves every class, invoice and credit onto one record; invoices already sent keep "
-        "their numbers and amounts. The other spelling is remembered, so next month's "
-        "workbook lands on the same child."
+        "Merging moves classes, invoices and credits onto one record. Sent invoices keep "
+        "their numbers and amounts."
     )
     names = {item["ID"]: item["Name"] for item in all_students}
 
@@ -1526,83 +1445,60 @@ def _merge_students_section(all_students: list[dict]) -> None:
 
 
 def students_tab() -> None:
-    st.subheader("Students")
 
     year, month = _month_picker("students_month")
 
-    st.markdown("###### Schedule uploads this month")
+    # Only who is missing: a tile per teacher who *had* uploaded was two dozen
+    # green boxes above the students every visit.
     statuses = db.get_import_status(year, month)
-    if not statuses:
-        st.caption("No active teachers yet.")
-    else:
-        badge_columns = st.columns(min(len(statuses), 4))
-        for index, item in enumerate(statuses):
-            slot = badge_columns[index % len(badge_columns)]
-            if item["Imported"]:
-                slot.success(f"✅ {item['Teacher']} · {_local_time(item['Imported At']):%d %b %H:%M}")
-            else:
-                slot.warning(f"⏳ {item['Teacher']} — not uploaded yet")
-
-    st.divider()
-
-    with st.form("add_student", clear_on_submit=True):
-        columns = st.columns(3)
-        name = columns[0].text_input("Student name", key="student_new_name")
-        parent = columns[1].text_input(
-            "Parent name", placeholder="optional", key="student_new_parent"
-        )
-        phone = columns[2].text_input(
-            "Contact number", placeholder="optional", key="student_new_phone"
-        )
-        if st.form_submit_button("Add student", type="primary"):
-            # A parent needs both halves to be stored at all, so half of one
-            # is a slip to point out rather than quietly drop on the floor.
-            outcome = db.create_student(name[:120], parent[:120], phone[:40])
-            if outcome == "created":
-                _flash(f"Added {name.strip()}.")
-                _rerun()
-            elif outcome == "duplicate":
-                st.warning("That student is already on the list.")
-            elif outcome == "parent_unavailable":
-                st.warning(
-                    "A parent needs both a name and a contact number — fill "
-                    "in the other one, or leave both blank to add the "
-                    "student on their own."
-                )
-            else:
-                st.warning("Enter a name first.")
-    st.caption("Parent details are optional — a student can be completed later.")
+    missing = [item["Teacher"] for item in statuses if not item["Imported"]]
+    if missing:
+        st.warning(f"⏳ No {calendar.month_name[month]} schedule yet from {_name_list(missing, most=10)}.")
+    elif statuses:
+        st.caption(f"✅ Every teacher's {calendar.month_name[month]} schedule is in.")
 
     all_students = db.get_all_students()
+    search = st.text_input(
+        "Search", placeholder="Search by name", key="student_search", label_visibility="collapsed"
+    )
+    columns = st.columns([1.3, 1.3, 1])
+    show_all = columns[0].checkbox("All students, not just this month", key="students_show_all")
+    find_twins = columns[1].checkbox("Same child on file twice?", key="students_dupes_open")
+    with columns[2].popover("Add a student", width="stretch"):
+        with st.form("add_student", clear_on_submit=True, border=False):
+            name = st.text_input("Student name", key="student_new_name")
+            parent = st.text_input("Parent name", placeholder="optional", key="student_new_parent")
+            phone = st.text_input("Contact number", placeholder="optional", key="student_new_phone")
+            if st.form_submit_button("Add student", type="primary"):
+                # A parent needs both halves to be stored at all, so half of one
+                # is a slip to point out rather than quietly drop on the floor.
+                outcome = db.create_student(name[:120], parent[:120], phone[:40])
+                if outcome == "created":
+                    _flash(f"Added {name.strip()}.")
+                    _rerun()
+                elif outcome == "duplicate":
+                    st.warning("That student is already on the list.")
+                elif outcome == "parent_unavailable":
+                    st.warning("A parent needs both a name and a number — or leave both blank.")
+                else:
+                    st.warning("Enter a name first.")
     if not all_students:
         st.info("No students yet.")
         return
-    _merge_students_section(all_students)
+    if find_twins:
+        _merge_students_section(all_students)
 
     student_notes = {item["ID"]: item["Note"] for item in all_students if item["Note"]}
-    show_all = st.checkbox(
-        "Show all students, not just this month", key="students_show_all"
-    )
     month_ids = {item["ID"] for item in db.get_students_in_month(year, month)}
     pool = all_students if show_all else [
         item for item in all_students if item["ID"] in month_ids
     ]
 
-    search = st.text_input(
-        "Search", placeholder="Type part of a name", key="student_search"
-    )
     shown = [
         item
         for item in pool
         if not search.strip() or search.strip().lower() in item["Name"].lower()
     ]
-    if show_all:
-        st.caption(f"{len(shown)} of {len(all_students)} students")
-    else:
-        st.caption(
-            f"{len(shown)} student(s) with a class in "
-            f"{calendar.month_name[month]} {year} ({len(all_students)} total on file)"
-        )
 
     # One query for everyone shown, rather than one per student expanded.
     breakdowns = db.get_all_student_month_breakdowns(year, month)
@@ -1619,19 +1515,15 @@ def students_tab() -> None:
     credit_waiting = db.get_student_credit_totals(page_ids)
     usage_by_student = db.get_student_usage_many(page_ids)
     if len(shown) > len(page):
-        st.info(
-            f"Showing the first {len(page)} of {len(shown)} — type a name "
-            "above to find someone specific."
-        )
+        st.caption(f"Showing {len(page)} of {len(shown)} — search to find anyone else.")
+    elif not shown:
+        st.caption("Nobody matches." if search.strip() else f"Nobody had a class in {calendar.month_name[month]}.")
 
     for item in page:
         marker = " 📝" if student_notes.get(item["ID"]) else ""
-        contact = (
-            f" — {item['Parent']} · {item['Phone']}"
-            if item["Parent"]
-            else " — no parent on file"
-        )
-        with st.expander(f"{item['Name']}{contact}{marker}"):
+        parent = f" · {item['Parent']}" if item["Parent"] else ""
+        owes = breakdowns.get(item["ID"], {}).get("total") or 0
+        with st.expander(f"{item['Name']}{parent}{marker}" + (f" — ${owes:,.0f}" if owes else "")):
             breakdown = breakdowns.get(item["ID"], {"lines": [], "total": 0.0})
             if breakdown["lines"]:
                 # A subject still on the import's placeholder has no price
@@ -1719,11 +1611,8 @@ def students_tab() -> None:
                 st.write(f"**Delete {item['Name']}?**")
                 if usage["invoices"]:
                     st.warning(
-                        f"**{item['Name']} has {usage['invoices']} invoice(s) "
-                        "already sent, so they cannot be deleted.** An invoice "
-                        "keeps the student it was addressed to — without them "
-                        "it would vanish from the Invoices, Payments and "
-                        "Reminders screens while still counting as earned."
+                        f"{item['Name']} has {usage['invoices']} invoice(s) sent, so can't be "
+                        "deleted — sent invoices keep their student."
                     )
                 elif usage["classes"] or usage["subjects"]:
                     st.warning(
@@ -2115,11 +2004,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             else:
                 st.warning(_explain(str(outcome)))
 
-        st.caption(
-            "Condition applies to this class only — everyone defaults to being "
-            "in the room. Paid is filled in for you when the invoice covering "
-            "the class is recorded on the Payments screen."
-        )
+        st.caption("For this class only. Paid fills in when the invoice is paid on Payments.")
         rows = [
             {
                 "Student": row["student_name"],
@@ -2285,10 +2170,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 _rerun()
 
     with st.expander(f"Edit the subject — {detail['Class']}"):
-        st.caption(
-            "A subject is the teacher's, its price and its colour on the grid. "
-            "Students belong to each class, so they are set above."
-        )
+        st.caption("Applies to every class of this subject.")
         current = next(
             (
                 item
@@ -2407,8 +2289,7 @@ def schedule_tab() -> None:
         selected = None
 
     if selected is None:
-        st.caption("Click a class in the grid above to edit it.")
-        return
+        return  # the grid's own legend says to click a class
 
     _anchor("class-editor")
     _lesson_editor(selected, teacher_id)
@@ -2682,9 +2563,8 @@ def _credits_pointer() -> None:
     waiting = db.get_credits(status="Open")
     if waiting:
         st.caption(
-            f"{len(waiting)} credit(s) for missed classes, "
-            f"${sum(c['Amount'] for c in waiting):,.2f}, come off students' next "
-            "invoices automatically — see the Credits screen."
+            f"{len(waiting)} credit(s) for missed classes, ${sum(c['Amount'] for c in waiting):,.2f}, "
+            "come off next invoices by themselves — see Credits."
         )
 
 
@@ -2700,11 +2580,7 @@ def credits_tab() -> None:
     where one already paid back in money is marked refunded so it comes off
     nothing.
     """
-    st.subheader("Credits")
-    st.caption(
-        "A class a student was invoiced for and then missed — cancelled, or taken "
-        "off the lesson — is owed back. It comes off their next invoice by itself."
-    )
+    st.caption("Classes already invoiced, then missed. Each comes off the student's next invoice.")
     credits = db.get_credits()
 
     # By the month of the class that was missed: "what did September's
@@ -2751,10 +2627,7 @@ def credits_tab() -> None:
     # The filter stays in view even with nothing to filter: a screen that
     # hides its controls until there is data reads as one missing them.
     if not credits:
-        st.info(
-            "No credits yet. A class cancelled before its invoice goes out is "
-            "simply left off it; one missed after it has gone out shows up here."
-        )
+        st.info("No credits yet.")
         return
 
     def when(credit):
@@ -2969,11 +2842,7 @@ def _past_invoices_section(counts: dict) -> None:
                 # No "bill the whole thing" button. An invoice covers one
                 # month, so a draft holding several is billed a month at a
                 # time from the list at the top of this tab, on that month.
-                st.caption(
-                    "Billed from the month's list above — pick the month at "
-                    "the top of this tab and send it there, so each invoice "
-                    "covers one month."
-                )
+                st.caption("Bill it from the month's list at the top of this screen.")
                 columns = st.columns([1.4, 1, 4])
                 with columns[0]:
                     parent, phone = contacts.get(invoice["Student ID"], ("", ""))
@@ -3061,7 +2930,6 @@ def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
 
 
 def invoices_tab() -> None:
-    st.subheader("Invoices")
 
     # The month leads and everything below is that month's: an invoice is
     # always *for* a month of classes, never a running total of everything
@@ -3078,7 +2946,7 @@ def invoices_tab() -> None:
     # One line, not a four-metric dashboard: there is only ever one question
     # on this screen -- how much is there to send this month.
     st.markdown(
-        f"### {period} — {summary['to_bill_count']} to bill, "
+        f"#### {period} — {summary['to_bill_count']} to bill, "
         f"${summary['to_bill_value']:,.2f}"
     )
     trail = f"{summary['billed_count']} already sent (${summary['billed_value']:,.2f})"
@@ -3098,42 +2966,30 @@ def invoices_tab() -> None:
         _unnamed_subjects("invoices", year, month)
 
     if not month_items:
-        st.info(
-            f"Nothing left to bill for {period}. Import a schedule for a month "
-            "that has not been billed yet and it will appear here."
-        )
+        st.info(f"Nothing left to bill for {period}.")
     else:
-        def _apply_select_all() -> None:
-            value = st.session_state.get("invoice_select_all", False)
-            for row in month_items:
-                st.session_state[f"inv_pick_{row['Invoice ID']}"] = value
-
-        st.checkbox(
-            "Select all", key="invoice_select_all", on_change=_apply_select_all
-        )
-        selected_ids = []
-        for row in month_items:
-            if st.checkbox(
-                f"{row['Student']} — {row['Classes']} class(es) this month, "
-                f"${row['Month Amount']:,.2f}",
-                key=f"inv_pick_{row['Invoice ID']}",
-            ):
-                selected_ids.append(row["Invoice ID"])
-
-        chosen_total = sum(
-            row["Month Amount"] for row in month_items
-            if row["Invoice ID"] in selected_ids
-        )
-        if st.button(
-            f"Send {len(selected_ids)} invoice(s) — ${chosen_total:,.2f}",
-            type="primary",
-            disabled=not selected_ids,
-            key="invoice_bulk_issue",
-            width="stretch",
-            help="Bills this month only, then renders one image per student "
-                 "ready to send on KakaoTalk.",
-        ):
-            _send_invoices(selected_ids, year, month)
+        # A form, as on Payments: ticking is instant, and the button is above
+        # the list rather than below every student in it.
+        with st.form(f"invoice_form_{year}_{month}", border=False):
+            send = st.form_submit_button(
+                "Send ticked invoices", type="primary", key="invoice_bulk_issue", width="stretch",
+                help="Bills this month only, then makes one image per student to send on KakaoTalk.",
+            )
+            every = st.checkbox(f"All {len(month_items)}", key="invoice_select_all")
+            ticked = {
+                row["Invoice ID"]: st.checkbox(
+                    f"{row['Student']} — {row['Classes']} class(es), ${row['Month Amount']:,.2f}",
+                    key=f"inv_pick_{row['Invoice ID']}",
+                )
+                for row in month_items
+            }
+        if send:
+            selected_ids = [row["Invoice ID"] for row in month_items
+                            if every or ticked.get(row["Invoice ID"])]
+            if selected_ids:
+                _send_invoices(selected_ids, year, month)
+            else:
+                st.warning("Tick who to bill first.")
 
     # Sits below the month's figures rather than on top of them, and belongs
     # to the month it was issued for.
@@ -3229,12 +3085,6 @@ def _paid_list(paid: list[dict], year: int, month: int) -> None:
 
 
 def payments_tab() -> None:
-    st.subheader("Payments")
-    st.caption(
-        "Tick the parents who have paid and press the button. Payment belongs "
-        "to the whole invoice, so one tick settles every class on it."
-    )
-
     year, month = _month_picker("payments_month")
     period = f"{calendar.month_name[month]} {year}"
     data = db.get_invoice_payments(year, month)
@@ -3251,73 +3101,67 @@ def payments_tab() -> None:
     collected = round(
         sum(r["Paid amount"] if r["Paid amount"] is not None else r["Total"] for r in paid), 2
     )
-    st.markdown(f"### {period} — {len(unpaid)} to collect, ${outstanding:,.2f} outstanding")
+    st.markdown(f"#### {period} — {len(unpaid)} to collect, ${outstanding:,.2f}")
     trail = f"{len(paid)} paid (${collected:,.2f}) · due {data['due']:%d %b %Y}"
     late = [row for row in unpaid if row["Overdue"] > 0]
     if late:
         trail += f" · **{len(late)} overdue**"
     st.caption(trail)
 
-    st.divider()
     if not unpaid:
         st.success(f"Everyone has paid for {period}.")
     else:
-        def _apply_select_all() -> None:
-            value = st.session_state.get(f"pay_all_{year}_{month}", False)
-            for row in unpaid:
-                st.session_state[f"pay_pick_{row['ID']}"] = value
-
-        st.markdown(f"###### Awaiting payment ({len(unpaid)})")
-        st.checkbox(
-            "Select all", key=f"pay_all_{year}_{month}", on_change=_apply_select_all
-        )
-        picked = []
-        for row in unpaid:
-            bits = [f"{row['Student']} — ${row['Owing']:,.2f}"]
-            if row["Owing"] < row["Total"] - 0.005:
-                bits.append(f"part paid, ${row['Total']:,.2f} invoice")
-            bits.append(f"invoice #{row['Number']}")
-            if row.get("Covers"):
-                # Billed whole rather than a month at a time, so the amount
-                # beside their name is not only this month's classes.
-                bits.append(f"covers {row['Covers']}")
-            if row["Overdue"]:
-                bits.append(f"**{row['Overdue']} days overdue**")
-            if st.checkbox(" · ".join(bits), key=f"pay_pick_{row['ID']}"):
-                picked.append(row)
-
-        total_picked = round(sum(row["Owing"] for row in picked), 2)
-        columns = st.columns([1, 1])
-        when = columns[0].date_input(
-            "Date received", value=dt.date.today(), key=f"pay_on_{year}_{month}"
-        )
-        note = columns[1].text_input(
-            "Note (optional)", key=f"pay_note_{year}_{month}",
-            placeholder="e.g. bank transfer, paid at desk",
-            help="Saved against every invoice you tick.",
-        )
-        if st.button(
-            f"Mark {len(picked)} paid in full — ${total_picked:,.2f}",
-            type="primary",
-            disabled=not picked,
-            width="stretch",
-            key=f"pay_confirm_{year}_{month}",
-        ):
-            done = failed = 0
-            for row in picked:
-                if db.mark_invoice_paid(row["ID"], paid_on=when, note=note) in (
-                    "paid", "part paid"
-                ):
-                    done += 1
-                    st.session_state.pop(f"pay_pick_{row['ID']}", None)
-                else:
-                    failed += 1
-            st.session_state.pop(f"pay_all_{year}_{month}", None)
-            if failed:
-                st.warning(f"{failed} could not be recorded.")
-            if done:
-                _flash(f"Recorded {done} payment(s) — ${total_picked:,.2f} for {period}.")
-                _rerun()
+        # A form, so ticking is instant: outside one every tick reran the whole
+        # screen, two seconds each on the live app, with the button waiting
+        # below every parent on the list.
+        search = st.text_input(
+            "Find", placeholder="Search by student or invoice number",
+            key=f"pay_find_{year}_{month}", label_visibility="collapsed",
+        ).strip().casefold()
+        shown = [row for row in unpaid
+                 if not search or search in row["Student"].casefold() or search in str(row["Number"])]
+        with st.form(f"pay_form_{year}_{month}", border=False):
+            columns = st.columns([1, 1.2, 1.2])
+            when = columns[0].date_input("Date received", value=dt.date.today())
+            note = columns[1].text_input("Note", placeholder="optional, e.g. bank transfer")
+            columns[2].markdown("<div style='height: 1.75rem'></div>", unsafe_allow_html=True)
+            submitted = columns[2].form_submit_button(
+                "Mark ticked as paid", type="primary", width="stretch", key=f"pay_confirm_{year}_{month}",
+            )
+            every = shown and st.checkbox(f"All {len(shown)} below" if search else f"All {len(shown)}")
+            ticks = {}
+            for row in shown:
+                bits = [f"{row['Student']} — ${row['Owing']:,.2f}"]
+                if row["Owing"] < row["Total"] - 0.005:
+                    bits.append(f"part paid, ${row['Total']:,.2f} invoice")
+                bits.append(f"#{row['Number']}")
+                if row.get("Covers"):
+                    # Billed whole rather than a month at a time, so the amount
+                    # beside their name is not only this month's classes.
+                    bits.append(f"covers {row['Covers']}")
+                if row["Overdue"]:
+                    bits.append(f"**{row['Overdue']} days overdue**")
+                ticks[row["ID"]] = st.checkbox(" · ".join(bits), key=f"pay_pick_{row['ID']}")
+            if not shown:
+                st.caption("Nobody matches that search.")
+        if submitted:
+            picked = [row for row in shown if every or ticks.get(row["ID"])]
+            if not picked:
+                st.warning("Tick who has paid first.")
+            else:
+                done = failed = 0
+                for row in picked:
+                    if db.mark_invoice_paid(row["ID"], paid_on=when, note=note) in ("paid", "part paid"):
+                        done += 1
+                    else:
+                        failed += 1
+                if failed:
+                    st.warning(f"{failed} could not be recorded.")
+                if done:
+                    total_picked = round(sum(row["Owing"] for row in picked), 2)
+                    st.session_state.pop(f"pay_find_{year}_{month}", None)
+                    _flash(f"Recorded {done} payment(s) — ${total_picked:,.2f} for {period}.")
+                    _rerun()
 
         _part_payment_form(unpaid, year, month)
 
@@ -3635,11 +3479,7 @@ def _retention_view() -> None:
 
 
 def _history_view() -> None:
-    st.caption(
-        "Past schedules kept for analysis only — for months already billed outside the "
-        "app. They never create classes, invoices or reminders. Adding the same "
-        "workbook again updates it rather than doubling it."
-    )
+    st.caption("For the charts only — never billed. Adding a workbook again updates it.")
     summary = db.get_lesson_history_summary()
     if summary:
         st.dataframe(summary, width="stretch", hide_index=True)
@@ -3786,10 +3626,7 @@ def _teaching_view() -> None:
     from the Schedule and from past schedules, so how many students were
     taught, and for how many hours, is known for every month.
     """
-    st.caption(
-        "Every lesson taught — from the Schedule and from Past schedules — so months "
-        "billed outside the app count too. Money is under Invoiced."
-    )
+    st.caption("Every lesson taught, from the Schedule and Past schedules. Money is under Invoiced.")
     year, month = _month_picker("data_month")
     today = dt.date.today()
     label = f"{calendar.month_name[month]} {year}"
@@ -3827,7 +3664,7 @@ def _teaching_view() -> None:
                 change = value - previous[key]
                 delta = f"{change:+,.0f} on {calendar.month_abbr[before[1]]}"
             column.metric(text, f"{value:,.0f}", delta=delta)
-        if beginning and previous:
+        if beginning and previous and not so_far:
             st.caption(
                 f"Not compared with {calendar.month_abbr[before[1]]}: records for "
                 + _name_list(beginning) + f" begin in {calendar.month_abbr[month]}."
@@ -3855,13 +3692,11 @@ def _teaching_view() -> None:
     )
     later = sorted(t for t, first in first_on_record.items() if first > (year, month))
     st.caption(
-        "A child with two teachers counts once; a student marked cancelled isn't counted. "
-        + (f"{calendar.month_abbr[month]} is so far. " if so_far else "")
-        + ("Records start partway through the year for "
+        "Absences aren't counted; a child with two teachers counts once. "
+        + ("Records start later for "
            + _name_list([f"{t} ({calendar.month_abbr[m]})" for m, t in starts])
-           + " — a rise in those months is partly their records beginning. " if starts else "")
-        + (f"Records for {_name_list(later)} begin after {label}, so they aren't here yet."
-           if later else "")
+           + ". " if starts else "")
+        + (f"Not on record yet: {_name_list(later)}." if later else "")
     )
 
     teachers = pd.DataFrame(
@@ -3921,7 +3756,6 @@ def _lessons(count: int) -> str:
 
 
 def data_tab() -> None:
-    st.subheader("Data")
     view = st.radio(
         "View",
         ["Teaching", "Invoiced", "Student retention", "Past schedules"],
@@ -3938,11 +3772,7 @@ def data_tab() -> None:
     if view == "Past schedules":
         _history_view()
         return
-    st.caption(
-        "Invoiced is read off the invoices sent, so it never moves when a price "
-        "changes. Still to invoice is everything else taught or booked, at "
-        "today's prices — it moves the moment a price is set."
-    )
+    st.caption("Invoiced: invoices sent. Still to invoice: taught or booked, at today's prices.")
 
     year, month = _month_picker("data_month")
     label = f"{calendar.month_name[month]} {year}"
@@ -3992,9 +3822,8 @@ def data_tab() -> None:
             who = f"{len(earlier)} teachers" if len(earlier) > 3 else _name_list(earlier)
             st.caption(
                 f"Before {calendar.month_name[first_full]} only {who} "
-                f"{'was' if len(earlier) == 1 else 'were'} billed through the app, so earlier "
-                "months are their classes alone, not the academy's whole takings. From "
-                f"{calendar.month_name[first_full]}, {full} teachers are in."
+                f"{'was' if len(earlier) == 1 else 'were'} billed through the app — see Teaching "
+                "for every teacher's months."
             )
 
     # Then teachers side by side. A line each for two dozen teachers was a
@@ -4030,11 +3859,6 @@ def data_tab() -> None:
             .properties(height=260),
             width="stretch",
         )
-    st.caption(
-        f"{year} only, so December is never drawn beside the next January. Each line "
-        "is a teacher's month: what was invoiced, plus what is still to invoice at "
-        "today's prices — hover a point for the two."
-    )
 
     st.divider()
     # Both this and the trend price their classes through the same helper, so
@@ -4057,9 +3881,7 @@ def data_tab() -> None:
     columns[2].metric(
         "Per teaching hour",
         _per_hour(snapshot["Invoiced"].sum(), snapshot["Invoiced lesson hours"].sum()),
-        help="Invoiced divided by the hours of the lessons on those invoices. A "
-             "class of six earns six students' rates in one hour of a teacher's "
-             "time. Lessons not invoiced yet are left out of both.",
+        help="Invoiced ÷ hours of those lessons. A class of six earns six rates an hour.",
     )
     # Invoiced money only moves when invoices go out, so an import or a new
     # price changed nothing on this screen. What is still to come, at
@@ -4131,12 +3953,7 @@ def data_tab() -> None:
 
 
 def reminders_tab() -> None:
-    st.subheader("Payment reminders")
-    st.caption(
-        "An invoice is due on the 20th of the month after its classes — "
-        "January's is chased from 20 February. One row per unpaid invoice; "
-        "record payment on the Payments screen."
-    )
+    st.caption("Due on the 20th of the following month. Record payments on Payments.")
 
     today = dt.date.today()
     all_reminders = db.get_payment_reminders(today)
@@ -4151,11 +3968,7 @@ def reminders_tab() -> None:
     older = [item for item in all_reminders if not _due_this_month(item)]
     if older:
         owed = sum(item["Amount"] for item in older)
-        st.warning(
-            f"{len(older)} invoice(s) from before this month are still unpaid "
-            f"too — ${owed:,.2f}. {calendar.month_name[today.month]} isn't "
-            "the whole picture."
-        )
+        st.warning(f"Also unpaid from earlier months: {len(older)} invoice(s), ${owed:,.2f}.")
     if not reminders:
         st.success("Nothing newly overdue this month.")
         show = older
@@ -4189,7 +4002,12 @@ def reminders_tab() -> None:
     )
 
 
-st.title("KS Academia")
+# No page title: the browser tab names the app, and the row of screens is
+# the first thing anyone needs. Streamlit's own top padding goes too.
+st.markdown(
+    "<style>[data-testid='stMainBlockContainer'] { padding-top: 2.5rem; }</style>",
+    unsafe_allow_html=True,
+)
 # Above the tabs, so a confirmation from any tab's last action is visible
 # wherever the rerun lands.
 _show_flash()
@@ -4221,8 +4039,12 @@ if _pending in SECTIONS:
 
 # Seeded here rather than through the widget's `default=`: passing a default
 # *and* writing the key from elsewhere (the jump below) is the combination
-# Streamlit warns about, and session state alone does the same job.
-st.session_state.setdefault("active_section", next(iter(SECTIONS)))
+# Streamlit warns about, and session state alone does the same job. A new
+# session -- a refresh, or the connection dropping and coming back -- opens
+# the screen the address names, rather than throwing you back to Teachers.
+if "active_section" not in st.session_state:
+    _named = st.query_params.get("screen")
+    st.session_state["active_section"] = _named if _named in SECTIONS else next(iter(SECTIONS))
 # A section that has since been renamed must not follow a browser that was
 # open across the change: it lands on the first screen instead.
 if st.session_state["active_section"] not in SECTIONS:
@@ -4245,14 +4067,9 @@ if _section is None:
     )
     _rerun()
 st.session_state["last_section"] = _section
-
-st.divider()
+if _section and st.query_params.get("screen") != _section:
+    st.query_params["screen"] = _section
 # `_section or ...` is belt-and-braces: _rerun() above raises under Streamlit
 # so None never reaches here, but indexing by None would be a hard crash if
 # that ever stopped being true.
 SECTIONS[_section or next(iter(SECTIONS))]()
-# Outside the screen function, so one that bails out early -- "nothing to
-# show for this month" and the like -- still gets a back-to-top at the foot
-# of whatever it did render.
-st.divider()
-_inline_back_to_top()

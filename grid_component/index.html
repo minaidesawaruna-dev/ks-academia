@@ -125,10 +125,10 @@ function render(){
   lessons.forEach(l => { if (!byDate.has(l.date)) byDate.set(l.date, []); byDate.get(l.date).push(l); });
   const dates = [...byDate.keys()].sort();
 
-  // The axis always covers 09:00-21:00, and stretches further if a class
-  // falls outside it, so the shape of the day is the same every month.
-  const DAY_OPEN = 9 * 60, DAY_CLOSE = 21 * 60;
-  let lo = DAY_OPEN, hi = DAY_CLOSE;
+  // The axis runs from the month's first class to its last, the same for
+  // every day of the month. A fixed 09:00-21:00 had an evening teacher
+  // scroll past eight empty hours to reach their first class.
+  let lo = Infinity, hi = -Infinity;
   lessons.forEach(l => { lo = Math.min(lo, mins(l.start)); hi = Math.max(hi, mins(l.end)); });
   lo -= lo % 60;                       // start the axis on a whole hour
   if (hi % 60) hi += 60 - (hi % 60);   // and end on one
