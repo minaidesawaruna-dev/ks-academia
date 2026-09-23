@@ -245,9 +245,19 @@ def _cell_lines(value: Any) -> list[str]:
             for line in value.splitlines() if line.strip()]
 
 
+# Anything in round or square brackets: a nickname, a tag, a grade, a note.
+# The group is what is inside.
+_BRACKETED = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
+
+
+def without_brackets(text: str, replacement: str = " ") -> str:
+    """``text`` with every bracketed part -- "(Emily)", "[UWC D]" -- taken out."""
+    return _BRACKETED.sub(replacement, text)
+
+
 def normalise_name(name: str) -> str:
     """Lower-case, drop bracketed aliases and punctuation, collapse spaces."""
-    text = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", name.translate(INVISIBLE))
+    text = without_brackets(name.translate(INVISIBLE))
     text = re.sub(r"[^\w\s\uac00-\ud7a3]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip().lower()
 
@@ -706,6 +716,11 @@ def grade_of(class_name: str) -> int | None:
     return _IB_YEAR_GRADE.get(int(match.group(1))) if match else None
 
 
+def rate_for_grade(grade: int) -> float:
+    """The academy's hourly price for a grade: $60 to Grade 10, $65 from Grade 11."""
+    return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
+
+
 def standard_rate(class_name: str) -> float | None:
     """The academy's price for a class, from the grade in its name.
 
@@ -716,14 +731,12 @@ def standard_rate(class_name: str) -> float | None:
     nobody picked go out on an invoice.
     """
     grade = grade_of(class_name)
-    if grade is None:
-        return None
-    return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
+    return None if grade is None else rate_for_grade(grade)
 
 
 def _own_tagged_status(text: str, status: str) -> dict[str, Any] | None:
     """One student with their status in brackets -- "Jihoon(당일취소)" -- or None."""
-    tag = re.search(r"[\(\[]([^\)\]]*)[\)\]]", text)
+    tag = _BRACKETED.search(text)
     if not tag or status_from_line(tag.group(1))[0] != status:
         return None
     name = (text[: tag.start()] + text[tag.end():]).strip()
@@ -801,7 +814,7 @@ def _is_subject_line(line: str) -> bool:
 
 
 def _is_person_line(line: str) -> bool:
-    untagged = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", line)
+    untagged = without_brackets(line)
     return (looks_like_name(line) and not re.search(r"\d", untagged)
             and not any(_subject_strength(word) for word in untagged.split()))
 
@@ -834,7 +847,7 @@ def _roster_names(line: str, notes: list[str]) -> list[tuple[str, str | None, st
         line, parts = f"{parts[0]} {parts[1].capitalize()}", []
     found: list[tuple[str, str | None, str | None]] = []
     for part in parts if len(parts) > 1 else [line.strip()]:
-        tag = re.search(r"[\(\[]([^\)\]]*)[\)\]]", part)
+        tag = _BRACKETED.search(part)
         if tag and _ABSENT_NOTE.search(tag.group(1)):
             name = (part[: tag.start()] + part[tag.end():]).strip()
             if _is_person_line(name):
@@ -857,7 +870,7 @@ def _roster_names(line: str, notes: list[str]) -> list[tuple[str, str | None, st
         if match and _is_person_line(match["rest"]):
             name = match["rest"].strip()
             note = f"G{int(match['grade'])}" + (f"; {note}" if note else "")
-        if re.search(r"\d", re.sub(r"[\(\[][^\)\]]*[\)\]]", "", name)):
+        if re.search(r"\d", without_brackets(name, "")):
             notes.append(part)
         elif looks_like_name(name):
             found.append((name, note, None))
@@ -929,7 +942,7 @@ def _is_remark(line: str) -> bool:
     if TIME_RANGE_RE.search(line) and _AMPM.search(line):
         return False
     return bool(_AWAY_NOTE.search(line)
-                or re.search(r"\d", re.sub(r"[\(\[][^\)\]]*[\)\]]", "", line)))
+                or re.search(r"\d", without_brackets(line, "")))
 
 
 def parse_cell(text: str) -> dict[str, Any]:
@@ -1311,8 +1324,7 @@ def name_sound(name: str) -> str:
     """A name as it is said, in any word order and spacing, without a nickname
     in brackets: "Choi Jaaemin" and "Jaemin Choi", "Jang Kyubin" and "Jang
     Gyubin", "Kim Daeun(Emily)" and "Kim Da Eun" all come out the same."""
-    bare = re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", name)
-    return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", bare)))
+    return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))))
 
 
 def _hangul_sounds(hangul: str) -> set[str]:
@@ -2125,7 +2137,7 @@ def _bare(name: str) -> str:
 
 
 def _suffix(name: str) -> str:
-    found = re.findall(r"[\(\[]([^\)\]]*)[\)\]]", _display_clean(name))
+    found = _BRACKETED.findall(_display_clean(name))
     return found[0].strip() if found else ""
 
 

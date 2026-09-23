@@ -295,6 +295,29 @@ def t_combine_prefers_app():
     return "a lesson in both is counted once, from the app"
 
 
+def t_monthly_activity():
+    day = dt.date(2026, 3, 2)
+    app = dict(source="app")
+    rows = [
+        # One group lesson, 16:00-17:00: three students, one cancelled.
+        {**lesson("Nam Jihoon", day), **app}, {**lesson("Seo Yerin", day), **app},
+        {**lesson("Oh Minseok", day, status="Cancelled"), **app},
+        # The same child with a second teacher, written as that workbook did.
+        {**lesson("nam jihoon", day, teacher="teacher b", hour=18), "source": "history"},
+        {**lesson("Seo Yerin", dt.date(2026, 3, 9), teacher="Teacher B"), **app},
+        # A lesson only a cancelled student was booked on doesn't count.
+        {**lesson("Oh Minseok", dt.date(2026, 3, 16), status="Cancelled"), **app},
+        {**lesson("Oh Minseok", dt.date(2026, 4, 6)), **app},
+    ]
+    got = rt.monthly_activity(rows)
+    march = next(r for r in got["by_month"] if (r["Year"], r["Month"]) == (2026, 3))
+    assert march == {"Year": 2026, "Month": 3, "Students": 2, "Lessons": 3, "Hours": 3.0,
+                     "Teachers": 2}, march
+    teachers = {(r["Teacher"], r["Month"]): (r["Students"], r["Lessons"]) for r in got["by_teacher"]}
+    assert teachers == {("Teacher A", 3): (2, 1), ("Teacher B", 3): (2, 2), ("Teacher A", 4): (1, 1)}, teachers
+    return "a child with two teachers once; cancelled not counted; the app's spelling of a teacher"
+
+
 for name, fn in [
     ("grade read from class names", t_grades),
     ("Kaplan-Meier by hand", t_kaplan_meier),
@@ -310,6 +333,7 @@ for name, fn in [
     ("too little data", t_too_little_data),
     ("past-schedules store", t_history_store),
     ("app wins over past schedules", t_combine_prefers_app),
+    ("what was taught each month", t_monthly_activity),
 ]:
     check(name, fn)
 

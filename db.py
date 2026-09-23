@@ -13,6 +13,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -222,6 +223,8 @@ class ClassSession(Base):
             "start_time",
             name="uq_class_session_time",
         ),
+        # A teacher's month is how the Schedule, Teachers and Data screens ask.
+        Index("ix_class_sessions_teacher_date", "teacher_id", "session_date"),
     )
 
     id = Column(Integer, primary_key=True)
@@ -249,7 +252,7 @@ class SessionAttendance(Base):
 
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer, ForeignKey("class_sessions.id"), nullable=False)
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
     # Retained for compatibility with schedule imports made before Scheduling.
     status = Column(String(40), nullable=False, default="Attending")
     is_online = Column(Boolean, nullable=False, default=False)
@@ -292,7 +295,7 @@ class Invoice(Base):
     __tablename__ = "invoices"
 
     id = Column(Integer, primary_key=True)
-    student_id = Column(Integer, ForeignKey("students.id"), nullable=False)
+    student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
     status = Column(String(10), nullable=False, default="Open")   # Open | Issued
     invoice_number = Column(Integer, nullable=True)
     issued_on = Column(Date, nullable=True)
@@ -330,7 +333,7 @@ class InvoiceItem(Base):
     # re-uploaded workbook. Detaching keeps the sent invoice printable and
     # leaves nothing pointing at a row that no longer exists. An open
     # invoice's line is deleted outright instead, so it never sees this.
-    session_id = Column(Integer, ForeignKey("class_sessions.id"), nullable=True)
+    session_id = Column(Integer, ForeignKey("class_sessions.id"), nullable=True, index=True)
     # Filled in when the invoice is issued, so the figures stop moving.
     class_name = Column(String(120), nullable=True)
     teacher_name = Column(String(120), nullable=True)
@@ -562,7 +565,11 @@ def _schema_is_current() -> bool:
     and a check that only counted column names would skip it.
     """
     try:
-        reflected = inspect(engine).get_multi_columns()
+        inspector = inspect(engine)
+        reflected = inspector.get_multi_columns()
+        indexed = {
+            index["name"] for indexes in inspector.get_multi_indexes().values() for index in indexes
+        }
     except Exception:
         # Reflection is an optimisation, not the source of truth. If it
         # cannot be done, fall through to the slow, careful path.
@@ -582,6 +589,8 @@ def _schema_is_current() -> bool:
                 return False
             if column.nullable and not found.get("nullable", True):
                 return False
+        if any(index.name not in indexed for index in table.indexes):
+            return False
     return True
 
 
@@ -780,6 +789,14 @@ def initialise_database():
     if count_billed_cancellations():
         backfill_cancellation_credits()
 
+    # create_all() makes a new table's indexes, never an old table's. Without
+    # the one on invoice_items.session_id, asking which lessons are still to
+    # be billed scans every invoice line once per student-lesson: eight
+    # minutes at five times this academy's size, a second and a half with it.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(engine, checkfirst=True)
+
     # Payment moved from per-class ticks onto the invoice. Any invoice whose
     # classes were all ticked under the old scheme was fully paid, so it is
     # recorded as such once rather than reappearing as a debt. A no-op after
@@ -912,8 +929,6 @@ def get_subject_student_grades(class_ids):
     lesson names, since a grade moves up once a school year. A student with
     no graded lesson anywhere is left out.
     """
-    from schedule_parser import grade_of
-
     ids = [int(value) for value in class_ids]
     if not ids:
         return {}
@@ -933,16 +948,28 @@ def get_subject_student_grades(class_ids):
             .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
             .where(SessionAttendance.student_id.in_(students))
         ).all()
+    latest = _latest_grades(lessons)
+    grades: dict[int, list[int]] = {class_id: [] for class_id in ids}
+    for class_id, student_id in on_subject:
+        if student_id in latest:
+            grades[class_id].append(latest[student_id])
+    return grades
+
+
+def _latest_grades(lessons) -> dict[int, int]:
+    """Each student's grade, from the most recent lesson whose name gives one.
+
+    ``lessons`` is ``(student id, class name, date)`` rows. A grade moves up
+    once a school year, so the latest graded lesson is the one that counts.
+    """
+    from schedule_parser import grade_of
+
     latest: dict[int, tuple[date, int]] = {}
     for student_id, class_name, when in lessons:
         grade = grade_of(class_name)
         if grade and (student_id not in latest or as_date(when) > latest[student_id][0]):
             latest[student_id] = (as_date(when), grade)
-    grades: dict[int, list[int]] = {class_id: [] for class_id in ids}
-    for class_id, student_id in on_subject:
-        if student_id in latest:
-            grades[class_id].append(latest[student_id][1])
-    return grades
+    return {student_id: grade for student_id, (_, grade) in latest.items()}
 
 
 def get_teacher_session_counts(year, month):
@@ -1020,10 +1047,18 @@ def _get_or_create_parent(session, name, phone):
     return parent
 
 
-def create_student(full_name, parent_name, parent_phone):
+def create_student(full_name, parent_name="", parent_phone=""):
+    """Add a student, with their parent if both a name and a number are given.
+
+    Family details are optional -- an import knows only the child's name, and
+    they can be filled in later -- but half of a parent is refused rather
+    than stored as one nobody can call.
+    """
     cleaned_name = _fit(full_name, Student.full_name)
     if not cleaned_name:
         return "invalid"
+    if bool((parent_name or "").strip()) != bool((parent_phone or "").strip()):
+        return "parent_unavailable"
 
     with SessionLocal() as session:
         duplicate = session.scalar(
@@ -1034,31 +1069,13 @@ def create_student(full_name, parent_name, parent_phone):
         if duplicate:
             return "duplicate"
 
-        parent = _get_or_create_parent(session, parent_name, parent_phone)
-        if parent is None:
-            return "parent_unavailable"
+        parent = None
+        if (parent_name or "").strip():
+            parent = _get_or_create_parent(session, parent_name, parent_phone)
+            if parent is None:
+                return "parent_unavailable"
 
-        session.add(Student(full_name=cleaned_name, parent_id=parent.id))
-        session.commit()
-        return "created"
-
-
-def create_quick_student(full_name):
-    """Create a student name from Scheduling; family details can be added later."""
-
-    cleaned_name = _fit(full_name, Student.full_name)
-    if not cleaned_name:
-        return "invalid"
-
-    with SessionLocal() as session:
-        duplicate = session.scalar(
-            select(Student).where(
-                func.lower(Student.full_name) == cleaned_name.lower()
-            )
-        )
-        if duplicate:
-            return "duplicate"
-        session.add(Student(full_name=cleaned_name, parent_id=None))
+        session.add(Student(full_name=cleaned_name, parent_id=parent.id if parent else None))
         session.commit()
         return "created"
 
@@ -1249,6 +1266,38 @@ def describe_class_deletion(class_ids):
         return rows
 
 
+def _remove_lesson(session, lesson, reason, rate_index):
+    """Take one lesson off the schedule, settling what it was billed.
+
+    A charge on an invoice still open is simply dropped. One on an invoice
+    already sent is owed back as a credit, rather than rewriting a bill a
+    parent has in their hand; the sent line keeps its figures and loses only
+    its link to a lesson that no longer exists, as do credits that pointed at
+    it. Returns ``(credits raised, open charges dropped)``.
+    """
+    credited = dropped = 0
+    for item in session.scalars(
+        select(InvoiceItem).where(InvoiceItem.session_id == lesson.id)
+    ).all():
+        invoice = session.get(Invoice, item.invoice_id)
+        if invoice is not None and invoice.status == "Issued":
+            credit, raised = _raise_credit(session, invoice.student_id, lesson, reason, rate_index)
+            credit.session_id = None      # the class is about to go
+            item.session_id = None        # ... and so is its line's link
+            credited += int(raised)
+        else:
+            session.delete(item)
+            dropped += invoice is not None
+    for attendance in session.scalars(
+        select(SessionAttendance).where(SessionAttendance.session_id == lesson.id)
+    ).all():
+        session.delete(attendance)
+    for credit in session.scalars(select(Credit).where(Credit.session_id == lesson.id)).all():
+        credit.session_id = None
+    session.delete(lesson)
+    return credited, dropped
+
+
 def delete_class(class_id):
     """Delete a subject and everything hanging off it.
 
@@ -1275,35 +1324,9 @@ def delete_class(class_id):
         if lesson_ids:
             rate_index = _rate_index(session, {class_id})
             for lesson in lessons:
-                for item in session.scalars(
-                    select(InvoiceItem).where(InvoiceItem.session_id == lesson.id)
-                ).all():
-                    invoice = session.get(Invoice, item.invoice_id)
-                    if invoice is None:
-                        session.delete(item)
-                        continue
-                    if invoice.status == "Issued":
-                        credit, raised = _raise_credit(
-                            session, invoice.student_id, lesson,
-                            "Subject removed", rate_index,
-                        )
-                        credit.session_id = None      # the class is about to go
-                        item.session_id = None        # ... and so is its line's link
-                        credited += int(raised)
-                    else:
-                        session.delete(item)
-                        dropped += 1
-                for attendance in session.scalars(
-                    select(SessionAttendance).where(
-                        SessionAttendance.session_id == lesson.id
-                    )
-                ).all():
-                    session.delete(attendance)
-                for credit in session.scalars(
-                    select(Credit).where(Credit.session_id == lesson.id)
-                ).all():
-                    credit.session_id = None
-                session.delete(lesson)
+                raised, gone = _remove_lesson(session, lesson, "Subject removed", rate_index)
+                credited += raised
+                dropped += gone
 
         for enrolment in session.scalars(
             select(Enrolment).where(Enrolment.class_id == class_id)
@@ -2423,7 +2446,7 @@ def find_duplicate_students():
     """
     import difflib
 
-    from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, grade_of, name_sound
+    from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, name_sound
 
     with SessionLocal() as session:
         students = session.execute(select(Student.id, Student.full_name).order_by(Student.id)).all()
@@ -2437,50 +2460,66 @@ def find_duplicate_students():
         ).all()
     sat: dict[int, set] = defaultdict(set)
     teachers: dict[int, set] = defaultdict(set)
-    latest_grade: dict[int, tuple] = {}
-    for student_id, session_id, teacher, class_name, when in lessons:
+    for student_id, session_id, teacher, _, _ in lessons:
         sat[student_id].add(session_id)
         teachers[student_id].add(teacher)
-        grade = grade_of(class_name)
-        if grade and (student_id not in latest_grade or as_date(when) > latest_grade[student_id][0]):
-            latest_grade[student_id] = (as_date(when), grade)
+    latest_grade = _latest_grades((row[0], row[3], row[4]) for row in lessons)
 
     said = {student_id: name_sound(name) for student_id, name in students}
     bare = {student_id: _bare(name) for student_id, name in students}
     tags = {student_id: _suffix(name) for student_id, name in students}
+    names = dict(students)
+    # Comparing everyone with everyone grows with the square of the students
+    # on file, who only ever accumulate: 0.4s at 300, 5s at 1,500. Two names
+    # can only be alike if they share something -- how they sound, a word
+    # ("Lee"), or how the name starts or ends once spaces go ("Kimhana" and
+    # "Kim Hana") -- so only those are compared, and the answer is the same.
+    buckets: dict[str, list[int]] = defaultdict(list)
+    for student_id, name in students:
+        compact = bare[student_id].replace(" ", "")
+        keys = {"sound:" + said[student_id]} if said[student_id] else set()
+        keys |= {"word:" + word for word in bare[student_id].split() if len(word) > 1}
+        keys |= {"start:" + compact[:3], "end:" + compact[-3:]}
+        for key in keys:
+            buckets[key].append(student_id)
+    candidates = sorted({
+        (bucket[i], bucket[j])
+        for bucket in buckets.values()
+        for i in range(len(bucket)) for j in range(i + 1, len(bucket))
+    })
     pairs = []
-    for index, (left_id, left) in enumerate(students):
-        for right_id, right in students[index + 1:]:
-            if (left_id, right_id) in apart:
-                continue
-            if tags[left_id] and tags[right_id] and tags[left_id] != tags[right_id]:
-                continue
-            sound = bool(said[left_id]) and said[left_id] == said[right_id]
-            if sound and sat[left_id] & sat[right_id]:
-                continue
-            matcher = difflib.SequenceMatcher(None, bare[left_id], bare[right_id])
-            # The cheap upper bounds first: most of ~45,000 pairs end there.
-            if not sound and (matcher.real_quick_ratio() < MERGE_THRESHOLD
-                              or matcher.quick_ratio() < MERGE_THRESHOLD):
-                continue
-            ratio = matcher.ratio()
-            if not sound and ratio < MERGE_THRESHOLD:
-                continue
-            if sat[left_id] & sat[right_id]:
-                continue
-            grades = [latest_grade.get(left_id, (None, None))[1], latest_grade.get(right_id, (None, None))[1]]
-            # Two grades apart is two children, however alike the names.
-            if all(grades) and abs(grades[0] - grades[1]) >= 2:
-                continue
-            pairs.append({
-                "ids": [left_id, right_id],
-                "names": [left, right],
-                "reason": "sound" if sound else "spelling",
-                "similarity": round(ratio, 3),
-                "lessons": [len(sat[left_id]), len(sat[right_id])],
-                "teachers": [sorted(teachers[left_id]), sorted(teachers[right_id])],
-                "grades": grades,
-            })
+    for left_id, right_id in candidates:
+        left, right = names[left_id], names[right_id]
+        if (left_id, right_id) in apart:
+            continue
+        if tags[left_id] and tags[right_id] and tags[left_id] != tags[right_id]:
+            continue
+        sound = bool(said[left_id]) and said[left_id] == said[right_id]
+        if sound and sat[left_id] & sat[right_id]:
+            continue
+        matcher = difflib.SequenceMatcher(None, bare[left_id], bare[right_id])
+        # The cheap upper bounds first: most candidates end there.
+        if not sound and (matcher.real_quick_ratio() < MERGE_THRESHOLD
+                          or matcher.quick_ratio() < MERGE_THRESHOLD):
+            continue
+        ratio = matcher.ratio()
+        if not sound and ratio < MERGE_THRESHOLD:
+            continue
+        if sat[left_id] & sat[right_id]:
+            continue
+        grades = [latest_grade.get(left_id), latest_grade.get(right_id)]
+        # Two grades apart is two children, however alike the names.
+        if all(grades) and abs(grades[0] - grades[1]) >= 2:
+            continue
+        pairs.append({
+            "ids": [left_id, right_id],
+            "names": [left, right],
+            "reason": "sound" if sound else "spelling",
+            "similarity": round(ratio, 3),
+            "lessons": [len(sat[left_id]), len(sat[right_id])],
+            "teachers": [sorted(teachers[left_id]), sorted(teachers[right_id])],
+            "grades": grades,
+        })
     pairs.sort(key=lambda pair: (pair["reason"] != "sound", -pair["similarity"]))
     return pairs
 
@@ -3257,17 +3296,22 @@ def get_invoice(invoice_id):
             if invoice.status == "Issued"
             else _open_credit_lines(session, invoice.student_id, charges)
         )
-        return {
-            "ID": invoice.id,
-            "Number": invoice.invoice_number,
-            "Student": student.full_name if student else "",
-            "Parent": parent.name if parent else "",
-            "Phone": parent.phone if parent else "",
-            "Status": invoice.status,
-            "Issued": invoice.issued_on,
-            "Lines": lines,
-            "Total": round(sum(line["Amount"] for line in lines), 2),
-        }
+        return _invoice_record(invoice, student, parent, lines)
+
+
+def _invoice_record(invoice, student, parent, lines):
+    """One invoice as the screens and the printable copy read it."""
+    return {
+        "ID": invoice.id,
+        "Number": invoice.invoice_number,
+        "Student": student.full_name if student else "",
+        "Parent": parent.name if parent else "",
+        "Phone": parent.phone if parent else "",
+        "Status": invoice.status,
+        "Issued": invoice.issued_on,
+        "Lines": lines,
+        "Total": round(sum(line["Amount"] for line in lines), 2),
+    }
 
 
 def get_invoices_detailed(invoice_ids):
@@ -3364,19 +3408,7 @@ def get_invoices_detailed(invoice_ids):
                 charges = round(sum(line["Amount"] for line in lines), 2)
                 lines += _open_credit_lines(session, invoice.student_id, charges)
 
-            detailed.append(
-                {
-                    "ID": invoice.id,
-                    "Number": invoice.invoice_number,
-                    "Student": student.full_name if student else "",
-                    "Parent": parent.name if parent else "",
-                    "Phone": parent.phone if parent else "",
-                    "Status": invoice.status,
-                    "Issued": invoice.issued_on,
-                    "Lines": lines,
-                    "Total": round(sum(line["Amount"] for line in lines), 2),
-                }
-            )
+            detailed.append(_invoice_record(invoice, student, parent, lines))
         return detailed
 
 
@@ -3695,36 +3727,10 @@ def remove_lessons_not_in(teacher_id, periods, keep_slots, class_ids):
                 continue
             rate_index = _rate_index(session, {lesson.class_id for lesson in stale})
             for lesson in stale:
-                items = session.scalars(
-                    select(InvoiceItem).where(InvoiceItem.session_id == lesson.id)
-                ).all()
-                for item in items:
-                    invoice = session.get(Invoice, item.invoice_id)
-                    if invoice is None:
-                        continue
-                    if invoice.status == "Issued":
-                        # Already asked for; owe it back rather than
-                        # rewriting an invoice that has gone out.
-                        credit, raised = _raise_credit(
-                            session, invoice.student_id, lesson,
-                            "Class removed from the schedule", rate_index,
-                        )
-                        credit.session_id = None      # the class is about to go
-                        item.session_id = None        # ... and so is its line's link
-                        credited += int(raised)
-                    else:
-                        session.delete(item)
-                for attendance in session.scalars(
-                    select(SessionAttendance).where(
-                        SessionAttendance.session_id == lesson.id
-                    )
-                ).all():
-                    session.delete(attendance)
-                for credit in session.scalars(
-                    select(Credit).where(Credit.session_id == lesson.id)
-                ).all():
-                    credit.session_id = None
-                session.delete(lesson)
+                raised, _ = _remove_lesson(
+                    session, lesson, "Class removed from the schedule", rate_index
+                )
+                credited += raised
                 removed += 1
         session.commit()
     return {"lessons_removed": removed, "credits_raised": credited}
@@ -4858,14 +4864,14 @@ def get_analysis_lessons(today=None):
         "app": [
             {"teacher": teacher, "class_name": class_name, "date": as_date(when),
              "start": start, "end": end, "student": student,
-             "status": _lesson_condition(online, recording, cancelled)}
+             "status": _lesson_condition(online, recording, cancelled), "source": "app"}
             for teacher, class_name, when, start, end, student, online, recording, cancelled
             in app_rows
         ],
         "history": [
             {"teacher": teacher, "class_name": class_name, "date": as_date(when),
              "start": start, "end": end, "student": known_as.get(_alias_key(student), student),
-             "status": status}
+             "status": status, "source": "history"}
             for teacher, class_name, when, start, end, student, status in history_rows
         ],
     }

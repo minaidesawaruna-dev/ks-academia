@@ -1434,6 +1434,14 @@ def teachers_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _two_children(dates: list[dt.date]) -> None:
+    st.warning(
+        "They sat the same class on "
+        + ", ".join(f"{day:%d %b %Y}" for day in dates[:3])
+        + " — one child can't be in a class twice, so these are two children."
+    )
+
+
 def _merge_students_section(all_students: list[dict]) -> None:
     """Two records of one child -- spelled two ways by two teachers -- made one.
 
@@ -1463,11 +1471,7 @@ def _merge_students_section(all_students: list[dict]) -> None:
             )
             _rerun()
         elif result["status"] == "share_a_lesson":
-            st.warning(
-                "They sat the same class on "
-                + ", ".join(f"{day:%d %b %Y}" for day in result["dates"][:3])
-                + " — one child can't be in a class twice, so these are two children."
-            )
+            _two_children(result["dates"])
         else:
             st.warning("One of them is no longer on file — refresh the page.")
 
@@ -1511,11 +1515,7 @@ def _merge_students_section(all_students: list[dict]) -> None:
     if keep and drop:
         preview = db.merge_students(keep, drop, dry_run=True)
         if preview["status"] == "share_a_lesson":
-            st.warning(
-                "They sat the same class on "
-                + ", ".join(f"{day:%d %b %Y}" for day in preview["dates"][:3])
-                + " — one child can't be in a class twice, so these are two children."
-            )
+            _two_children(preview["dates"])
         elif preview["status"] == "would_merge":
             st.caption(
                 f"{names[drop]}'s {preview['lessons']} class(es), {preview['invoices']} invoice(s) sent "
@@ -1557,12 +1557,7 @@ def students_tab() -> None:
         if st.form_submit_button("Add student", type="primary"):
             # A parent needs both halves to be stored at all, so half of one
             # is a slip to point out rather than quietly drop on the floor.
-            if bool(parent.strip()) != bool(phone.strip()):
-                outcome = "parent_unavailable"
-            elif parent.strip():
-                outcome = db.create_student(name[:120], parent[:120], phone[:40])
-            else:
-                outcome = db.create_quick_student(name[:120])
+            outcome = db.create_student(name[:120], parent[:120], phone[:40])
             if outcome == "created":
                 _flash(f"Added {name.strip()}.")
                 _rerun()
@@ -3739,6 +3734,184 @@ def _history_view() -> None:
 _COMPARE_MAX = 8
 
 
+def _name_list(names: list[str], most: int = 6) -> str:
+    """"A, B and C", or "A, B, C and 4 more" past ``most``."""
+    names = list(names)
+    if len(names) > most:
+        return ", ".join(names[:most]) + f" and {len(names) - most} more"
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
+    """Up to eight teachers to draw side by side; the top of ``ranked`` to start with.
+
+    Picks from another year or month can name a teacher not on this list,
+    which the widget refuses; only the ones it can still show are kept. And
+    Streamlit forgets a widget's value on any run it isn't drawn -- a year
+    with nothing recorded -- so a copy is kept to come back to.
+    """
+    kept = st.session_state.get(key, st.session_state.get(f"_{key}_kept"))
+    st.session_state[key] = (
+        [name for name in kept if name in names] if kept is not None else ranked[:_COMPARE_MAX]
+    )
+    picked = st.multiselect(
+        "Compare teachers",
+        options=names,
+        key=key,
+        max_selections=_COMPARE_MAX,
+        placeholder="Pick teachers to compare",
+        help=f"Up to {_COMPARE_MAX} at a time, so each keeps its own colour.",
+    )
+    st.session_state[f"_{key}_kept"] = picked
+    return picked
+
+
+@st.cache_data(show_spinner="Reading every lesson…", max_entries=4)
+def _teaching_activity(version: tuple, today: dt.date) -> dict:
+    """Students, lessons and hours by month, for one state of the lessons on record."""
+    sources = db.get_analysis_lessons(today)
+    lessons, _ = retention.combine(sources["app"], sources["history"])
+    return retention.monthly_activity(lessons)
+
+
+_TEACHING_MEASURES = {"Students": "Students taught", "Hours": "Teaching hours", "Lessons": "Lessons"}
+
+
+def _teaching_view() -> None:
+    """What the academy taught, month by month and teacher by teacher.
+
+    The Invoiced view can only show money billed through the app, and most
+    teachers came onto it in September 2026 -- before that it is two
+    teachers' takings. The lessons themselves are on record for everyone,
+    from the Schedule and from past schedules, so how many students were
+    taught, and for how many hours, is known for every month.
+    """
+    st.caption(
+        "Every lesson taught — from the Schedule and from Past schedules — so months "
+        "billed outside the app count too. Money is under Invoiced."
+    )
+    year, month = _month_picker("data_month")
+    today = dt.date.today()
+    label = f"{calendar.month_name[month]} {year}"
+    activity = _teaching_activity(db.get_analysis_data_version(), today)
+    months = [row for row in activity["by_month"] if row["Year"] == year and row["Month"] <= month]
+    if not months:
+        st.info(f"No lessons on record in {year} up to the end of {label}.")
+        return
+
+    # The month picked, against the one before it -- unless the month isn't
+    # over yet, when half a month beside a whole one says nothing.
+    so_far = (year, month) == (today.year, today.month)
+    before = (year, month - 1) if month > 1 else (year - 1, 12)
+    by_month = {(row["Year"], row["Month"]): row for row in activity["by_month"]}
+    current, previous = by_month.get((year, month)), by_month.get(before)
+    # Teachers' records begin at different times -- four of the biggest only
+    # in January 2026 -- and a month where some begin isn't comparable with
+    # the one before: the jump is records, not students.
+    first_on_record: dict[str, tuple[int, int]] = {}
+    for row in activity["by_teacher"]:
+        key = (row["Year"], row["Month"])
+        if row["Teacher"] not in first_on_record or key < first_on_record[row["Teacher"]]:
+            first_on_record[row["Teacher"]] = key
+    beginning = sorted(t for t, first in first_on_record.items() if first == (year, month))
+    st.markdown(f"#### {label}" + (f" — up to {today:%d %b}" if so_far else ""))
+    if current is None:
+        st.caption(f"No lessons on record in {label}.")
+    else:
+        columns = st.columns(4)
+        for column, key, text in zip(columns, ["Students", "Lessons", "Hours", "Teachers"],
+                                     ["Students taught", "Lessons", "Teaching hours", "Teachers"]):
+            value = current[key]
+            delta = None
+            if previous and not so_far and not beginning:
+                change = value - previous[key]
+                delta = f"{change:+,.0f} on {calendar.month_abbr[before[1]]}"
+            column.metric(text, f"{value:,.0f}", delta=delta)
+        if beginning and previous:
+            st.caption(
+                f"Not compared with {calendar.month_abbr[before[1]]}: records for "
+                + _name_list(beginning) + f" begin in {calendar.month_abbr[month]}."
+            )
+
+    order = [calendar.month_abbr[m] for m in range(1, month + 1)]
+    frame = pd.DataFrame(months)
+    frame["Month name"] = frame["Month"].map(lambda m: calendar.month_abbr[m])
+    st.markdown(f"#### Students taught each month — {year}")
+    st.altair_chart(
+        alt.Chart(frame)
+        .mark_bar(color="#2a78d6")
+        .encode(
+            x=alt.X("Month name:N", sort=order, title=None),
+            y=alt.Y("Students:Q", title="Students"),
+            tooltip=[alt.Tooltip("Month name:N", title="Month"), "Students:Q", "Lessons:Q",
+                     alt.Tooltip("Hours:Q", title="Teaching hours", format=",.1f"), "Teachers:Q"],
+        )
+        .properties(height=240),
+        width="stretch",
+    )
+    starts = sorted(
+        ((first[1], t) for t, first in first_on_record.items()
+         if first[0] == year and 1 < first[1] <= month),
+    )
+    later = sorted(t for t, first in first_on_record.items() if first > (year, month))
+    st.caption(
+        "A child with two teachers counts once; a student marked cancelled isn't counted. "
+        + (f"{calendar.month_abbr[month]} is so far. " if so_far else "")
+        + ("Records start partway through the year for "
+           + _name_list([f"{t} ({calendar.month_abbr[m]})" for m, t in starts])
+           + " — a rise in those months is partly their records beginning. " if starts else "")
+        + (f"Records for {_name_list(later)} begin after {label}, so they aren't here yet."
+           if later else "")
+    )
+
+    teachers = pd.DataFrame(
+        [row for row in activity["by_teacher"] if row["Year"] == year and row["Month"] <= month]
+    )
+    teachers["Month name"] = teachers["Month"].map(lambda m: calendar.month_abbr[m])
+    measure = st.radio("Compare by", list(_TEACHING_MEASURES), horizontal=True, key="teach_measure")
+    this_month = teachers[teachers["Month"] == month].sort_values(measure, ascending=False)
+    ranked = list(this_month["Teacher"]) or list(
+        teachers.groupby("Teacher")[measure].sum().sort_values(ascending=False).index)
+    names = sorted(teachers["Teacher"].unique(), key=str.casefold)
+    picked = _compare_picker("teach_compare", names, ranked)
+    if picked:
+        st.altair_chart(
+            alt.Chart(teachers[teachers["Teacher"].isin(picked)])
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("Month name:N", sort=order, title=None),
+                y=alt.Y(f"{measure}:Q", title=_TEACHING_MEASURES[measure]),
+                color=alt.Color("Teacher:N", sort=picked, legend=alt.Legend(
+                    title=None, orient="bottom", columns=4, labelLimit=0)),
+                tooltip=["Teacher:N", alt.Tooltip("Month name:N", title="Month"), "Students:Q",
+                         "Lessons:Q", alt.Tooltip("Hours:Q", title="Teaching hours", format=",.1f")],
+            )
+            .properties(height=260),
+            width="stretch",
+        )
+
+    if not this_month.empty:
+        last = teachers[(teachers["Year"] == before[0]) & (teachers["Month"] == before[1])] \
+            if before[0] == year else pd.DataFrame(
+                [row for row in activity["by_teacher"] if (row["Year"], row["Month"]) == before])
+        last_students = dict(zip(last["Teacher"], last["Students"])) if not last.empty else {}
+        st.markdown(f"#### Each teacher in {label}")
+        st.dataframe(
+            [
+                {
+                    "Teacher": row.Teacher,
+                    "Students": int(row.Students),
+                    "Lessons": int(row.Lessons),
+                    "Teaching hours": round(float(row.Hours), 1),
+                    f"Students in {calendar.month_abbr[before[1]]}": last_students.get(row.Teacher, 0),
+                }
+                for row in this_month.sort_values("Students", ascending=False).itertuples()
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+
+
 def _per_hour(invoiced: float, hours: float) -> str:
     return f"${invoiced / hours:,.0f}" if hours else "—"
 
@@ -3751,11 +3924,14 @@ def data_tab() -> None:
     st.subheader("Data")
     view = st.radio(
         "View",
-        ["Invoiced", "Student retention", "Past schedules"],
+        ["Teaching", "Invoiced", "Student retention", "Past schedules"],
         horizontal=True,
         key="data_view",
         label_visibility="collapsed",
     )
+    if view == "Teaching":
+        _teaching_view()
+        return
     if view == "Student retention":
         _retention_view()
         return
@@ -3813,11 +3989,7 @@ def data_tab() -> None:
         first_full = int(per_month[per_month == full].index.min())
         earlier = sorted(set(active.loc[active["Month"] < first_full, "Teacher"]), key=str.casefold)
         if earlier and len(earlier) * 2 <= full:
-            who = (
-                f"{len(earlier)} teachers" if len(earlier) > 3
-                else " and ".join([", ".join(earlier[:-1]), earlier[-1]]) if len(earlier) > 1
-                else earlier[0]
-            )
+            who = f"{len(earlier)} teachers" if len(earlier) > 3 else _name_list(earlier)
             st.caption(
                 f"Before {calendar.month_name[first_full]} only {who} "
                 f"{'was' if len(earlier) == 1 else 'were'} billed through the app, so earlier "
@@ -3836,24 +4008,7 @@ def data_tab() -> None:
     by_teacher = frame.groupby("Teacher")["Month total"].sum().sort_values(ascending=False)
     names = sorted(by_teacher.index, key=str.casefold)
     earning = [name for name, total in by_teacher.items() if total > 0]
-    # Picks from another year or month can name a teacher not on this list,
-    # which the widget refuses; keep only the ones it can still show. And
-    # Streamlit forgets a widget's value on any run it isn't drawn -- a year
-    # with nothing recorded -- so a copy is kept to come back to.
-    kept = st.session_state.get("data_compare", st.session_state.get("_data_compare_kept"))
-    st.session_state["data_compare"] = (
-        [name for name in kept if name in names] if kept is not None
-        else earning[:_COMPARE_MAX]
-    )
-    picked = st.multiselect(
-        "Compare teachers",
-        options=names,
-        key="data_compare",
-        max_selections=_COMPARE_MAX,
-        placeholder="Pick teachers to compare",
-        help=f"Up to {_COMPARE_MAX} at a time, so each keeps its own colour.",
-    )
-    st.session_state["_data_compare_kept"] = picked
+    picked = _compare_picker("data_compare", names, earning)
     if picked:
         st.altair_chart(
             alt.Chart(frame[frame["Teacher"].isin(picked)])

@@ -30,8 +30,8 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, SENIOR_RATE, _bare, _suffix, name_sound,
-    standard_rate,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _suffix, name_sound, rate_for_grade,
+    standard_rate, without_brackets,
 )
 
 __all__ = [
@@ -157,10 +157,6 @@ def suggest_class_renames(
     return collisions
 
 
-def _grade_rate(grade: int) -> float:
-    return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
-
-
 def grades_text(grades: list[int]) -> str:
     """[9, 10] -> "Grades 9–10"; [9, 11] -> "Grades 9 and 11"; [12] -> "Grade 12"."""
     if len(grades) == 1:
@@ -193,7 +189,7 @@ def price_rule(subjects: list[dict], rates: list[dict] | None = None) -> dict[in
     for item in subjects:
         named = standard_rate(item["Class"])
         grades = sorted(set(student_grades.get(item["Class ID"], [])))
-        bands = {_grade_rate(grade) for grade in grades}
+        bands = {rate_for_grade(grade) for grade in grades}
         own = chosen.get(item["Class ID"])
         if named:
             rule[item["Class ID"]] = (named, "", True)
@@ -338,7 +334,7 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                         and not GRADE_TAG.match(best["tag"]) and bare_names[bare_new] == 1)
             # A given name alone -- "Yuna" in one workbook, "Yoona" on file
             # -- is too common a name to settle it without asking.
-            full_names = all(len(re.findall(r"[A-Za-z]+", re.sub(r"[\(\[][^\)\]]*[\)\]]", " ", n))) >= 2
+            full_names = all(len(re.findall(r"[A-Za-z]+", without_brackets(n))) >= 2
                              for n in (name, best["existing_name"]))
             best["likely_same"] = (
                 (best["reason"] == "grade" and grade_matches == 1)
@@ -506,7 +502,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
                 name_to_id[key] = student_matches[key]
                 confirmed.append((student_matches[key], entry["student_name"]))
                 continue
-            if db.create_quick_student(entry["student_name"]) == "created":
+            if db.create_student(entry["student_name"]) == "created":
                 created["students"] += 1
             new_id = db.get_student_id_by_name(entry["student_name"])
             if new_id is not None:

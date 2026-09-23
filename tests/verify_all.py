@@ -550,7 +550,7 @@ def t_long_names_fit_their_columns():
         "long_name = 'Very Long Name ' * 60;"
         "db.initialise_database();"
         "assert db.create_teacher(long_name) is True;"
-        "assert db.create_quick_student(long_name) == 'created';"
+        "assert db.create_student(long_name) == 'created';"
         "teacher = db.get_all_teachers()[0];"
         "student = db.get_all_students()[0];"
         "outcome = db.create_class_and_first_session("
@@ -866,6 +866,43 @@ def t_merge_and_name():
     return "merged whole, remembered next month; unnamed subject named on its sent lines too"
 
 
+_INDEX_SCRIPT = '''
+import json, sqlite3, sys, db
+from sqlalchemy import inspect
+db.initialise_database()
+path = db.engine.url.database
+db.engine.dispose()
+# An older database: the same tables, without the indexes added since.
+con = sqlite3.connect(path)
+dropped = [name for (name,) in con.execute(
+    "select name from sqlite_master where type = 'index' and name like 'ix_%'")]
+for name in dropped:
+    con.execute(f"drop index {name}")
+con.commit(); con.close()
+before = db._schema_is_current()
+db.initialise_database()
+after = sorted(i["name"] for v in inspect(db.engine).get_multi_indexes().values() for i in v
+               if i["name"].startswith("ix_"))
+print(json.dumps({"dropped": sorted(dropped), "before": before, "after": after,
+                  "current": db._schema_is_current()}))
+'''
+
+
+def t_missing_indexes_added():
+    """A database from before the indexes gets them on the next start, and only once."""
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "index.db").replace("\\", "/")
+        result = run(["-c", _INDEX_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert len(got["dropped"]) == 4 and got["before"] is False, got
+    assert got["after"] == got["dropped"] and got["current"] is True, got
+    return f"{len(got['after'])} indexes restored on start; the check then passes"
+
+
 _CREDIT_SCRIPT = '''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -1097,6 +1134,7 @@ for name, fn in [
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
+    ("missing indexes added", t_missing_indexes_added),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

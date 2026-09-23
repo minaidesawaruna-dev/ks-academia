@@ -104,6 +104,69 @@ def combine(app_lessons: list[dict], history_lessons: list[dict]) -> tuple[list[
     }
 
 
+def monthly_activity(lessons: list[dict]) -> dict[str, list[dict[str, Any]]]:
+    """What was taught each month: students, lessons and teaching hours.
+
+    From every lesson on record -- the app's and past schedules alike -- so a
+    month billed outside the app still counts. A student marked cancelled
+    didn't come and isn't counted; a lesson nobody came to isn't either. A
+    lesson's hours are the teacher's time, counted once however many came.
+    A child taught by two teachers is one student in the academy's month and
+    one in each teacher's. Past schedules name a teacher as the workbook did
+    ("Jason"); they're matched to the app's spelling of the same teacher.
+
+    Returns ``{"by_month": [...], "by_teacher": [...]}``, one row per month,
+    and per teacher per month.
+    """
+    spelling = {row["teacher"].casefold(): row["teacher"] for row in lessons}
+    for row in lessons:
+        if row.get("source") == "app":
+            spelling[row["teacher"].casefold()] = row["teacher"]
+    taught: dict[tuple, dict] = {}
+    students: dict[tuple, set] = defaultdict(set)
+    academy: dict[tuple, set] = defaultdict(set)
+    for row in lessons:
+        if row.get("status") == CANCELLED:
+            continue
+        student = normalise_name(row["student"])
+        if not student:
+            continue
+        teacher = spelling[row["teacher"].casefold()]
+        month = (row["date"].year, row["date"].month)
+        lesson = (teacher, row["date"], row["start"])
+        if lesson not in taught:
+            start = row["start"].hour * 60 + row["start"].minute
+            end = row["end"].hour * 60 + row["end"].minute
+            taught[lesson] = {"month": month, "hours": max(0, end - start) / 60}
+        students[(teacher, month)].add(student)
+        academy[month].add(student)
+
+    by_teacher: dict[tuple, dict] = {}
+    for (teacher, _, _), lesson in taught.items():
+        row = by_teacher.setdefault((teacher, lesson["month"]), {
+            "Teacher": teacher, "Year": lesson["month"][0], "Month": lesson["month"][1],
+            "Students": len(students[(teacher, lesson["month"])]), "Lessons": 0, "Hours": 0.0,
+        })
+        row["Lessons"] += 1
+        row["Hours"] += lesson["hours"]
+    by_month: dict[tuple, dict] = {}
+    for (teacher, month), row in by_teacher.items():
+        total = by_month.setdefault(month, {
+            "Year": month[0], "Month": month[1], "Students": len(academy[month]),
+            "Lessons": 0, "Hours": 0.0, "Teachers": 0,
+        })
+        total["Lessons"] += row["Lessons"]
+        total["Hours"] += row["Hours"]
+        total["Teachers"] += 1
+    for row in list(by_teacher.values()) + list(by_month.values()):
+        row["Hours"] = round(row["Hours"], 2)
+    return {
+        "by_month": sorted(by_month.values(), key=lambda r: (r["Year"], r["Month"])),
+        "by_teacher": sorted(by_teacher.values(),
+                             key=lambda r: (r["Year"], r["Month"], r["Teacher"].casefold())),
+    }
+
+
 def student_months(lessons: list[dict], today: dt.date) -> list[dict[str, Any]]:
     """One row per student per month they came, with what followed.
 
