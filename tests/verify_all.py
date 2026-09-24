@@ -903,6 +903,74 @@ def t_missing_indexes_added():
     return f"{len(got['after'])} indexes restored on start; the check then passes"
 
 
+_SAME_NAME_SCRIPT = '''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A"); db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, names):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+# Two girls called Hana, one in each of Teacher A's classes.
+db.create_student("Hana"); db.create_student("Nam Jihoon")
+from sqlalchemy import select, func
+with db.SessionLocal() as s:
+    s.add(db.Student(full_name="Hana")); s.commit()
+first, second = [st["ID"] for st in db.get_all_students() if st["Name"] == "Hana"]
+sessions = [lesson(1, "G9 Hana Math", ["Hana", "Nam Jihoon"]), lesson(2, "G9 Hana Eng", ["Hana"])]
+sb.backfill({"sessions": sessions, "name_reviews": []}, ids["Teacher A"])
+def who(subject):
+    with db.SessionLocal() as s:
+        return sorted(s.scalars(select(db.SessionAttendance.student_id).join(db.ClassSession,
+            db.ClassSession.id == db.SessionAttendance.session_id).join(db.AcademyClass,
+            db.AcademyClass.id == db.ClassSession.class_id).where(db.AcademyClass.name == subject)).all())
+# One Hana in each class, as the admin sorted them out.
+with db.SessionLocal() as s:
+    for subject, hana in (("G9 Hana Math", first), ("G9 Hana Eng", second)):
+        for row in s.scalars(select(db.SessionAttendance).join(db.ClassSession, db.ClassSession.id == db.SessionAttendance.session_id)
+                .join(db.AcademyClass, db.AcademyClass.id == db.ClassSession.class_id)
+                .where(db.AcademyClass.name == subject, db.SessionAttendance.student_id.in_([first, second]))).all():
+            row.student_id = hana
+    s.commit()
+before = {"math": who("G9 Hana Math"), "eng": who("G9 Hana Eng")}
+# Uploading again must keep each Hana in her own class.
+sb.backfill({"sessions": [dict(x) for x in sessions], "name_reviews": []}, ids["Teacher A"])
+after = {"math": who("G9 Hana Math"), "eng": who("G9 Hana Eng")}
+with db.SessionLocal() as s:
+    credits = s.scalar(select(func.count()).select_from(db.Credit))
+# Two spellings merged inside a workbook keep the one on file.
+db.create_student("Bae Sujin")
+preview = {"sessions": [lesson(8, "G12 Test", ["Bae soojin"]), lesson(15, "G12 Test", ["Bae soojin"]),
+                        lesson(22, "G12 Test", ["Bae Sujin"])],
+           "name_reviews": [{"names": ["Bae Sujin", "Bae soojin"], "counts": [1, 2]}]}
+sb.apply_review_decisions(preview, {0: "merge"})
+spelled = sorted({a["student_name"] for x in preview["sessions"] for a in x["attendance"]})
+print(json.dumps({"first": first, "second": second, "before": before, "after": after,
+                  "credits": credits, "spelled": spelled}))
+'''
+
+
+def t_same_name_students():
+    """Two students of one name stay in their own classes; a merge keeps the name on file."""
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "same.db").replace("\\", "/")
+        result = run(["-c", _SAME_NAME_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["before"] == got["after"], f"re-upload moved a Hana: {got['before']} -> {got['after']}"
+    assert got["first"] in got["after"]["math"] and got["second"] not in got["after"]["math"], got
+    assert got["second"] in got["after"]["eng"] and got["first"] not in got["after"]["eng"], got
+    assert got["credits"] == 0, got
+    assert got["spelled"] == ["Bae Sujin"], got["spelled"]
+    return "each Hana kept in her class on re-upload; 'Bae soojin' merged into the name on file"
+
+
 _CREDIT_SCRIPT = '''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -1135,6 +1203,7 @@ for name, fn in [
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
     ("missing indexes added", t_missing_indexes_added),
+    ("students with the same name", t_same_name_students),
     ("Korean text survives into PDF", t_korean_pdf),
     ("real Korean student renders", t_korean_real_student),
     ("image render unchanged", t_png_unchanged),

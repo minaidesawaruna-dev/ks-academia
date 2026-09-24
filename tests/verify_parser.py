@@ -626,6 +626,59 @@ def t_grade_tag_is_not_a_nickname():
     return "'Nam Jihoon(G9)' and a lone 'Yuna' are asked about, never pre-matched"
 
 
+def t_notes_typed_onto_names():
+    # A note on the student's line is the student plus a note -- each of these
+    # made a new student out of the note.
+    for line, want in {
+        "(5pm-7pm KR) Nam Jihoon": ("Nam Jihoon", "5pm-7pm KR"),
+        "Oh Minseok(1시간)": ("Oh Minseok", "1시간"),
+        "Seo Yerin(13일보강)": ("Seo Yerin", "13일보강"),
+        "Park Hana 보강": ("Park Hana", "보강"),
+        "Choi Doyun(시간잘못보고옴)": ("Choi Doyun", "시간잘못보고옴"),
+    }.items():
+        got = sp._roster_names(line, [])
+        assert [(n, note) for n, note, _ in got] == [want], (line, got)
+    # A tag that tells children apart stays on the name.
+    for line in ("Nam Jihoon(G9 UWC D)", "Oh Minseok(G7)", "Seo Yerin(Emma)", "Park Hana(A)", "Hana(하나)"):
+        assert [n for n, _, _ in sp._roster_names(line, [])] == [line], line
+    return "'(5pm-7pm KR) Nam Jihoon' is Nam Jihoon with a note; '(G9 UWC D)' stays a tag"
+
+
+def t_name_written_in_hangul():
+    assert sp.hangul_fit("다혜", "Dahye") == 1 and sp.hangul_fit("강다혜", "Kang Dahye") == 2
+    assert sp.hangul_fit("다혜", "Jiwoo") == 0 and sp.hangul_fit("다혜", "다혜") == 0
+    def session(anchor, names):
+        return {"coordinate": anchor, "attendance": [{"student_name": n, "source": anchor} for n in names]}
+    reviews = sp.canonicalise_names([session("B3", ["Dahye", "Seo Yerin"]), session("C3", ["다혜", "Seo Yerin"])])["reviews"]
+    found = {tuple(r["names"]): r["likely_same"] for r in reviews}
+    assert found.get(("Dahye", "다혜")) is True, found
+    # Fitting two English names in the workbook, it is asked about, not assumed.
+    two = sp.canonicalise_names([session("B3", ["Dahye"]), session("C3", ["Kang Dahye"]), session("D3", ["다혜"])])["reviews"]
+    assert all(r["likely_same"] is False for r in two if "다혜" in r["names"]), two
+    # Suggested against students on file, the same way.
+    found = _suggested({1: "Dahye", 2: "Seo Yerin"}, ["다혜"])
+    assert found == {"다혜": (1, True)}, found
+    found = _suggested({1: "Dahye", 2: "Kang Dahye"}, ["다혜"])
+    assert set(found) == {"다혜"} and found["다혜"][1] is False, found
+    return "'다혜' found as 'Dahye' in the workbook and on file; asked when it fits two"
+
+
+def t_typo_in_one_class():
+    def session(anchor, cls, names):
+        return {"coordinate": anchor, "class_name": cls,
+                "attendance": [{"student_name": n, "source": anchor} for n in names]}
+    reviews = sp.canonicalise_names([
+        session("B3", "G12 Econs A", ["Nam Jihoon", "Seo Yerin"]),
+        session("B9", "G12 Econs A", ["Nam Jihon", "Seo Yerin"]),       # same seat, typed wrong
+        session("C3", "G12 Econs B", ["Park Hana"]),
+        session("C9", "G11 Econs", ["Park Haena"]),                     # other class: asked
+    ])["reviews"]
+    found = {tuple(r["names"]): r["likely_same"] for r in reviews}
+    assert found.get(("Nam Jihon", "Nam Jihoon")) is True, found
+    assert found.get(("Park Haena", "Park Hana")) is False, found
+    return "a typo in the same class starts on merge; in another class it is asked"
+
+
 def t_sound_alike_reviews():
     def session(anchor, names):
         return {"coordinate": anchor, "attendance": [
@@ -779,6 +832,9 @@ for name, fn in [
     ("sound-alike names in one workbook", t_sound_alike_reviews),
     ("absence written on the name", t_absence_written_on_the_name),
     ("grade tag is not a nickname", t_grade_tag_is_not_a_nickname),
+    ("notes typed onto names", t_notes_typed_onto_names),
+    ("a name written in Hangul", t_name_written_in_hangul),
+    ("a typo in one class", t_typo_in_one_class),
     ("month ranges in sheet names", t_month_ranges_in_names),
     ("month labels read, notes ignored", t_month_labels),
     ("whole-year sheet by its labels", t_whole_year_sheet),

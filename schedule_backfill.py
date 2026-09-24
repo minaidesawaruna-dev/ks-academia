@@ -30,8 +30,8 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _suffix, name_sound, rate_for_grade,
-    standard_rate, without_brackets,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _suffix, hangul_fit, name_sound,
+    rate_for_grade, standard_rate, without_brackets,
 )
 
 __all__ = [
@@ -64,11 +64,24 @@ def apply_review_decisions(
     session's attendance. Mutates and returns ``preview["sessions"]``.
     """
     renames: dict[str, str] = {}
-    for index, review in enumerate(preview.get("name_reviews") or []):
+    reviews = preview.get("name_reviews") or []
+    # The spelling already on file wins, so the child stays the child on file:
+    # a teacher writing "Bae soojin" most weeks and "Bae Sujin" (on file)
+    # once made the merge land on the new spelling -- a second student.
+    known = (
+        {item["Name"].casefold() for item in db.get_all_students()} | set(db.get_student_aliases())
+        if any(decisions.get(index) == "merge" for index in range(len(reviews))) else set()
+    )
+    for index, review in enumerate(reviews):
         if decisions.get(index) != "merge":
             continue
         names, counts = review["names"], review["counts"]
-        winner, loser = (names[0], names[1]) if counts[0] >= counts[1] else (names[1], names[0])
+        on_file = [name for name in names if name.casefold() in known]
+        if len(on_file) == 1:
+            winner = on_file[0]
+            loser = names[1] if winner == names[0] else names[0]
+        else:
+            winner, loser = (names[0], names[1]) if counts[0] >= counts[1] else (names[1], names[0])
         renames[loser.casefold()] = winner
         # Kept for the import to remember: next month's workbook will spell
         # the child both ways again, and shouldn't need asking.
@@ -314,6 +327,18 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                     "tag": _suffix(name) or None,
                     "existing_tag": _suffix(said_same["Name"]) or None,
                 }
+        # Written in Hangul -- "다혜" for the "Dahye" on file. Taken for her when
+        # she is the only student it fits; asked about when several do.
+        fits = [item for item in existing if best is None and hangul_fit(name, item["Name"])]
+        if fits:
+            top = max(fits, key=lambda item: hangul_fit(name, item["Name"]))
+            best = {
+                "parsed_name": name, "existing_name": top["Name"], "existing_id": top["ID"],
+                "similarity": 0.0, "reason": "hangul", "tag": None, "existing_tag": None,
+                "likely_same": len(fits) == 1,
+            }
+            candidates.append(best)
+            continue
         if best:
             # Spelled differently but said the same -- Jaaemin and Jaemin, Kyubin
             # and Gyubin -- and by nobody else on file: the same child, so
@@ -487,8 +512,19 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     student_matches = student_matches or {}
     # A spelling already known to be a student on file -- merged into them,
     # or confirmed at an earlier import -- is them; their own name wins.
+    students_on_file = db.get_all_students()
     name_to_id = {**db.get_student_aliases(),
-                  **{item["Name"].casefold(): item["ID"] for item in db.get_all_students()}}
+                  **{item["Name"].casefold(): item["ID"] for item in students_on_file}}
+    # Two students with exactly one name -- two girls called Suhyun -- can't
+    # be told apart by the name, so which class they're in decides: the one
+    # already in that class, else the one this teacher teaches. Picking one
+    # for every class moved a child's month onto the other girl.
+    same_name: dict[str, list[int]] = defaultdict(list)
+    for item in students_on_file:
+        same_name[item["Name"].casefold()].append(item["ID"])
+    same_name = {name: ids for name, ids in same_name.items() if len(ids) > 1}
+    rosters = db.get_teacher_rosters(teacher_id) if same_name else {}
+    taught = set().union(*rosters.values()) if rosters else set()
     confirmed = []
     for session in sessions:
         for entry in session["attendance"]:
@@ -532,13 +568,22 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     for index, (class_name, class_sessions) in enumerate(sorted(by_class.items())):
         class_sessions.sort(key=lambda item: (item["date"], item["start_time"]))
         class_id = existing.get(class_name.casefold())
+        names_here = name_to_id
+        if same_name:
+            names_here = dict(name_to_id)
+            for name, ids in same_name.items():
+                for pool in (rosters.get(class_id, set()), taught):
+                    fits = [student_id for student_id in ids if student_id in pool]
+                    if len(fits) == 1:
+                        names_here[name] = fits[0]
+                        break
 
         roster = sorted(
             {
-                name_to_id[entry["student_name"].casefold()]
+                names_here[entry["student_name"].casefold()]
                 for session in class_sessions
                 for entry in session["attendance"]
-                if entry["student_name"].casefold() in name_to_id
+                if entry["student_name"].casefold() in names_here
             }
         )
 
@@ -562,7 +607,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
                 end_time=first["end_time"],
                 status="Completed" if first["date"] <= dt.date.today() else "Scheduled",
                 note="",
-                attendance_rows=_attendance_rows(first, name_to_id),
+                attendance_rows=_attendance_rows(first, names_here),
             )
             if outcome != "created":
                 # "teacher_conflict" means the teacher already has a class at
@@ -586,7 +631,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
 
         for session in class_sessions[start_at:]:
             status = "Completed" if session["date"] <= dt.date.today() else "Scheduled"
-            attendance_rows = _attendance_rows(session, name_to_id)
+            attendance_rows = _attendance_rows(session, names_here)
             month_key = (session["date"].year, session["date"].month)
             existing_session_id = db.find_schedule_session(
                 class_id, session["date"], session["start_time"]

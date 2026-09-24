@@ -829,6 +829,38 @@ def _split_subject_line(line: str) -> tuple[str, str | None]:
     return (" ".join(words[: last + 1]), rest) if _is_person_line(rest) else (line, None)
 
 
+# A note typed into brackets on a student's line -- "(5pm-7pm KR) Lee Hana",
+# "Hana(1시간)" one hour, "Hana(13일보강)" make-up on the 13th, "Hana(시간잘못보고옴)"
+# came at the wrong time -- as opposed to a tag that tells two children apart:
+# "(G9 UWC D)", "(G7)", "(Emma)". Left on the name, each note made a new student.
+_NOTE_IN_BRACKETS = re.compile(
+    r"(?i)보강|시간|결석|늦|일찍|잘못|\d+\s*일|\d\s*(?:[.:]\s*\d+)?\s*[ap]\.?\s?m|\bKR\b|[가-힣]{5,}"
+)
+# "Ayoon 보강": Ayoon, at a make-up class.
+_TRAILING_NOTE = re.compile(r"\s+(보강)\s*$")
+
+
+def _take_name_notes(part: str) -> tuple[str, str | None]:
+    """``part`` without the notes typed onto it, and those notes (or None)."""
+    taken: list[str] = []
+
+    def take(match: re.Match) -> str:
+        inside = match.group(1).strip()
+        leading = match.start() == 0 and part[match.end():].strip()
+        if leading or _NOTE_IN_BRACKETS.search(inside):
+            taken.append(inside)
+            return " "
+        return match.group(0)
+
+    name = _BRACKETED.sub(take, part)
+    trailing = _TRAILING_NOTE.search(name)
+    if trailing:
+        taken.append(trailing.group(1))
+        name = name[: trailing.start()]
+    name = " ".join(name.split())
+    return (name, "; ".join(taken)) if taken and name else (part, None)
+
+
 def _roster_names(line: str, notes: list[str]) -> list[tuple[str, str | None, str | None]]:
     """The students one roster line names, as ``[(name, note, status), ...]``.
 
@@ -862,10 +894,11 @@ def _roster_names(line: str, notes: list[str]) -> list[tuple[str, str | None, st
         if _AWAY_NOTE.search(part):
             notes.append(part)
             continue
-        name, note = part, None
+        name, note = _take_name_notes(part)
         match = _SLASH_NOTE.match(name) or _UNTIL_NOTE.match(name)
         if match:
-            name, note = match["name"].strip(), match["note"].strip()
+            name = match["name"].strip()
+            note = "; ".join(filter(None, [note, match["note"].strip()]))
         match = _GRADE_PREFIX.match(name)
         if match and _is_person_line(match["rest"]):
             name = match["rest"].strip()
@@ -1419,6 +1452,25 @@ def _answers_to(readings, student: tuple[frozenset, frozenset]) -> int:
             elif surname & surnames:
                 return 2
     return best
+
+
+_HANGUL_NAME = re.compile(r"[가-힣]{2,4}")
+
+
+def hangul_fit(hangul_name: str, other: str) -> int:
+    """How well a name written in Hangul fits one written in English letters.
+
+    Teachers mostly write a child in English and now and then in Korean:
+    "다혜" in one week's cell is the "Dahye" of every other week. 2 when the
+    surname and given name both fit ("강다혜", "Kang Dahye"), 1 when the
+    given name does ("다혜", "Dahye" or "Kang Dahye"), else 0. Only a name
+    that is all Hangul and a name with English letters are compared.
+    """
+    written = hangul_name.strip()
+    if not _HANGUL_NAME.fullmatch(written) or not re.search(r"[A-Za-z]", other):
+        return 0
+    student = _roster_sounds(other)
+    return max((_answers_to(readings, student) for _, readings in _note_people(written)), default=0)
 
 
 def _note_dates(text: str, day: dt.date) -> set[dt.date]:
@@ -2154,6 +2206,32 @@ _REASON_TEXT = {
 _REASON_ORDER = {"tag": 0, "spelling": 1, "sound": 2, "capitalisation": 3}
 
 
+def _likely_same(reason, left, right, together, classes_of, hangul_matches) -> bool:
+    """Whether a pair of spellings in one workbook starts on "merge".
+
+    Never when the two sat one lesson together. Otherwise: a difference only
+    of capitalisation or of how the name is written (word order,
+    romanisation) is one child; a Hangul name is, when it fits just one
+    English name. A spelling or tag difference -- "Nam Jihon" and "Nam
+    Jihoon", "Clement" and "Clement(UWC D)" -- is one child when both turn
+    up in the same class on different days: the same seat, typed two ways.
+    In different classes it stays a question ("Park Hana" in one class, "Park
+    Haena" in another), as do two different tags and a grade in brackets.
+    """
+    if together:
+        return False
+    if hangul_matches is not None:
+        return len(hangul_matches) == 1
+    if reason in ("capitalisation", "sound"):
+        return True
+    tags = (_suffix(left), _suffix(right))
+    if all(tags) and tags[0].casefold() != tags[1].casefold():
+        return False
+    if any(tag and GRADE_TAG.match(tag) for tag in tags):
+        return False
+    return bool((classes_of[left] & classes_of[right]) - {""})
+
+
 def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     """Find spellings of the same student across a workbook -- and flag every
     one for a human decision. Nothing is merged automatically here.
@@ -2185,6 +2263,7 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
     """
     roster_mates: dict[str, set[str]] = defaultdict(set)
     counts: Counter = Counter()
+    classes_of: dict[str, set[str]] = defaultdict(set)
 
     for session in sessions:
         anchor = session["coordinate"]
@@ -2203,12 +2282,23 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             item["tag"] = _suffix(cleaned) or None
             item["student_name"] = cleaned
             counts[cleaned] += 1
+            classes_of[cleaned].add(session.get("class_name") or "")
 
     names = sorted(counts)
+    # A name in Hangul is taken for the one English name it fits, when only
+    # one in the workbook does; fitting two, it is asked about, not assumed.
+    hangul_fits = {
+        name: [other for other in names if hangul_fit(name, other)]
+        for name in names if _HANGUL_NAME.fullmatch(name)
+    }
     reviews: list[dict[str, Any]] = []
     for index, left in enumerate(names):
         for right in names[index + 1:]:
-            if left.casefold() == right.casefold():
+            hangul, latin = (left, right) if left in hangul_fits else (right, left)
+            if hangul in hangul_fits and latin in hangul_fits[hangul]:
+                reason = "sound"
+                ratio = 0.0
+            elif left.casefold() == right.casefold():
                 reason, ratio = "capitalisation", 1.0
             else:
                 bare_left, bare_right = _bare(left), _bare(right)
@@ -2242,7 +2332,8 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason_text": detail,
                     "counts": [counts[left], counts[right]],
                     # Two names in one class are two children, however alike.
-                    "likely_same": reason in ("capitalisation", "sound") and not together,
+                    "likely_same": _likely_same(reason, left, right, together, classes_of,
+                                                hangul_fits.get(hangul) if hangul in hangul_fits else None),
                 }
             )
 

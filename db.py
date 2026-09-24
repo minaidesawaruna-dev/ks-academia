@@ -495,6 +495,20 @@ def _alias_key(name: str) -> str:
     return " ".join(str(name).split()).casefold()
 
 
+def get_teacher_rosters(teacher_id) -> dict[int, set[int]]:
+    """Who has sat each of a teacher's classes: ``{class_id: {student ids}}``."""
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(ClassSession.class_id, SessionAttendance.student_id).distinct()
+            .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+            .where(ClassSession.teacher_id == int(teacher_id))
+        ).all()
+    rosters: dict[int, set[int]] = defaultdict(set)
+    for class_id, student_id in rows:
+        rosters[class_id].add(student_id)
+    return dict(rosters)
+
+
 def get_student_aliases() -> dict[str, int]:
     """Every other spelling on file: ``{spelling, casefolded: student id}``."""
     with SessionLocal() as session:
@@ -2446,7 +2460,7 @@ def find_duplicate_students():
     """
     import difflib
 
-    from schedule_parser import MERGE_THRESHOLD, _bare, _suffix, name_sound
+    from schedule_parser import _HANGUL_NAME, MERGE_THRESHOLD, _bare, _suffix, hangul_fit, name_sound
 
     with SessionLocal() as session:
         students = session.execute(select(Student.id, Student.full_name).order_by(Student.id)).all()
@@ -2482,11 +2496,18 @@ def find_duplicate_students():
         keys |= {"start:" + compact[:3], "end:" + compact[-3:]}
         for key in keys:
             buckets[key].append(student_id)
-    candidates = sorted({
+    candidates = {
         (bucket[i], bucket[j])
         for bucket in buckets.values()
         for i in range(len(bucket)) for j in range(i + 1, len(bucket))
-    })
+    }
+    # A child written once in Hangul -- "다혜" for "Dahye" -- shares no letters
+    # with their English name, so no bucket above brings the two together.
+    in_hangul = {sid for sid, name in students if _HANGUL_NAME.fullmatch(name.strip())}
+    written_in = {sid: [other for other, other_name in students if hangul_fit(names[sid], other_name)]
+                  for sid in in_hangul}
+    candidates |= {tuple(sorted((sid, other))) for sid, others in written_in.items() for other in others}
+    candidates = sorted(candidates)
     pairs = []
     for left_id, right_id in candidates:
         left, right = names[left_id], names[right_id]
@@ -2494,7 +2515,8 @@ def find_duplicate_students():
             continue
         if tags[left_id] and tags[right_id] and tags[left_id] != tags[right_id]:
             continue
-        sound = bool(said[left_id]) and said[left_id] == said[right_id]
+        sound = (bool(said[left_id]) and said[left_id] == said[right_id]) or (
+            right_id in written_in.get(left_id, ()) or left_id in written_in.get(right_id, ()))
         if sound and sat[left_id] & sat[right_id]:
             continue
         matcher = difflib.SequenceMatcher(None, bare[left_id], bare[right_id])

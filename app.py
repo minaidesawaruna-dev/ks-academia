@@ -638,6 +638,7 @@ def _import_upload_panel() -> None:
         st.caption("Close to a student already on file — the same child, or someone new?")
         for index, candidate in enumerate(match_candidates):
             reason_text = {
+                "hangul": "the same name written in Korean",
                 "tag": "same name, tagged differently",
                 "grade": "same name, with a grade written in front",
                 "sound": "same name, spelled another way",
@@ -1763,8 +1764,12 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
             new_name = columns[0].text_input(
                 "Subject name", key="new_class_name"
             )
+            # Empty unless someone types one: the academy's rule prices it --
+            # the grade in its name, else its students' grades, else $60. A
+            # figure in the box by default was a price nobody chose.
             rate = columns[1].number_input(
-                "Hourly rate", min_value=0.01, value=80.0, step=5.0, key="new_class_rate"
+                "Hourly rate ($)", min_value=0.01, value=None, step=5.0,
+                placeholder="by grade", key="new_class_rate",
             )
             colour = columns[2].color_picker(
                 "Colour", value="#FFF2CC", key="new_class_colour"
@@ -1856,6 +1861,8 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
                 if not (new_name or "").strip():
                     st.warning("Name the subject first.")
                     return
+                typed_rate = rate
+                rate = rate or schedule_parser.standard_rate(new_name) or db.UNSET_RATE
                 outcome = db.create_class_and_first_session(
                     name=new_name, teacher_id=teacher_id, hourly_rate=rate,
                     display_color=colour, student_ids=selected_ids,
@@ -1870,6 +1877,9 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
                     if c["Class"].strip().lower() == new_name.strip().lower()
                 ]
                 class_id = created[0]["ID"] if created else None
+                if class_id and not typed_rate and rate <= db.UNSET_RATE:
+                    # No grade in the name: its students' grades decide, else $60.
+                    schedule_backfill.price_by_rule(db.get_unpriced_subjects(class_ids=[class_id]))
             else:
                 class_id = next(c["ID"] for c in classes if c["Class"] == choice)
                 outcome = db.create_schedule_session(
@@ -2186,10 +2196,15 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
         class_name = columns[0].text_input(
             "Subject name", value=detail["Class"], key=f"cname_{lesson_id}"
         )
+        on_record = float(current.get("Hourly Rate") or 0)
+        if on_record <= db.UNSET_RATE:
+            on_record = schedule_backfill.price_rule(
+                [{"Class ID": detail["Class ID"], "Class": detail["Class"]}]
+            )[detail["Class ID"]][0]
         class_rate = columns[1].number_input(
             "Hourly rate",
             min_value=0.01,
-            value=float(current.get("Hourly Rate") or 80.0),
+            value=on_record,
             step=5.0,
             key=f"crate_{lesson_id}",
         )
