@@ -2681,19 +2681,23 @@ def _group_credits(entries):
     """
     grouped = {}
     for credit, amount in entries:
+        # Most credits are a missed class; a price put right afterwards is
+        # not, and a parent reading "Cancelled" would look for the class.
+        label = ("Price corrected" if (credit.reason or "").startswith("Price corrected")
+                 else "Cancelled")
         entry = grouped.setdefault(
-            credit.class_name or "Cancelled class", {"dates": [], "amount": 0.0}
+            (label, credit.class_name or "Cancelled class"), {"dates": [], "amount": 0.0}
         )
         if credit.session_date:
             entry["dates"].append(credit.session_date)
         entry["amount"] += float(amount or 0)
 
     lines = []
-    for name, entry in grouped.items():
+    for (label, name), entry in grouped.items():
         dates = sorted(entry["dates"])
         lines.append(
             {
-                "Subject": f"Cancelled — {name}",
+                "Subject": f"{label} — {name}",
                 "Teacher": "",
                 "Dates": dates,
                 "Quantity": len(dates),

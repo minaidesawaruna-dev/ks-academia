@@ -632,13 +632,14 @@ def _import_upload_panel() -> None:
             decisions[index] = "merge" if choice.startswith("Merge") else "separate"
 
     student_matches: dict[str, int] = {}
-    match_candidates = schedule_backfill.suggest_student_matches(preview["sessions"])
+    match_candidates = schedule_backfill.suggest_student_matches(preview["sessions"], teacher_id)
     if match_candidates:
         st.markdown(f"**Possible existing students ({len(match_candidates)})**")
         st.caption("Close to a student already on file — the same child, or someone new?")
         for index, candidate in enumerate(match_candidates):
             reason_text = {
                 "hangul": "the same name written in Korean",
+                "short": "this teacher's student, name shortened",
                 "tag": "same name, tagged differently",
                 "grade": "same name, with a grade written in front",
                 "sound": "same name, spelled another way",

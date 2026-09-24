@@ -553,18 +553,20 @@ def t_generic_sheet_names():
     return "'Sheet2' and '시트3' are not February and March"
 
 
-def _suggested(on_file, parsed, aliases=None):
-    """What the import would ask about ``parsed`` names, given students ``on_file``."""
+def _suggested(on_file, parsed, aliases=None, taught=None):
+    """What the import would ask about ``parsed`` names, given students ``on_file``
+    and, optionally, which of them this teacher already teaches."""
     import schedule_backfill as sb
-    real = sb.db.get_all_students, sb.db.get_student_aliases
+    real = sb.db.get_all_students, sb.db.get_student_aliases, sb.db.get_teacher_rosters
     try:
         sb.db.get_all_students = lambda: [{"ID": i, "Name": n} for i, n in on_file.items()]
         sb.db.get_student_aliases = lambda: dict(aliases or {})
+        sb.db.get_teacher_rosters = lambda teacher_id: {1: set(taught or ())}
         lesson = {"attendance": [{"student_name": n} for n in parsed]}
         return {m["parsed_name"]: (m["existing_id"], m["likely_same"])
-                for m in sb.suggest_student_matches([lesson])}
+                for m in sb.suggest_student_matches([lesson], 1 if taught else None)}
     finally:
-        sb.db.get_all_students, sb.db.get_student_aliases = real
+        sb.db.get_all_students, sb.db.get_student_aliases, sb.db.get_teacher_rosters = real
 
 
 def t_grade_prefix_match():
@@ -677,6 +679,24 @@ def t_typo_in_one_class():
     assert found.get(("Nam Jihon", "Nam Jihoon")) is True, found
     assert found.get(("Park Haena", "Park Hana")) is False, found
     return "a typo in the same class starts on merge; in another class it is asked"
+
+
+def t_teachers_own_students():
+    on_file = {1: "Park Hana Leong", 2: "Nam Jihoon", 3: "Oh Minseok", 4: "Seo Yerin Choi", 5: "Kim Taewoo"}
+    taught = {1, 2, 3, 4}
+    found = _suggested(on_file, ["Hana", "Emma Nam Jihoon", "Minseok Oh", "Yerin", "Taewoo"], taught=taught)
+    # Cut short, or an English name added, by the teacher who teaches them.
+    assert found.get("Hana") == (1, True) and found.get("Emma Nam Jihoon") == (2, True), found
+    assert found.get("Yerin") == (4, True), found
+    # Not this teacher's student: not assumed from a given name alone.
+    assert found.get("Taewoo", (5, False))[1] is False, found
+    # A typo of one of theirs, in either order.
+    found = _suggested(on_file, ["Minsek Oh"], taught=taught)
+    assert found.get("Minsek Oh") == (3, True), found
+    # Two of theirs fit: asked, not assumed.
+    found = _suggested({1: "Park Hana", 2: "Kim Hana"}, ["Hana"], taught={1, 2})
+    assert found.get("Hana", (0, False))[1] is False, found
+    return "'Hana' is the teacher's Park Hana Leong; a name that fits two of theirs is asked"
 
 
 def t_sound_alike_reviews():
@@ -835,6 +855,7 @@ for name, fn in [
     ("notes typed onto names", t_notes_typed_onto_names),
     ("a name written in Hangul", t_name_written_in_hangul),
     ("a typo in one class", t_typo_in_one_class),
+    ("a teacher's own students, shortened", t_teachers_own_students),
     ("month ranges in sheet names", t_month_ranges_in_names),
     ("month labels read, notes ignored", t_month_labels),
     ("whole-year sheet by its labels", t_whole_year_sheet),

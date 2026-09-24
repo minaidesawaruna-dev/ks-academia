@@ -30,7 +30,7 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _suffix, hangul_fit, name_sound,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _fold, _suffix, hangul_fit, name_sound,
     rate_for_grade, standard_rate, without_brackets,
 )
 
@@ -252,7 +252,36 @@ def _without_grade(name: str) -> str:
     return stripped or name.strip()
 
 
-def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _name_words(name: str) -> list[str]:
+    return [_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))]
+
+
+def _close_spelling(parsed: str, full: str) -> bool:
+    """A letter or two apart, in either word order: "Kim Taewo" and "Taewoo Kim"."""
+    ordered = [" ".join(sorted(_bare(name).split())) for name in (parsed, full)]
+    return max(difflib.SequenceMatcher(None, _bare(parsed), _bare(full)).ratio(),
+               difflib.SequenceMatcher(None, *ordered).ratio()) >= MERGE_THRESHOLD
+
+
+def _shortened(parsed: str, full: str) -> bool:
+    """Whether ``parsed`` is ``full`` cut short or with a name added.
+
+    "Hana" for "Park Hana Leong", "Yerin" for "Seo Yerin",
+    "Minsooo" for "Minsoo Kim" (a spelling a letter or two longer), or
+    "Emma Nam Jihoon" for "Nam Jihoon" (an English name in front).
+    """
+    mine, theirs = _name_words(parsed), _name_words(full)
+    if len(theirs) < 2 or not mine:
+        return False
+    if len(mine) == 1:
+        word = mine[0]
+        return any(word == other or (min(len(word), len(other)) >= 5 and abs(len(word) - len(other)) <= 2
+                                     and (word.startswith(other) or other.startswith(word)))
+                   for other in theirs)
+    return len(mine) == len(theirs) + 1 and set(theirs) <= set(mine)
+
+
+def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | None = None) -> list[dict[str, Any]]:
     """Parsed names that might already be an existing student under a
     different spelling, tag, or capitalisation -- flagged for a human
     decision rather than either silently merging into the existing record
@@ -264,6 +293,10 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
     """
     existing = db.get_all_students()
     exact = {item["Name"].casefold() for item in existing} | set(db.get_student_aliases())
+    # The teacher's own students, for names they shorten: "Hana" means
+    # their Park Hana Leong, not every Hana in the academy.
+    rosters = db.get_teacher_rosters(teacher_id) if teacher_id else {}
+    theirs = set().union(*rosters.values()) if rosters else set()
     sounds = {item["ID"]: name_sound(item["Name"]) for item in existing}
     bare_names = Counter(_bare(item["Name"]) for item in existing)
 
@@ -327,6 +360,24 @@ def suggest_student_matches(sessions: list[dict[str, Any]]) -> list[dict[str, An
                     "tag": _suffix(name) or None,
                     "existing_tag": _suffix(said_same["Name"]) or None,
                 }
+        # Cut short, with an English name added, or typed a letter or two
+        # wrong, by the teacher who teaches them: taken for that student when
+        # only one of theirs fits. Said with the academy's other students in
+        # mind it would be a guess; among one teacher's, it is their student.
+        if theirs and (best is None or best["reason"] == "spelling"):
+            short = [item for item in existing
+                     if item["ID"] in theirs and _shortened(name, item["Name"])]
+            typo = [item for item in existing
+                    if item["ID"] in theirs and _close_spelling(name, item["Name"])]
+            found = short or typo
+            if found:
+                best = {
+                    "parsed_name": name, "existing_name": found[0]["Name"], "existing_id": found[0]["ID"],
+                    "similarity": 0.0, "reason": "short" if short else "spelling",
+                    "tag": None, "existing_tag": None, "likely_same": len(found) == 1,
+                }
+                candidates.append(best)
+                continue
         # Written in Hangul -- "다혜" for the "Dahye" on file. Taken for her when
         # she is the only student it fits; asked about when several do.
         fits = [item for item in existing if best is None and hangul_fit(name, item["Name"])]
