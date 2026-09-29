@@ -30,8 +30,8 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _fold, _suffix, hangul_fit, name_sound,
-    rate_for_grade, standard_rate, without_brackets,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _close_spelling, _fold, _shortened, _suffix,
+    hangul_fit, name_sound, rate_for_grade, standard_rate, without_brackets,
 )
 
 __all__ = [
@@ -250,35 +250,6 @@ def _without_grade(name: str) -> str:
     """
     stripped = re.sub(r"^(?:g|y|gr\.?|grade)\s?\d{1,2}\b[\s.:\-]*", "", name.strip(), flags=re.I)
     return stripped or name.strip()
-
-
-def _name_words(name: str) -> list[str]:
-    return [_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))]
-
-
-def _close_spelling(parsed: str, full: str) -> bool:
-    """A letter or two apart, in either word order: "Kim Taewo" and "Taewoo Kim"."""
-    ordered = [" ".join(sorted(_bare(name).split())) for name in (parsed, full)]
-    return max(difflib.SequenceMatcher(None, _bare(parsed), _bare(full)).ratio(),
-               difflib.SequenceMatcher(None, *ordered).ratio()) >= MERGE_THRESHOLD
-
-
-def _shortened(parsed: str, full: str) -> bool:
-    """Whether ``parsed`` is ``full`` cut short or with a name added.
-
-    "Hana" for "Park Hana Leong", "Yerin" for "Seo Yerin",
-    "Minsooo" for "Minsoo Kim" (a spelling a letter or two longer), or
-    "Emma Nam Jihoon" for "Nam Jihoon" (an English name in front).
-    """
-    mine, theirs = _name_words(parsed), _name_words(full)
-    if len(theirs) < 2 or not mine:
-        return False
-    if len(mine) == 1:
-        word = mine[0]
-        return any(word == other or (min(len(word), len(other)) >= 5 and abs(len(word) - len(other)) <= 2
-                                     and (word.startswith(other) or other.startswith(word)))
-                   for other in theirs)
-    return len(mine) == len(theirs) + 1 and set(theirs) <= set(mine)
 
 
 def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | None = None) -> list[dict[str, Any]]:

@@ -3480,12 +3480,14 @@ def _retention_view() -> None:
         st.markdown(
             f"- **Data:** {sources['app']:,} student-lessons from the app and "
             f"{sources['history']:,} more from past schedules (never billed), "
-            f"{report['first_month']} to {report['last_month']}. A lesson in both "
-            "counts once.\n"
+            f"{report['first_month']} to {report['last_month']}. A month the app holds "
+            "is taken from the app; a child the past schedules write another way counts "
+            "as the app's student.\n"
             f"- **Leaving** is no lesson for {report['grace_months']} months and never "
             "coming back. Grade 12s ending in May or June have finished school, not left.\n"
             "- **The model** is logistic regression on student-months — one row per "
-            "student per month, using only what was known then.\n"
+            "student per month, using only what was known then — fitted on months "
+            f"{report['grace_months']} or more back, once every student's outcome is known.\n"
             + check +
             "- **A gap in a teacher's records** is not students leaving: a month is "
             "judged only when that teacher's schedule carries on after it.\n"

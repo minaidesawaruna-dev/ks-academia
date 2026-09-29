@@ -287,12 +287,53 @@ def t_history_store():
 
 
 def t_combine_prefers_app():
-    app = [lesson("Nam Jihoon", dt.date(2025, 5, 3), cls="G10 Math (Teacher A)")]
-    history = [lesson("nam  jihoon", dt.date(2025, 5, 3), teacher="teacher a", cls="G10 Math"),
-               lesson("Oh Minseok", dt.date(2025, 5, 3))]
+    """A month the app holds is the app's; past schedules fill in the rest, the app's way.
+
+    The past schedules here are a later copy of the workbook: the same lesson
+    with the child written "Tae woo" where the app has Jang Taewoo, and a
+    lesson moved to another day. Counting both would make one child two and
+    one lesson two.
+    """
+    may3, may17, apr5 = dt.date(2025, 5, 3), dt.date(2025, 5, 17), dt.date(2025, 4, 5)
+    app = [lesson("Jang Taewoo", may3, cls="G10 Math (Teacher A)"), lesson("Seo Yerin", may3),
+           lesson("Choi Doyun", may3), lesson("Park Hana", may3),
+           # Another child, on file as plain "Hana", in another class.
+           lesson("Hana", dt.date(2025, 6, 7), cls="G9 English", hour=10)]
+    history = [lesson("Tae woo", may3, teacher="teacher a"), lesson("Seo Yerin", may3, teacher="teacher a"),
+               lesson("Oh Minseok", may3), lesson("Hana", may3),
+               lesson("Seo Yerin", may17),                       # moved in the later copy
+               lesson("Tae woo", apr5), lesson("Seo Yerin", apr5),
+               lesson("Oh Minseok", apr5), lesson("Hana", apr5)]
     combined, counts = rt.combine(app, history)
-    assert len(combined) == 2 and counts == {"app": 1, "history": 1, "history_already_in_app": 1}
-    return "a lesson in both is counted once, from the app"
+    april = sorted(row["student"] for row in combined if row["date"] == apr5)
+    assert april == ["Hana", "Jang Taewoo", "Oh Minseok", "Seo Yerin"], april
+    assert not [row for row in combined if row["date"] == may17], "a moved lesson counted twice"
+    assert counts == {"app": 5, "history": 4, "history_already_in_app": 5, "spellings_linked": 1}, counts
+    may = next(r for r in rt.monthly_activity(combined)["by_month"] if r["Month"] == 5)
+    assert (may["Students"], may["Lessons"]) == (4, 1), may
+    return ("a month the app holds is the app's; a respelled child is the app's student "
+            "in earlier months; unlike names and names already on file are not tied")
+
+
+def t_settled_months_only():
+    """The model learns and is checked only on months whose outcome is known.
+
+    The month before last holds only the students who came back: the ones who
+    didn't can't yet be told from a break. Left in, it made leaving look rarer.
+    """
+    lessons = _simulated()
+    as_of = dt.date(2025, 11, 30)
+    latest = rt.month_index(as_of)
+    rows = rt.student_months(lessons, as_of)
+    half_known = [row for row in rows if row["month"] == latest - 1 and row["label"] is not None]
+    assert half_known and all(row["label"] == 0 for row in half_known), "the premise didn't hold"
+    kept = rt.settled(rows, as_of)
+    assert kept and max(row["month"] for row in kept) == latest - rt.GRACE_MONTHS, \
+        max(row["month"] for row in kept)
+    report = rt.retention_report(lessons, dt.date(2025, 12, 31))
+    assert report["labelled"] == len(kept), (report["labelled"], len(kept))
+    assert report["validation"]["tested_to"] == rt.month_label(latest - rt.GRACE_MONTHS), report["validation"]
+    return f"{len(half_known)} half-known student-months left out of the fit and the check"
 
 
 def t_monthly_activity():
@@ -333,6 +374,7 @@ for name, fn in [
     ("too little data", t_too_little_data),
     ("past-schedules store", t_history_store),
     ("app wins over past schedules", t_combine_prefers_app),
+    ("model uses settled months only", t_settled_months_only),
     ("what was taught each month", t_monthly_activity),
 ]:
     check(name, fn)

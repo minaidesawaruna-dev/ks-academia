@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import calendar
 import datetime as dt
+import difflib
 import math
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
@@ -85,22 +87,100 @@ def month_label(index: int) -> str:
     return f"{calendar.month_abbr[index % 12 + 1]} {index // 12}"
 
 
-def combine(app_lessons: list[dict], history_lessons: list[dict]) -> tuple[list[dict], dict]:
-    """Every lesson once. Where past schedules repeat a lesson the app holds, the app wins.
+def _said_alike(written: str, on_file: str) -> bool:
+    """Whether two spellings are one child: the upload screen's own tests -- the
+    same name said another way, cut short or with a name added, a letter or two
+    off, a bracketed tag apart, a Hangul name that fits the English one -- plus
+    the two ways teachers shorten a name within one class: the given name alone
+    with its syllables spaced ("Tae woo" for Jang Taewoo), or with a letter
+    off ("Dahey" for Kim Dahye)."""
+    sound = schedule_parser.name_sound(written)
+    if ((sound and sound == schedule_parser.name_sound(on_file))
+            or schedule_parser._bare(written) == schedule_parser._bare(on_file)
+            or schedule_parser._shortened(written, on_file)
+            or schedule_parser._shortened(on_file, written)
+            or schedule_parser._close_spelling(written, on_file)
+            or schedule_parser.hangul_fit(written, on_file)
+            or schedule_parser.hangul_fit(on_file, written)):
+        return True
+    mine, theirs = schedule_parser._name_words(written), schedule_parser._name_words(on_file)
+    # Folded as one word, since "Tae woo" folds differently syllable by syllable.
+    joined = schedule_parser._fold("".join(re.findall(r"[A-Za-z]+", schedule_parser.without_brackets(written))))
+    if len(mine) >= 2 and len(theirs) >= 2 and len(joined) >= 4 and joined in theirs:
+        return True
+    # And the other way: "Minjae" for Min Jae Choi.
+    raw = re.findall(r"[A-Za-z]+", schedule_parser.without_brackets(on_file))
+    if len(mine) == 1 and len(joined) >= 5 and any(
+            schedule_parser._fold(raw[i] + raw[i + 1]) == joined for i in range(len(raw) - 1)):
+        return True
+    return len(mine) == 1 and len(theirs) >= 2 and len(joined) >= 5 and any(
+        len(word) >= 5 and difflib.SequenceMatcher(None, joined, word).ratio() >= schedule_parser.MERGE_THRESHOLD
+        for word in theirs)
 
-    A lesson is the same when the teacher, date, start time and student match;
-    class names are left out of that, because an import may have renamed the
-    class the workbook still calls something else.
+
+def link_spellings(app_lessons: list[dict], history_lessons: list[dict]) -> dict[tuple[str, str], str]:
+    """Past-schedule spellings of children the app holds under another name.
+
+    Learned only from lessons in both -- same teacher, date and start. On such
+    a lesson, a name the past schedule has and the app doesn't is tied to the
+    one name the app has and the past schedule doesn't that passes
+    ``_said_alike``. Never tied: a spelling that is itself a student's name in
+    the app (another "Hana" may be exactly who it means), or one that points
+    at two different students anywhere. A wrong tie would merge two children,
+    so a spelling nothing ties stays as written.
+
+    Returns ``{(teacher casefolded, spelling normalised): the app's name}``.
     """
-    def key(row):
-        return (row["teacher"].casefold(), row["date"], row["start"], normalise_name(row["student"]))
+    def roster(rows):
+        out: dict[tuple, dict[str, str]] = defaultdict(dict)
+        for row in rows:
+            key = normalise_name(row["student"])
+            if key:
+                out[(row["teacher"].casefold(), row["date"], row["start"])][key] = row["student"]
+        return out
 
-    seen = {key(row) for row in app_lessons}
-    extra = [row for row in history_lessons if key(row) not in seen]
+    app, past = roster(app_lessons), roster(history_lessons)
+    in_app = {key for lesson in app.values() for key in lesson}
+    votes: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for lesson, written in past.items():
+        on_file = app.get(lesson)
+        if not on_file:
+            continue
+        free = [name for key, name in on_file.items() if key not in written]
+        for key, name in written.items():
+            if key in in_app:
+                continue
+            fits = [other for other in free if _said_alike(name, other)]
+            if len(fits) == 1:
+                votes[(lesson[0], key)].add(fits[0])
+    return {spelling: next(iter(names)) for spelling, names in votes.items() if len(names) == 1}
+
+
+def combine(app_lessons: list[dict], history_lessons: list[dict]) -> tuple[list[dict], dict]:
+    """Every lesson once, taken from the app wherever the app has the month.
+
+    A month the app holds for a teacher is the app's alone: that teacher's
+    past schedules for the month are left out. The past schedules are often a
+    later copy of the workbook the app imported, so taking both would count a
+    moved lesson twice, and a child written one way in each as two children.
+    Past schedules fill in only the months the app doesn't have, with any
+    spelling that ``link_spellings`` ties to an app student written the app's
+    way, so the same child is one student from their first lesson on record.
+    """
+    held = {(row["teacher"].casefold(), row["date"].year, row["date"].month) for row in app_lessons}
+    links = link_spellings(app_lessons, history_lessons)
+    extra = []
+    for row in history_lessons:
+        teacher = row["teacher"].casefold()
+        if (teacher, row["date"].year, row["date"].month) in held:
+            continue
+        name = links.get((teacher, normalise_name(row["student"])))
+        extra.append({**row, "student": name} if name else row)
     return app_lessons + extra, {
         "app": len(app_lessons),
         "history": len(extra),
         "history_already_in_app": len(history_lessons) - len(extra),
+        "spellings_linked": len(links),
     }
 
 
@@ -431,15 +511,28 @@ def odds_ratios(model: LogisticModel) -> list[dict[str, Any]]:
     return out
 
 
+def settled(rows: list[dict], today: dt.date) -> list[dict]:
+    """The labelled rows from months whose outcome is known for every student.
+
+    A month is settled once ``GRACE_MONTHS`` have passed after it. The month
+    before that is only half known: a student who came back is already a
+    stayer, but one who didn't can't yet be told from a break, so that month
+    holds only its stayers. Fitting or scoring on it made leaving look rarer
+    in summer, and the model look better on its check, than either is.
+    """
+    latest = month_index(today)
+    return [row for row in rows if row["label"] is not None and row["month"] <= latest - GRACE_MONTHS]
+
+
 def validate(lessons: list[dict], today: dt.date) -> dict[str, Any] | None:
     """Fit as if it were an earlier date, then score the months that came after.
 
     The model is refitted on lessons before a cutoff only -- labels included,
     so a student who came back after the cutoff counts as unknown, exactly as
-    it would have then -- and tested on the most recent months holding about
-    three in ten of the labelled rows. None when there is too little of either.
+    it would have then -- and tested on the most recent settled months holding
+    about three in ten of the settled rows. None when there is too little of either.
     """
-    rows = [row for row in student_months(lessons, today) if row["label"] is not None]
+    rows = settled(student_months(lessons, today), today)
     if not rows:
         return None
     per_month = Counter(row["month"] for row in rows)
@@ -450,9 +543,8 @@ def validate(lessons: list[dict], today: dt.date) -> dict[str, Any] | None:
         if held >= 0.3 * len(rows):
             break
     cutoff_day = dt.date(cutoff // 12, cutoff % 12 + 1, 1)
-    train = [row for row in student_months([r for r in lessons if r["date"] < cutoff_day],
-                                           cutoff_day - dt.timedelta(days=1))
-             if row["label"] is not None]
+    trained_to = cutoff_day - dt.timedelta(days=1)
+    train = settled(student_months([r for r in lessons if r["date"] < cutoff_day], trained_to), trained_to)
     test = [row for row in rows if row["month"] >= cutoff]
     train_leavers = sum(row["label"] for row in train)
     test_labels = np.array([row["label"] for row in test])
@@ -464,7 +556,7 @@ def validate(lessons: list[dict], today: dt.date) -> dict[str, Any] | None:
     top = max(1, round(0.2 * len(test)))
     return {
         "auc": auc(test_labels, risk),
-        "trained_through": month_label(cutoff - 1),
+        "trained_through": month_label(max(row["month"] for row in train)),
         "tested_from": month_label(cutoff),
         "tested_to": month_label(max(per_month)),
         "train_rows": len(train),
@@ -483,7 +575,7 @@ def retention_report(lessons: list[dict], today: dt.date) -> dict[str, Any]:
     """
     as_of = today.replace(day=1) - dt.timedelta(days=1)
     rows = student_months(lessons, as_of)
-    labelled = [row for row in rows if row["label"] is not None]
+    labelled = settled(rows, as_of)
     leavers = sum(row["label"] for row in labelled)
     students = {row["key"] for row in rows}
     if leavers < MIN_LEAVERS or len(labelled) - leavers < MIN_LEAVERS:

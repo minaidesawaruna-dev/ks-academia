@@ -1360,6 +1360,35 @@ def name_sound(name: str) -> str:
     return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))))
 
 
+def _name_words(name: str) -> list[str]:
+    return [_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))]
+
+
+def _close_spelling(parsed: str, full: str) -> bool:
+    """A letter or two apart, in either word order: "Kim Taewo" and "Taewoo Kim"."""
+    ordered = [" ".join(sorted(_bare(name).split())) for name in (parsed, full)]
+    return max(difflib.SequenceMatcher(None, _bare(parsed), _bare(full)).ratio(),
+               difflib.SequenceMatcher(None, *ordered).ratio()) >= MERGE_THRESHOLD
+
+
+def _shortened(parsed: str, full: str) -> bool:
+    """Whether ``parsed`` is ``full`` cut short or with a name added.
+
+    "Hana" for "Park Hana Leong", "Yerin" for "Seo Yerin",
+    "Minsooo" for "Minsoo Kim" (a spelling a letter or two longer), or
+    "Emma Nam Jihoon" for "Nam Jihoon" (an English name in front).
+    """
+    mine, theirs = _name_words(parsed), _name_words(full)
+    if len(theirs) < 2 or not mine:
+        return False
+    if len(mine) == 1:
+        word = mine[0]
+        return any(word == other or (min(len(word), len(other)) >= 5 and abs(len(word) - len(other)) <= 2
+                                     and (word.startswith(other) or other.startswith(word)))
+                   for other in theirs)
+    return len(mine) == len(theirs) + 1 and set(theirs) <= set(mine)
+
+
 def _hangul_sounds(hangul: str) -> set[str]:
     """Every folded English spelling of a run of Hangul syllables."""
     spellings = [""]
