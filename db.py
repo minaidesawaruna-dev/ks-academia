@@ -1701,6 +1701,14 @@ def _replace_session_attendance(session, session_id, attendance_rows):
     ).all():
         session.delete(old_row)
 
+    # One place per student in a class, the first given: two rows for one
+    # child would break the table's rule and fail the whole save.
+    first_rows, seen = [], set()
+    for row in attendance_rows:
+        if row["student_id"] not in seen:
+            seen.add(row["student_id"])
+            first_rows.append(row)
+    attendance_rows = first_rows
     student_ids = [row["student_id"] for row in attendance_rows]
     valid_ids = set(
         session.scalars(
@@ -3651,52 +3659,124 @@ def backfill_cancellation_credits():
     return {"removed_from_open": removed, "credits_raised": credited}
 
 
-def remove_lessons_not_in(teacher_id, periods, keep_slots, class_ids):
+def workbook_drops(lesson_class_id, day, start, dates, keep_slots, class_ids, filled_slots):
+    """Whether a re-imported workbook no longer has this lesson, so it goes.
+
+    Only on a date the workbook shows (``dates``: every day it has a column
+    for) -- elsewhere it says nothing, so nothing is taken. On such a day, a
+    lesson of a subject the workbook has (``class_ids``) goes unless the
+    workbook still has that subject at that time (``keep_slots``); a lesson of
+    a subject it does not have goes unless something is written at that time
+    (``filled_slots``), which may be the same class under a name the import
+    could not match, and so is left alone.
+    """
+    if day not in dates:
+        return False
+    if lesson_class_id in class_ids:
+        return (lesson_class_id, day, start) not in keep_slots
+    return (day, start) not in filled_slots
+
+
+def _lessons_between(session, teacher_id, dates):
+    if not dates:
+        return []
+    return session.scalars(
+        select(ClassSession).where(
+            ClassSession.teacher_id == teacher_id,
+            ClassSession.session_date >= min(dates),
+            ClassSession.session_date <= max(dates),
+        )
+    ).all()
+
+
+def remove_lessons_not_in(teacher_id, dates, keep_slots, class_ids, filled_slots):
     """Delete a teacher's classes that a re-imported workbook no longer lists.
 
-    Scoped deliberately tightly: only the given (year, month) periods, only
-    that teacher, so uploading one month can never disturb another month or
-    another teacher's schedule.
+    Scoped deliberately tightly: only that teacher, and only the dates the
+    workbook shows (see ``workbook_drops``), so uploading one month can never
+    disturb another -- not even the month a sheet spills its last few
+    columns into -- nor another teacher's schedule.
 
     A class that moved to a new day leaves its old slot behind, and without
     this the student would be billed for both. Removing it is treated the
     same as a cancellation: dropped from an invoice still open, credited
     back if the invoice has already gone out.
-
-    ``keep_slots`` is the set of (class_id, date, start_time) the workbook
-    still describes; ``class_ids`` limits the sweep to the classes it
-    actually contains, so a class whose import was skipped keeps its
-    classes rather than looking like one that was dropped.
     """
+    dates = set(dates)
     removed = credited = 0
     with SessionLocal() as session:
-        for year, month in periods:
-            first_day = date(year, month, 1)
-            last_day = date(year, month, monthrange(year, month)[1])
-            lessons = session.scalars(
-                select(ClassSession).where(
-                    ClassSession.teacher_id == teacher_id,
-                    ClassSession.session_date >= first_day,
-                    ClassSession.session_date <= last_day,
-                )
-            ).all()
-            stale = [
-                lesson for lesson in lessons
-                if lesson.class_id in class_ids
-                and (lesson.class_id, lesson.session_date, lesson.start_time)
-                not in keep_slots
-            ]
-            if not stale:
-                continue
-            rate_index = _rate_index(session, {lesson.class_id for lesson in stale})
-            for lesson in stale:
-                raised, _ = _remove_lesson(
-                    session, lesson, "Class removed from the schedule", rate_index
-                )
-                credited += raised
-                removed += 1
+        stale = [
+            lesson for lesson in _lessons_between(session, teacher_id, dates)
+            if workbook_drops(lesson.class_id, lesson.session_date, lesson.start_time,
+                              dates, keep_slots, class_ids, filled_slots)
+        ]
+        rate_index = _rate_index(session, {lesson.class_id for lesson in stale})
+        for lesson in stale:
+            raised, _ = _remove_lesson(
+                session, lesson, "Class removed from the schedule", rate_index
+            )
+            credited += raised
+            removed += 1
         session.commit()
     return {"lessons_removed": removed, "credits_raised": credited}
+
+
+def get_teacher_lessons_on(teacher_id, dates):
+    """A teacher's lessons on the given dates, for checking an upload against.
+
+    Keyed ``(class id, date, start)``; each carries its roster as
+    ``get_schedule_session`` gives it, and whether any student has been
+    invoiced for it. Four queries however many lessons.
+    """
+    dates = set(dates)
+    with SessionLocal() as session:
+        lessons = [
+            lesson for lesson in _lessons_between(session, teacher_id, dates)
+            if lesson.session_date in dates
+        ]
+        ids = [lesson.id for lesson in lessons]
+        names = dict(session.execute(
+            select(AcademyClass.id, AcademyClass.name)
+            .where(AcademyClass.id.in_({lesson.class_id for lesson in lessons}))
+        ).all()) if lessons else {}
+        roster: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        invoiced: set[int] = set()
+        if ids:
+            for attendance, student in session.execute(
+                select(SessionAttendance, Student)
+                .join(Student, SessionAttendance.student_id == Student.id)
+                .where(SessionAttendance.session_id.in_(ids))
+                .order_by(Student.full_name)
+            ).all():
+                roster[attendance.session_id].append(_attendance_entry(attendance, student))
+            invoiced = set(session.scalars(
+                select(InvoiceItem.session_id)
+                .join(Invoice, InvoiceItem.invoice_id == Invoice.id)
+                .where(Invoice.status == "Issued", InvoiceItem.session_id.in_(ids))
+            ).all())
+        return {
+            (lesson.class_id, lesson.session_date, lesson.start_time): {
+                "ID": lesson.id,
+                "Class ID": lesson.class_id,
+                "Class": names.get(lesson.class_id, ""),
+                "Date": lesson.session_date,
+                "Start": lesson.start_time,
+                "End": lesson.end_time,
+                "Status": lesson.status,
+                "Attendance": roster.get(lesson.id, []),
+                "Invoiced": lesson.id in invoiced,
+            }
+            for lesson in lessons
+        }
+
+
+def get_teacher_months(teacher_id):
+    """Every (year, month) a teacher has a class in on the calendar."""
+    with SessionLocal() as session:
+        days = session.scalars(
+            select(ClassSession.session_date).where(ClassSession.teacher_id == teacher_id).distinct()
+        ).all()
+    return sorted({(as_date(day).year, as_date(day).month) for day in days})
 
 
 def payment_due_date(year, month):
@@ -4629,13 +4709,18 @@ def get_unpriced_classes_for_month(year, month):
 # ---------------------------------------------------------------------------
 
 
-def save_lesson_history(teacher_name, sessions, source=None):
+def save_lesson_history(teacher_name, sessions, source=None, dates=None):
     """Keep a parsed workbook's lessons for analysis, apart from anything billed.
 
     ``sessions`` is a parser preview's sessions. Saving the same workbook again
     updates what changed rather than adding it twice: a lesson is one teacher,
     date, start time and student. A teacher name matching an existing one up
     to capitals reuses that spelling, so one teacher's history stays together.
+
+    ``dates`` are the days the worksheets show. On those days a newer copy of
+    the workbook is the record: a lesson it no longer has -- moved, or a
+    student taken off -- is dropped, so it isn't counted twice. Other days,
+    and other workbooks' lessons, are left alone.
     """
     teacher_name = " ".join(str(teacher_name or "").split())[:100]
     if not teacher_name:
@@ -4683,9 +4768,13 @@ def save_lesson_history(teacher_name, sessions, source=None):
                 updated += 1
             else:
                 unchanged += 1
+        shown = set(dates or ())
+        dropped = [row for key, row in existing.items() if key[0] in shown and key not in incoming]
+        for row in dropped:
+            session.delete(row)
         session.commit()
     return {"status": "saved", "teacher": teacher_name, "added": added,
-            "updated": updated, "unchanged": unchanged}
+            "updated": updated, "unchanged": unchanged, "removed": len(dropped)}
 
 
 def get_lesson_history_summary():

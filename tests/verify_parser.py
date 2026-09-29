@@ -313,6 +313,31 @@ def t_whole_year_sheet():
     return "a sheet named '2026' read by its month labels, year from the sheet"
 
 
+def t_dates_shown():
+    """Every day a sheet has a column for is reported, and which months are its own.
+
+    A re-upload makes the calendar match the workbook only on the days it
+    shows, so a September sheet's last columns -- 1 and 2 October -- must not
+    stand for the whole of October.
+    """
+    book = _book(("Sep", [(None, [("28(MON)", LESSON), ("29(TUE)", None), ("30(WED)", None),
+                                  ("1(THU)", LESSON), ("2(FRI)", None)])]))
+    out = sp.parse_workbook(io.BytesIO(book), ["Sep"], 2026)
+    shown = [dt.date(2026, 9, d) for d in (28, 29, 30)] + [dt.date(2026, 10, d) for d in (1, 2)]
+    assert out["dates_shown"] == shown, out["dates_shown"]
+    assert out["sheet_months"] == [(2026, 9)], out["sheet_months"]
+    assert _dates(out) == [dt.date(2026, 9, 28), dt.date(2026, 10, 1)], _dates(out)
+    year = _book(("2026", [("JAN.2026", [("3(SAT)", LESSON), ("5(MON)", None)]),
+                           ("FEB", [("2(MON)", LESSON), ("7(SAT)", None)])]))
+    out = sp.parse_workbook(io.BytesIO(year), ["2026"], 2025)
+    assert out["dates_shown"] == [dt.date(2026, 1, 3), dt.date(2026, 1, 5),
+                                  dt.date(2026, 2, 2), dt.date(2026, 2, 7)], out["dates_shown"]
+    assert out["sheet_months"] == [(2026, 1), (2026, 2)], out["sheet_months"]
+    single = sp.parse_schedule(io.BytesIO(book), "Sep", 2026)
+    assert single["dates_shown"] == shown and single["sheet_months"] == [(2026, 9)], single["dates_shown"]
+    return "days with a column reported; October's two spill days are not October's sheet"
+
+
 def t_unlabelled_first_month():
     book = _book(("2026", [(None, [("3 SAT", LESSON)]),
                            ("FEB 2026", [("2(MON)", LESSON)]),
@@ -859,6 +884,7 @@ for name, fn in [
     ("month ranges in sheet names", t_month_ranges_in_names),
     ("month labels read, notes ignored", t_month_labels),
     ("whole-year sheet by its labels", t_whole_year_sheet),
+    ("days each sheet shows", t_dates_shown),
     ("unlabelled first month inferred", t_unlabelled_first_month),
     ("multi-month sheet name", t_multi_month_sheet_name),
     ("leftover other-year block", t_leftover_year_block),

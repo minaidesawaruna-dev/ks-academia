@@ -23,6 +23,7 @@ Run with:  streamlit run app.py
 from __future__ import annotations
 
 import calendar
+import copy
 import datetime as dt
 import io
 import os
@@ -513,6 +514,57 @@ def _warning_panel(preview: dict) -> None:
                     st.markdown(f"\u26a0\ufe0f {item['message']}")
 
 
+def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> None:
+    """What committing will do to the calendar, month by month, before anything is written.
+
+    Re-uploading a corrected workbook is routine; this is how anyone doing it
+    sees that it touches what they expect and nothing else. Worked out on a
+    copy of the parse, because settling the name questions rewrites it.
+    """
+    planned = {**preview, "sessions": copy.deepcopy(preview["sessions"])}
+    planned["sessions"] = schedule_backfill.apply_review_decisions(planned, decisions)
+    plan = schedule_backfill.plan_import(
+        planned, teacher_id, name_overrides=name_overrides,
+        student_matches=student_matches, dates=planned.get("dates_shown"),
+    )
+    if not plan:
+        return
+    st.markdown("**What this changes**")
+    st.dataframe(
+        [
+            {
+                "Month": f"{calendar.month_abbr[month]} {year}",
+                "New": counts["new"],
+                "Changed": counts["changed"],
+                "Removed": counts["removed"],
+                "Unchanged": counts["unchanged"] + counts["held"],
+                "Not added": counts["clash"] + counts["skipped"],
+            }
+            for (year, month), counts in sorted(plan.items())
+        ],
+        width="stretch",
+        hide_index=True,
+    )
+    totals = {key: sum(counts[key] for counts in plan.values())
+              for key in ("removed", "removed_invoiced", "changed_invoiced", "held", "clash", "skipped")}
+    notes = []
+    if totals["held"]:
+        notes.append(f"{totals['held']} class(es) whose date has passed will be marked held; "
+                     "nothing else about them changes.")
+    if totals["removed"]:
+        notes.append("Removed: no longer in the workbook on a day it shows"
+                     + (f"; {totals['removed_invoiced']} already invoiced, credited back on the "
+                        "next invoice." if totals["removed_invoiced"] else "."))
+    if totals["changed_invoiced"]:
+        notes.append(f"{totals['changed_invoiced']} changed class(es) already invoiced: anyone "
+                     "taken off or cancelled is credited, anyone added is billed next.")
+    if totals["clash"] + totals["skipped"]:
+        notes.append("Not added: the teacher already has a class at that time, or another "
+                     "teacher's subject has that name.")
+    if notes:
+        st.caption(" ".join(notes))
+
+
 def _import_upload_panel() -> None:
     """Upload an Excel schedule for a teacher, review the parse, then commit it."""
     # Retired teachers are not offered: marking one inactive means they are
@@ -598,6 +650,48 @@ def _import_upload_panel() -> None:
         return
     generation = st.session_state.get("import_generation", 0)
 
+    # A worksheet can hold a whole year, and every month in it would be
+    # imported -- the months billed before a teacher came onto the app put up
+    # for billing a second time. So the months are chosen, starting from the
+    # ones the app already holds for this teacher and any after them.
+    found = {
+        f"{item['month'][0]}-{item['month'][1]:02d}": item
+        for item in schedule_backfill.months_found(preview)
+    }
+    suggested = [
+        f"{year_}-{month_:02d}"
+        for year_, month_ in schedule_backfill.default_months(preview, teacher_id)
+    ]
+
+    def _month_option(key: str) -> str:
+        item = found[key]
+        label = f"{calendar.month_name[item['month'][1]]} {item['month'][0]} — {item['classes']} class(es)"
+        return label if item["own"] else label + f", {item['days']} day(s) spilling from the month before"
+
+    chosen_months = st.multiselect(
+        "Months to import", list(found), default=suggested, format_func=_month_option,
+        key=f"import_months_{generation}_{teacher_id}",
+        help="Only these months are imported. On the days they show, the calendar is made "
+             "to match the workbook: new classes added, changed ones updated, and classes "
+             "no longer in it removed — credited back if already invoiced.",
+    )
+    if teacher_id and any(item["own"] and key < min(suggested or ["9999"]) for key, item in found.items()):
+        first = found[suggested[0]]["month"] if suggested else None
+        st.caption(
+            (f"Months before {calendar.month_name[first[1]]} {first[0]} are not ticked"
+             if first else "None is ticked: every month here comes before this teacher's months in the app")
+            + " — billed outside the app, so importing one puts its classes up for billing again."
+        )
+    if not chosen_months:
+        st.info("Pick at least one month.")
+        return
+    preview = schedule_backfill.restrict_to_months(
+        preview, [tuple(map(int, key.split("-"))) for key in chosen_months]
+    )
+    # Questions below are numbered within the months chosen, so their answers
+    # must not carry over to a different choice of months.
+    scope = f"{generation}_{'_'.join(sorted(chosen_months))}"
+
     pending = len(preview["name_reviews"])
     headline = (
         f"{preview['session_count']} sessions · "
@@ -627,7 +721,7 @@ def _import_upload_panel() -> None:
                 ["Keep separate", "Merge — same person"],
                 index=1 if review.get("likely_same") else 0,
                 horizontal=True,
-                key=f"import_review_{generation}_{index}",
+                key=f"import_review_{scope}_{index}",
             )
             decisions[index] = "merge" if choice.startswith("Merge") else "separate"
 
@@ -650,7 +744,7 @@ def _import_upload_panel() -> None:
                 ["New / different person", f"Same as '{candidate['existing_name']}'"],
                 index=1 if candidate.get("likely_same") else 0,
                 horizontal=True,
-                key=f"import_match_{generation}_{index}",
+                key=f"import_match_{scope}_{index}",
             )
             if choice.startswith("Same as"):
                 student_matches[candidate["parsed_name"].casefold()] = candidate["existing_id"]
@@ -706,7 +800,7 @@ def _import_upload_panel() -> None:
                 choice = st.radio(
                     f"'{drop}' ({drop_n} class(es)) and '{keep}' ({kept_n} class(es))",
                     [f"Merge into '{keep}'", "Keep separate"],
-                    key=f"import_merge_{generation}_{index}",
+                    key=f"import_merge_{scope}_{index}",
                     horizontal=True,
                 )
                 if choice.startswith("Merge"):
@@ -742,6 +836,8 @@ def _import_upload_panel() -> None:
         for original, chosen in settled.items():
             name_overrides[original] = renamed_to.get(chosen, chosen)
 
+    _import_changes(preview, decisions, teacher_id, name_overrides, student_matches)
+
     if st.button("Commit import", type="primary", key="import_commit"):
         if not teacher_name:
             st.warning("Enter a teacher name first.")
@@ -764,6 +860,7 @@ def _import_upload_panel() -> None:
                 preview, commit_id,
                 name_overrides=name_overrides,
                 student_matches=student_matches,
+                dates=preview.get("dates_shown"),
             )
         if result["status"] == "imported":
             counts = result["created"]
@@ -807,6 +904,12 @@ def _import_upload_panel() -> None:
                         f" {credited} of them had already been invoiced and "
                         "were credited back."
                     )
+            twice = result.get("listed_twice") or []
+            if twice:
+                message += (
+                    f" {len(twice)} class(es) list one student twice — kept once, as first "
+                    f"written; check {', '.join(twice[:5])}{' …' if len(twice) > 5 else ''}."
+                )
             _flash(message)
             # Also kept where the preview was, which is where anyone who just
             # clicked the button is looking, until the next workbook is read.
@@ -3578,13 +3681,16 @@ def _history_view() -> None:
         "Add to past schedules", type="primary", key="history_save",
         disabled=not teacher.strip(),
     ):
-        result = db.save_lesson_history(teacher, sessions, source=upload.name)
+        result = db.save_lesson_history(
+            teacher, sessions, source=upload.name, dates=preview.get("dates_shown")
+        )
         _retention_report.clear()
         st.session_state.pop("history_preview", None)
         _flash(
             f"Past schedules for {result['teacher']}: {result['added']:,} student-lessons "
-            f"added, {result['updated']:,} updated, {result['unchanged']:,} already on "
-            "file. Nothing was billed."
+            f"added, {result['updated']:,} updated, {result['unchanged']:,} already on file"
+            + (f", {result['removed']:,} no longer in the workbook removed" if result["removed"] else "")
+            + ". Nothing was billed."
         )
         st.rerun()
 

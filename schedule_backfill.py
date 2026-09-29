@@ -21,6 +21,7 @@ collision can never quietly attach a class to the wrong teacher.
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 import difflib
 import re
@@ -41,6 +42,10 @@ __all__ = [
     "apply_review_decisions",
     "suggest_class_renames",
     "suggest_student_matches",
+    "months_found",
+    "default_months",
+    "restrict_to_months",
+    "plan_import",
 ]
 
 # db.py rejects a rate of zero, so an import seeds this placeholder and the
@@ -432,12 +437,19 @@ def _matches_stored(
 
 
 def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> list[dict]:
-    """Turn the parser's single status into the database's condition flags."""
+    """Turn the parser's single status into the database's condition flags.
+
+    One row per student, the first written: a child listed twice in one
+    class cell -- the same name again, or two spellings of one child on
+    file -- has one place in the class, not two.
+    """
     rows = []
+    seen: set[int] = set()
     for entry in session["attendance"]:
         student_id = name_to_id.get(entry["student_name"].casefold())
-        if student_id is None:
+        if student_id is None or student_id in seen:
             continue
+        seen.add(student_id)
         status = (entry.get("status") or "Attending").casefold()
         rows.append(
             {
@@ -449,6 +461,110 @@ def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> lis
             }
         )
     return rows
+
+
+def _listed_twice(session: dict[str, Any], name_to_id: dict[str, int]) -> bool:
+    ids = [name_to_id.get(entry["student_name"].casefold()) for entry in session["attendance"]]
+    ids = [student_id for student_id in ids if student_id is not None]
+    return len(ids) != len(set(ids))
+
+
+def _final_sessions(sessions: list[dict], name_overrides: dict[str, str]) -> tuple[list[dict], int]:
+    """The workbook's lessons under the subject names they are filed as, each once.
+
+    A month sheet usually repeats the first day or two of the next month,
+    so the same class can be parsed twice from two worksheets. Writing
+    both is pure waste, and where the two copies disagree -- typically one
+    sheet spelling a student's name differently -- they would overwrite
+    each other on every single import, forever. The parser already warns
+    that the class appears twice; here the first copy wins, so an import
+    settles instead of oscillating. Returns the lessons and how many
+    repeats were dropped.
+    """
+    final: list[dict] = []
+    seen_slots: set[tuple[str, Any, Any]] = set()
+    for session in sessions:
+        session = {**session, "class_name": name_overrides.get(session["class_name"], session["class_name"])}
+        slot = (session["class_name"].casefold(), session["date"], session["start_time"])
+        if slot in seen_slots:
+            continue
+        seen_slots.add(slot)
+        final.append(session)
+    return final, len(sessions) - len(final)
+
+
+def _covered_dates(sessions: list[dict], dates) -> set[dt.date]:
+    """The days an import speaks for: the days its worksheets show, when known.
+
+    Without them -- a caller that picked its own lessons out of a workbook --
+    every day of each month the lessons fall in, as imports always did.
+    """
+    if dates is not None:
+        return set(dates)
+    covered = set()
+    for year, month in {(s["date"].year, s["date"].month) for s in sessions}:
+        first = dt.date(year, month, 1)
+        covered.update(first + dt.timedelta(days=offset)
+                       for offset in range(calendar.monthrange(year, month)[1]))
+    return covered
+
+
+def _teacher_classes(teacher: dict) -> dict[str, int]:
+    """This teacher's subjects by name, casefolded -- never another teacher's."""
+    return {
+        item["Class"].casefold(): item["ID"]
+        for item in db.get_all_classes()
+        if item["Teacher"].casefold() == teacher["Name"].casefold()
+    }
+
+
+def _same_name_rules(teacher_id: int, students_on_file: list[dict]):
+    """Students sharing exactly one name, and where this teacher teaches each."""
+    same_name: dict[str, list[int]] = defaultdict(list)
+    for item in students_on_file:
+        same_name[item["Name"].casefold()].append(item["ID"])
+    same_name = {name: ids for name, ids in same_name.items() if len(ids) > 1}
+    rosters = db.get_teacher_rosters(teacher_id) if same_name else {}
+    taught = set().union(*rosters.values()) if rosters else set()
+    return same_name, rosters, taught
+
+
+def _names_for_class(class_id, name_to_id, same_name, rosters, taught) -> dict[str, int]:
+    """Names to students for one class.
+
+    Two students with exactly one name -- two girls called Hana -- can't
+    be told apart by the name, so which class they're in decides: the one
+    already in that class, else the one this teacher teaches. Picking one
+    for every class moved a child's month onto the other girl.
+    """
+    if not same_name:
+        return name_to_id
+    names_here = dict(name_to_id)
+    for name, ids in same_name.items():
+        for pool in (rosters.get(class_id, set()), taught):
+            fits = [student_id for student_id in ids if student_id in pool]
+            if len(fits) == 1:
+                names_here[name] = fits[0]
+                break
+    return names_here
+
+
+def _workbook_slots(sessions, by_class, existing):
+    """What the workbook still has, for db.workbook_drops.
+
+    Returns the subjects it contains that are already on file, each of those
+    subjects' (id, date, start), and every (date, start) it writes anything
+    at -- the last including classes whose name the import could not match,
+    so their time is never read as empty.
+    """
+    class_ids = {existing[name.casefold()] for name in by_class if name.casefold() in existing}
+    keep_slots = {
+        (existing[session["class_name"].casefold()], session["date"], session["start_time"])
+        for session in sessions
+        if session["class_name"].casefold() in existing
+    }
+    filled_slots = {(session["date"], session["start_time"]) for session in sessions}
+    return class_ids, keep_slots, filled_slots
 
 
 # One import at a time. A second run of the app can start while the first is
@@ -466,8 +582,14 @@ def backfill(
     hourly_rate: float = DEFAULT_RATE,
     name_overrides: dict[str, str] | None = None,
     student_matches: dict[str, int] | None = None,
+    dates=None,
 ) -> dict[str, Any]:
     """Write a parsed workbook into the database for one teacher.
+
+    ``dates`` are the days the uploaded worksheets show (the preview's
+    ``dates_shown``, cut to the months being imported). On those days the
+    teacher's calendar is made to match the workbook; other days are left
+    alone. Without it, every day of each month the lessons fall in.
 
     ``student_matches`` maps a parsed name (casefolded) to an *existing*
     student id -- the admin's confirmed answer to "is this really
@@ -477,10 +599,10 @@ def backfill(
     the admin actually looked at and said yes to.
     """
     with _ONE_IMPORT_AT_A_TIME:
-        return _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
+        return _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches, dates)
 
 
-def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches):
+def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches, dates):
     sessions = preview.get("sessions") or []
     if not sessions:
         return {"status": "empty"}
@@ -489,33 +611,10 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     if teacher is None:
         return {"status": "no_such_teacher"}
 
-    name_overrides = name_overrides or {}
-    for session in sessions:
-        session["class_name"] = name_overrides.get(session["class_name"], session["class_name"])
-
     created: dict[str, int] = defaultdict(int)
-
-    # A month sheet usually repeats the first day or two of the next month,
-    # so the same class can be parsed twice from two worksheets. Writing
-    # both is pure waste, and where the two copies disagree -- typically one
-    # sheet spelling a student's name differently -- they would overwrite
-    # each other on every single import, forever. The parser already warns
-    # that the class appears twice; here the first copy wins, so an import
-    # settles instead of oscillating.
-    deduped: list[dict[str, Any]] = []
-    seen_slots: set[tuple[str, Any, Any]] = set()
-    for session in sessions:
-        slot = (
-            session["class_name"].casefold(),
-            session["date"],
-            session["start_time"],
-        )
-        if slot in seen_slots:
-            created["duplicate_slots_skipped"] += 1
-            continue
-        seen_slots.add(slot)
-        deduped.append(session)
-    sessions = deduped
+    sessions, repeats = _final_sessions(sessions, name_overrides or {})
+    if repeats:
+        created["duplicate_slots_skipped"] = repeats
     period_stats: dict[tuple[int, int], dict[str, int]] = defaultdict(
         lambda: {"created": 0, "updated": 0}
     )
@@ -537,16 +636,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     students_on_file = db.get_all_students()
     name_to_id = {**db.get_student_aliases(),
                   **{item["Name"].casefold(): item["ID"] for item in students_on_file}}
-    # Two students with exactly one name -- two girls called Suhyun -- can't
-    # be told apart by the name, so which class they're in decides: the one
-    # already in that class, else the one this teacher teaches. Picking one
-    # for every class moved a child's month onto the other girl.
-    same_name: dict[str, list[int]] = defaultdict(list)
-    for item in students_on_file:
-        same_name[item["Name"].casefold()].append(item["ID"])
-    same_name = {name: ids for name, ids in same_name.items() if len(ids) > 1}
-    rosters = db.get_teacher_rosters(teacher_id) if same_name else {}
-    taught = set().union(*rosters.values()) if rosters else set()
+    same_name, rosters, taught = _same_name_rules(teacher_id, students_on_file)
     confirmed = []
     for session in sessions:
         for entry in session["attendance"]:
@@ -581,54 +671,34 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
     for session in sessions:
         by_class[session["class_name"]].append(session)
 
-    existing = {
-        item["Class"].casefold(): item["ID"]
-        for item in db.get_all_classes()
-        if item["Teacher"].casefold() == teacher["Name"].casefold()
-    }
+    existing = _teacher_classes(teacher)
 
-    # The workbook is the record for the months it covers, so a class that
-    # has disappeared from it -- moved to another day, or dropped -- is
-    # removed. Without this a rescheduled class would leave its old slot
-    # behind and the student would be billed for both. It is done first,
-    # before anything is added: a workbook that swaps one subject for another
-    # at the same time needs the old one gone, or the new one is refused as a
-    # clash with it and the slot ends up empty -- the old class credited, the
-    # one that ran never charged.
-    # Restricted to the classes this workbook actually contains: if a class
-    # failed to import (an unresolved name collision, say) its classes must
-    # not look "missing" and be deleted. A class dropped from the sheet
-    # entirely therefore keeps its classes, to be removed by hand.
-    imported_class_ids = {
-        existing[name.casefold()] for name in by_class if name.casefold() in existing
-    }
-    keep_slots = {
-        (existing[session["class_name"].casefold()],
-         session["date"], session["start_time"])
-        for session in sessions
-        if session["class_name"].casefold() in existing
-    }
-    periods = sorted({(s["date"].year, s["date"].month) for s in sessions})
+    # The workbook is the record for the days it shows, so a class that has
+    # disappeared from it -- moved to another day, or dropped -- is removed.
+    # Without this a rescheduled class would leave its old slot behind and
+    # the student would be billed for both. It is done first, before anything
+    # is added: a workbook that swaps one subject for another at the same
+    # time needs the old one gone, or the new one is refused as a clash with
+    # it and the slot ends up empty -- the old class credited, the one that
+    # ran never charged. Which lessons go is db.workbook_drops.
+    imported_class_ids, keep_slots, filled_slots = _workbook_slots(sessions, by_class, existing)
     reconciled = db.remove_lessons_not_in(
-        teacher_id, periods, keep_slots, imported_class_ids
+        teacher_id, _covered_dates(sessions, dates), keep_slots, imported_class_ids, filled_slots
     )
     if reconciled["lessons_removed"]:
         created["lessons_removed"] = reconciled["lessons_removed"]
     if reconciled["credits_raised"]:
         created["credits_raised"] = reconciled["credits_raised"]
 
+    listed_twice: list[str] = []
     for index, (class_name, class_sessions) in enumerate(sorted(by_class.items())):
         class_sessions.sort(key=lambda item: (item["date"], item["start_time"]))
         class_id = existing.get(class_name.casefold())
-        names_here = name_to_id
-        if same_name:
-            names_here = dict(name_to_id)
-            for name, ids in same_name.items():
-                for pool in (rosters.get(class_id, set()), taught):
-                    fits = [student_id for student_id in ids if student_id in pool]
-                    if len(fits) == 1:
-                        names_here[name] = fits[0]
-                        break
+        names_here = _names_for_class(class_id, name_to_id, same_name, rosters, taught)
+        listed_twice += [
+            item.get("cell") or f"{item['date']:%d %b} {item['class_name']}"
+            for item in class_sessions if _listed_twice(item, names_here)
+        ]
 
         roster = sorted(
             {
@@ -762,4 +832,161 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
             warning_count=warnings_by_month.get((year, month), 0),
         )
 
-    return {"status": "imported", "created": dict(created)}
+    if listed_twice:
+        created["listed_twice"] = len(listed_twice)
+    return {"status": "imported", "created": dict(created), "listed_twice": listed_twice}
+
+
+# ---------------------------------------------------------------------------
+# Choosing the months, and saying what an upload will change
+# ---------------------------------------------------------------------------
+
+
+def _month_of(day: dt.date) -> tuple[int, int]:
+    return day.year, day.month
+
+
+def months_found(preview: dict[str, Any]) -> list[dict[str, Any]]:
+    """Each month a parsed upload reaches, in order: its classes and days shown.
+
+    ``own`` is False for a month the worksheets only spill into -- the day
+    or two of the next month at the end of a month sheet.
+    """
+    classes = Counter(_month_of(session["date"]) for session in preview.get("sessions") or [])
+    days = Counter(_month_of(day) for day in preview.get("dates_shown") or [])
+    own = set(map(tuple, preview.get("sheet_months") or [])) or set(classes) | set(days)
+    return [
+        {"month": month, "classes": classes[month], "days": days[month], "own": month in own}
+        for month in sorted(set(classes) | set(days))
+    ]
+
+
+def default_months(preview: dict[str, Any], teacher_id: int | None,
+                   today: dt.date | None = None) -> list[tuple[int, int]]:
+    """The months an upload imports unless somebody says otherwise.
+
+    The months the app already holds for the teacher, and any after them:
+    an update, and what is coming. Not the months before -- billed outside
+    the app, so importing them would put them up for billing again -- and
+    not a month the worksheets only spill into, which is the next sheet's to
+    say. A teacher new to the app starts from this month.
+    """
+    today = today or dt.date.today()
+    held = db.get_teacher_months(teacher_id) if teacher_id else []
+    onwards = max(held) if held else (today.year, today.month)
+    return [
+        item["month"] for item in months_found(preview)
+        if item["own"] and (item["month"] in held or item["month"] >= onwards)
+    ]
+
+
+def restrict_to_months(preview: dict[str, Any], months) -> dict[str, Any]:
+    """The upload with only the chosen months' lessons, days and name questions."""
+    months = set(map(tuple, months))
+    sessions = [s for s in preview.get("sessions") or [] if _month_of(s["date"]) in months]
+    names = {a["student_name"] for s in sessions for a in s["attendance"]}
+    warnings = [w for w in preview.get("warnings") or []
+                if not w.get("date") or _month_of(w["date"]) in months]
+    return {
+        **preview,
+        "sessions": sessions,
+        "dates_shown": (None if preview.get("dates_shown") is None else
+                        [d for d in preview["dates_shown"] if _month_of(d) in months]),
+        "name_reviews": [r for r in preview.get("name_reviews") or []
+                         if any(name in names for name in r["names"])],
+        "warnings": warnings,
+        "session_count": len(sessions),
+        "unique_student_count": len(names),
+        "warning_count": len(warnings) + sum(len(s["warnings"]) for s in sessions),
+    }
+
+
+def plan_import(preview: dict[str, Any], teacher_id: int | None,
+                name_overrides: dict[str, str] | None = None,
+                student_matches: dict[str, int] | None = None,
+                dates=None, today: dt.date | None = None) -> dict[tuple[int, int], Counter]:
+    """What committing an upload would change, month by month, changing nothing.
+
+    Follows ``backfill`` step by step -- the same subject names, the same
+    students, the same lessons dropped (db.workbook_drops), the same
+    clashes -- so the screen can say before the import what the import then
+    does. Per month: "new", "changed", "unchanged", "removed", and of those
+    already invoiced "changed_invoiced" and "removed_invoiced"; "held" (only
+    its date has passed, so it is marked held -- the import counts these as
+    updated too); "clash" (the teacher already has a class at that time, so
+    it is not added) and "skipped" (another teacher's subject has that name).
+    """
+    today = today or dt.date.today()
+    sessions, _ = _final_sessions(preview.get("sessions") or [], name_overrides or {})
+    counts: dict[tuple[int, int], Counter] = defaultdict(Counter)
+    teacher = next((t for t in db.get_all_teachers() if t["ID"] == teacher_id), None)
+    if teacher is None:
+        for session in sessions:
+            counts[_month_of(session["date"])]["new"] += 1
+        return counts
+
+    students_on_file = db.get_all_students()
+    name_to_id = {**(student_matches or {}), **db.get_student_aliases(),
+                  **{item["Name"].casefold(): item["ID"] for item in students_on_file}}
+    # A name not on file becomes a new student; nobody stored can match it.
+    for session in sessions:
+        for entry in session["attendance"]:
+            name_to_id.setdefault(entry["student_name"].casefold(), -len(name_to_id) - 1)
+    same_name, rosters, taught = _same_name_rules(teacher_id, students_on_file)
+
+    existing = _teacher_classes(teacher)
+    taken_elsewhere = {item["Class"].casefold() for item in db.get_all_classes()} - set(existing)
+    by_class: dict[str, list[dict]] = defaultdict(list)
+    for session in sessions:
+        by_class[session["class_name"]].append(session)
+    covered = _covered_dates(sessions, dates)
+    class_ids, keep_slots, filled_slots = _workbook_slots(sessions, by_class, existing)
+    stored = db.get_teacher_lessons_on(teacher_id, covered | {s["date"] for s in sessions})
+
+    on_calendar: dict[dt.date, list[tuple]] = defaultdict(list)
+    for (class_id, day, start), lesson in stored.items():
+        if db.workbook_drops(class_id, day, start, covered, keep_slots, class_ids, filled_slots):
+            month = counts[_month_of(day)]
+            month["removed"] += 1
+            month["removed_invoiced"] += lesson["Invoiced"]
+        else:
+            on_calendar[day].append((lesson["Start"], lesson["End"], lesson["ID"]))
+
+    def clashes(session, excluded=None):
+        return any(start < session["end_time"] and end > session["start_time"] and lesson_id != excluded
+                   for start, end, lesson_id in on_calendar[session["date"]])
+
+    for class_name, class_sessions in sorted(by_class.items()):
+        class_sessions = sorted(class_sessions, key=lambda item: (item["date"], item["start_time"]))
+        class_id = existing.get(class_name.casefold())
+        if class_id is None:
+            if class_name.casefold() in taken_elsewhere or clashes(class_sessions[0]):
+                reason = "skipped" if class_name.casefold() in taken_elsewhere else "clash"
+                for session in class_sessions:
+                    counts[_month_of(session["date"])][reason] += 1
+                continue
+        names_here = _names_for_class(class_id, name_to_id, same_name, rosters, taught)
+        for session in class_sessions:
+            month = counts[_month_of(session["date"])]
+            current = stored.get((class_id, session["date"], session["start_time"])) if class_id else None
+            if current is None:
+                if clashes(session):
+                    month["clash"] += 1
+                    continue
+                on_calendar[session["date"]].append((session["start_time"], session["end_time"], None))
+                month["new"] += 1
+                continue
+            status = "Completed" if session["date"] <= today else "Scheduled"
+            rows = _attendance_rows(session, names_here)
+            if _matches_stored(session, status, rows, current):
+                month["unchanged"] += 1
+            elif (current["Status"], status) == ("Scheduled", "Completed") and _matches_stored(
+                    session, "Scheduled", rows, current):
+                # Nothing in the workbook changed: the class's date has passed.
+                month["held"] += 1
+            elif clashes(session, excluded=current["ID"]):
+                month["clash"] += 1
+            else:
+                month["changed"] += 1
+                month["changed_invoiced"] += current["Invoiced"]
+    return counts

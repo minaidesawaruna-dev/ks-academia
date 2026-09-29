@@ -1690,12 +1690,14 @@ def _resolve_dates(
 
 
 def _parse_sheet(worksheet, month: int | None, year: int):
-    """Read one worksheet into ``(sessions, warnings, months)``.
+    """Read one worksheet into ``(sessions, warnings, months, shown)``.
 
     ``month`` is the month the worksheet's name gives, or None when it gives
     none -- a sheet called "2026", which names its months above the day
     labels instead. ``months`` is the ``(year, month)`` of each month the
     sheet was read as, for the summary table; empty when nothing was read.
+    ``shown`` is every date the sheet has a day column for, lessons or not:
+    what an import of it can say is on the calendar, and what is not.
     """
     sheet_name = worksheet.title
     warnings: list[dict[str, Any]] = []
@@ -1706,10 +1708,10 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             return [], [_warning(
                 "skipped — the worksheet name gives no month and there are no day "
                 "labels such as '15(SAT)', so it doesn't look like a schedule.",
-                sheet=sheet_name)], []
+                sheet=sheet_name)], [], []
         return [], [
             _warning("no day headers such as '15(SAT)' were found.", sheet=sheet_name)
-        ], []
+        ], [], []
 
     row_times, time_columns = _time_axis(worksheet, header_row)
     if not row_times:
@@ -1737,7 +1739,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                                  coordinate=cell.coordinate if cell else None,
                                  cell_text=cell.value if cell else None))
     if not blocks:
-        return [], warnings, []
+        return [], warnings, [], []
 
     dates: dict[int, dt.date] = {}
     for block in blocks:
@@ -2192,7 +2194,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
 
     warnings += _absence_note_warnings(day_notes, sessions, sheet_name)
     sessions.sort(key=lambda item: (item["date"], item["start_time"], item["class_name"]))
-    return sessions, warnings, [(block["year"], block["month"]) for block in blocks]
+    return (sessions, warnings, [(block["year"], block["month"]) for block in blocks],
+            sorted(set(dates.values())))
 
 
 # --------------------------------------------------------------------------
@@ -2445,7 +2448,7 @@ def parse_schedule(source: Any, sheet_name: str, year: int) -> dict[str, Any]:
     try:
         if sheet_name not in workbook.sheetnames:
             raise ValueError(f"The workbook has no worksheet named {sheet_name!r}.")
-        sessions, warnings, _ = _parse_sheet(
+        sessions, warnings, months, shown = _parse_sheet(
             workbook[sheet_name], month, infer_year(sheet_name, int(year))
         )
     finally:
@@ -2454,6 +2457,8 @@ def parse_schedule(source: Any, sheet_name: str, year: int) -> dict[str, Any]:
     _name_unnamed(sessions)
     preview = _summarise(sessions, warnings, sheet_name, month, int(year))
     preview["name_reviews"] = report["reviews"]
+    preview["dates_shown"] = shown
+    preview["sheet_months"] = sorted(set(months))
     return preview
 
 
@@ -2464,6 +2469,8 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
     all_sessions: list[dict[str, Any]] = []
     all_warnings: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
+    shown: set[dt.date] = set()
+    own_months: set[tuple[int, int]] = set()
 
     try:
         for sheet_name in sheet_names:
@@ -2481,11 +2488,13 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
                 month = None
 
             sheet_year = infer_year(sheet_name, year)
-            sessions, warnings, months = _parse_sheet(
+            sessions, warnings, months, sheet_dates = _parse_sheet(
                 workbook[sheet_name], month, sheet_year
             )
             all_sessions.extend(sessions)
             all_warnings.extend(warnings)
+            shown.update(sheet_dates)
+            own_months.update(months)
             if month is None and not months:
                 continue  # not a schedule; its warning says so
 
@@ -2533,6 +2542,11 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
     preview = _summarise(all_sessions, all_warnings, "All worksheets", None, year)
     preview["sheet_summaries"] = summaries
     preview["name_reviews"] = report["reviews"]
+    preview["dates_shown"] = sorted(shown)
+    # The months the worksheets are *for*: a month sheet's own month, each
+    # month a year sheet labels. Not the day or two a sheet spills into the
+    # next month -- those are the next sheet's to say.
+    preview["sheet_months"] = sorted(own_months)
     return preview
 
 

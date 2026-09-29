@@ -1061,6 +1061,128 @@ print(json.dumps(result))
 '''
 
 
+_REUPLOAD_SCRIPT = r'''
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import select, func
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+everyone = ["Nam Jihoon", "Oh Minseok", "Seo Yerin"]
+KINDS = ("new", "changed", "unchanged", "removed", "clash", "skipped")
+
+def lesson(day, names, subject="G11 Test Math", hour=16):
+    return {"date": day, "class_name": subject, "start_time": dt.time(hour), "end_time": dt.time(hour + 2),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+def month_days(month, leave_out=()):
+    first = dt.date(2026, month, 1)
+    days = [first + dt.timedelta(days=i) for i in range(31)]
+    return [d for d in days if d.month == month and d not in leave_out]
+
+def on_calendar():
+    with db.SessionLocal() as s:
+        rows = s.execute(select(db.ClassSession.session_date, db.ClassSession.start_time, db.AcademyClass.name)
+                         .join(db.AcademyClass, db.AcademyClass.id == db.ClassSession.class_id)).all()
+    return sorted(f"{d:%m-%d} {t:%H} {n}" for d, t, n in rows)
+
+def upload(sessions, dates):
+    preview = {"sessions": sessions, "dates_shown": dates}
+    plan = sb.plan_import(preview, teacher, dates=dates)
+    got = sb.backfill(preview, teacher, dates=dates)
+    c = got["created"]
+    done = {"new": c.get("sessions_created", 0), "changed": c.get("sessions_updated", 0),
+            "unchanged": c.get("sessions_unchanged", 0), "removed": c.get("lessons_removed", 0),
+            "clash": c.get("lessons_teacher_conflict", 0) + c.get("class_teacher_conflict", 0),
+            "skipped": c.get("class_duplicate", 0)}
+    planned = {k: sum(m[k] for m in plan.values()) for k in KINDS}
+    planned["changed"] += sum(m["held"] for m in plan.values())  # the import counts both as updated
+    return planned, done, got.get("listed_twice", [])
+
+sept = lambda d: dt.date(2026, 9, d)
+first = ([lesson(sept(d), everyone) for d in (7, 14, 21, 25, 28)]
+         + [lesson(dt.date(2026, 10, d), everyone) for d in (5, 12)]
+         + [lesson(sept(20), everyone[:2], "G11 Test Mock", 10), lesson(sept(21), everyone[2:], "G9 Test Science", 13)])
+result = {"first": upload(first, month_days(9) + month_days(10))}
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+
+# The updated September sheet: the 28th moved to the 29th, the mock gone, Science written
+# another way, one child written twice twice over -- and its last columns, 1 and 2 October.
+twice = ["Nam Jihoon"] + everyone
+update = ([lesson(sept(7), twice), lesson(sept(14), everyone), lesson(sept(21), everyone), lesson(sept(29), twice)]
+          + [lesson(sept(21), everyone[2:], "G9 Test Sci", 13)])
+shown = month_days(9, leave_out={sept(25)}) + [dt.date(2026, 10, 1), dt.date(2026, 10, 2)]
+result["update"] = upload(update, shown)
+result["calendar"] = on_calendar()
+result["credits"] = sorted([c["Subject"], str(c["Class date"]), c["Amount"]] for c in db.get_credits())
+with db.SessionLocal() as s:
+    result["on_29th"] = s.scalar(select(func.count()).select_from(db.SessionAttendance)
+                                 .join(db.ClassSession, db.ClassSession.id == db.SessionAttendance.session_id)
+                                 .where(db.ClassSession.session_date == sept(29)))
+result["again"] = upload(update, shown)
+
+picked = {"sessions": [lesson(dt.date(2026, 1, 5), everyone), lesson(sept(7), everyone), lesson(dt.date(2026, 11, 2), everyone)],
+          "dates_shown": [dt.date(2026, 1, 5), sept(7), dt.date(2026, 11, 2), dt.date(2026, 12, 1)],
+          "sheet_months": [(2026, 1), (2026, 9), (2026, 11)]}
+result["default"] = sb.default_months(picked, teacher)
+result["default_new"] = [sb.default_months(picked, None, today=dt.date(2026, 9, 15)),
+                         sb.default_months(picked, None, today=dt.date(2026, 10, 1))]
+cut = sb.restrict_to_months(picked, [(2026, 9)])
+result["restricted"] = [[str(s["date"]) for s in cut["sessions"]], [str(d) for d in cut["dates_shown"]]]
+
+# Past schedules: a newer copy of a workbook replaces the old on the days it shows.
+db.save_lesson_history("Teacher B", [lesson(dt.date(2026, 8, 3), everyone[:1])])
+db.save_lesson_history("Teacher B", [lesson(sept(7), everyone[:2]), lesson(sept(14), everyone[:2])],
+                       dates=[sept(7), sept(14)])
+again = db.save_lesson_history("Teacher B", [lesson(sept(7), everyone[:1]), lesson(sept(15), everyone[:2])],
+                               dates=[sept(7), sept(14), sept(15)])
+with db.SessionLocal() as s:
+    rows = s.execute(select(db.LessonHistory.lesson_date, db.LessonHistory.student_name)).all()
+result["history"] = [sorted(f"{d:%m-%d} {n}" for d, n in rows), again["removed"]]
+print(json.dumps(result, default=list))
+'''
+
+
+def t_reupload_same_month():
+    """Uploading an updated workbook for a month already imported touches only what changed.
+
+    The calendar is made to match the workbook on the days it shows, and
+    nowhere else: a class moved or dropped goes (credited if invoiced), even
+    when its subject has vanished from the upload; a class the upload writes
+    another way at the same time is left for a person; a day with no column,
+    and the rest of a month a sheet only spills into, are untouched. A child
+    written twice in a class is one place, not a crash. What the screen says
+    beforehand (plan_import) is exactly what the import does.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "reupload.db").replace("\\", "/")
+        result = run(["-c", _REUPLOAD_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    for step in ("first", "update", "again"):
+        planned, done, _ = got[step]
+        assert planned == done, f"{step}: the screen said {planned}, the import did {done}"
+    assert got["first"][1] == {"new": 9, "changed": 0, "unchanged": 0, "removed": 0, "clash": 0, "skipped": 0}
+    assert got["update"][1] == {"new": 1, "changed": 0, "unchanged": 3, "removed": 2, "clash": 1, "skipped": 0}, got["update"]
+    assert got["update"][2] == ["07 Sep G11 Test Math", "29 Sep G11 Test Math"], got["update"][2]
+    assert got["calendar"] == ["09-07 16 G11 Test Math", "09-14 16 G11 Test Math", "09-21 13 G9 Test Science",
+                               "09-21 16 G11 Test Math", "09-25 16 G11 Test Math", "09-29 16 G11 Test Math",
+                               "10-05 16 G11 Test Math", "10-12 16 G11 Test Math"], got["calendar"]
+    assert got["credits"] == ([["G11 Test Math", "2026-09-28", 130.0]] * 3
+                              + [["G11 Test Mock", "2026-09-20", 130.0]] * 2), got["credits"]
+    assert got["on_29th"] == 3, f"a child written twice was put in twice: {got['on_29th']}"
+    assert got["again"][1] == {"new": 0, "changed": 0, "unchanged": 4, "removed": 0, "clash": 1, "skipped": 0}, got["again"]
+    assert got["default"] == [[2026, 9], [2026, 11]], got["default"]
+    assert got["default_new"] == [[[2026, 9], [2026, 11]], [[2026, 11]]], got["default_new"]
+    assert got["restricted"] == [["2026-09-07"], ["2026-09-07"]], got["restricted"]
+    assert got["history"] == [["08-03 Nam Jihoon", "09-07 Nam Jihoon", "09-15 Nam Jihoon", "09-15 Oh Minseok"], 3], got["history"]
+    return ("moved and dropped classes go, credited; October's rest, an unshown day and a renamed class "
+            "kept; a child written twice kept once; the screen's forecast matched; past schedules replaced")
+
+
 def t_swapped_class_same_slot():
     """A class the workbook replaces with another at the same time is swapped, not lost.
 
@@ -1269,6 +1391,7 @@ for name, fn in [
     ("import prices by grade", t_import_prices_by_grade),
     ("cancelled classes credited", t_cancelled_classes_credited),
     ("a class swapped in the same slot", t_swapped_class_same_slot),
+    ("re-uploading an updated month", t_reupload_same_month),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
