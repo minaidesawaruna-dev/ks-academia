@@ -587,6 +587,36 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
         if item["Teacher"].casefold() == teacher["Name"].casefold()
     }
 
+    # The workbook is the record for the months it covers, so a class that
+    # has disappeared from it -- moved to another day, or dropped -- is
+    # removed. Without this a rescheduled class would leave its old slot
+    # behind and the student would be billed for both. It is done first,
+    # before anything is added: a workbook that swaps one subject for another
+    # at the same time needs the old one gone, or the new one is refused as a
+    # clash with it and the slot ends up empty -- the old class credited, the
+    # one that ran never charged.
+    # Restricted to the classes this workbook actually contains: if a class
+    # failed to import (an unresolved name collision, say) its classes must
+    # not look "missing" and be deleted. A class dropped from the sheet
+    # entirely therefore keeps its classes, to be removed by hand.
+    imported_class_ids = {
+        existing[name.casefold()] for name in by_class if name.casefold() in existing
+    }
+    keep_slots = {
+        (existing[session["class_name"].casefold()],
+         session["date"], session["start_time"])
+        for session in sessions
+        if session["class_name"].casefold() in existing
+    }
+    periods = sorted({(s["date"].year, s["date"].month) for s in sessions})
+    reconciled = db.remove_lessons_not_in(
+        teacher_id, periods, keep_slots, imported_class_ids
+    )
+    if reconciled["lessons_removed"]:
+        created["lessons_removed"] = reconciled["lessons_removed"]
+    if reconciled["credits_raised"]:
+        created["credits_raised"] = reconciled["credits_raised"]
+
     for index, (class_name, class_sessions) in enumerate(sorted(by_class.items())):
         class_sessions.sort(key=lambda item: (item["date"], item["start_time"]))
         class_id = existing.get(class_name.casefold())
@@ -710,36 +740,14 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches)
             else:
                 created[f"lessons_{outcome}"] += 1
 
-    # The workbook is the record for the months it covers, so a class that
-    # has disappeared from it -- moved to another day, or dropped -- is
-    # removed here. Without this a rescheduled class would leave its old
-    # slot behind and the student would be billed for both.
-    # Restricted to the classes this workbook actually contains: if a class
-    # failed to import (an unresolved name collision, say) its classes must
-    # not look "missing" and be deleted. A class dropped from the sheet
-    # entirely therefore keeps its classes, to be removed by hand.
-    imported_class_ids = {
-        existing[name.casefold()] for name in by_class if name.casefold() in existing
-    }
-    keep_slots = {
-        (existing[session["class_name"].casefold()],
-         session["date"], session["start_time"])
-        for session in sessions
-        if session["class_name"].casefold() in existing
-    }
-    periods = sorted({(s["date"].year, s["date"].month) for s in sessions})
-    reconciled = db.remove_lessons_not_in(
-        teacher_id, periods, keep_slots, imported_class_ids
-    )
-    if reconciled["lessons_removed"]:
-        created["lessons_removed"] = reconciled["lessons_removed"]
-    if reconciled["credits_raised"]:
-        created["credits_raised"] = reconciled["credits_raised"]
-
     # No subject is left on the placeholder. A name with a grade was priced
     # as it was created; the rest are priced here, once their lessons are in
     # and their students' grades can be read -- else the $60 default. A
-    # placeholder only ever meant an invoice nobody could send.
+    # placeholder only ever meant an invoice nobody could send. Every class
+    # this workbook contains now, the ones just created included.
+    imported_class_ids = {
+        existing[name.casefold()] for name in by_class if name.casefold() in existing
+    }
     priced, _ = price_by_rule(db.get_unpriced_subjects(class_ids=imported_class_ids))
     if priced:
         created["priced_by_rule"] = priced

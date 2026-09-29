@@ -1017,6 +1017,75 @@ print(json.dumps(result))
 '''
 
 
+_SWAP_SCRIPT = r'''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+everyone = ["Nam Jihoon", "Oh Minseok", "Seo Yerin"]
+
+def lesson(day, names, subject="G11 Test Math"):
+    return {"date": day, "class_name": subject, "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+def lessons_on(day):
+    from sqlalchemy import select, func
+    with db.SessionLocal() as s:
+        rows = s.execute(select(db.AcademyClass.name, func.count(db.SessionAttendance.id))
+                         .join(db.ClassSession, db.ClassSession.class_id == db.AcademyClass.id)
+                         .join(db.SessionAttendance, db.SessionAttendance.session_id == db.ClassSession.id)
+                         .where(db.ClassSession.session_date == day).group_by(db.ClassSession.id)).all()
+    return [{"class_name": n, "n": c} for n, c in rows]
+
+def owed():
+    return sorted([c["Student"], c["Amount"], c["Status"]] for c in db.get_credits())
+
+def to_bill():
+    return sorted([row["Student"], row["Month Amount"]] for row in db.get_open_invoice_items_for_month(2026, 9))
+
+sept = [lesson(dt.date(2026, 9, d), everyone) for d in (1, 8, 15, 22)]
+sb.backfill({"sessions": sept}, teacher)
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+day = dt.date(2026, 9, 22)
+swapped = sept[:3] + [lesson(day, ["Nam Jihoon", "Seo Yerin"], "G11 Test Workshop")]
+first = sb.backfill({"sessions": swapped}, teacher)["created"]
+result = {"counts": {k: v for k, v in first.items() if k in ("sessions_created", "lessons_removed")},
+          "on_day": sorted([x["class_name"], x["n"]] for x in lessons_on(day)), "credits": owed(), "to_bill": to_bill()}
+sb.backfill({"sessions": swapped}, teacher)
+result["again"] = [sorted([x["class_name"], x["n"]] for x in lessons_on(day)), owed(), to_bill()]
+clash = sb.backfill({"sessions": swapped + [lesson(dt.date(2026, 9, 1), ["Oh Minseok"], "G11 Test Clinic")]}, teacher)
+result["clash"] = [clash["created"].get("lessons_teacher_conflict", 0) + clash["created"].get("class_teacher_conflict", 0),
+                   sorted([x["class_name"], x["n"]] for x in lessons_on(dt.date(2026, 9, 1)))]
+print(json.dumps(result))
+'''
+
+
+def t_swapped_class_same_slot():
+    """A class the workbook replaces with another at the same time is swapped, not lost.
+
+    The new class used to be refused -- the teacher already had a class at
+    that time -- and the old one was then removed as missing, so the slot
+    ended up empty: billed students credited, the class that did run never
+    charged. A true double booking is still refused and reported.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "swap.db").replace("\\", "/")
+        result = run(["-c", _SWAP_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-600:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["on_day"] == [["G11 Test Workshop", 2]], got["on_day"]
+    assert got["counts"] == {"sessions_created": 1, "lessons_removed": 1}, got["counts"]
+    assert got["credits"] == [[n, 130.0, "Open"] for n in ("Nam Jihoon", "Oh Minseok", "Seo Yerin")], got["credits"]
+    assert got["to_bill"] == [["Nam Jihoon", 130.0], ["Seo Yerin", 130.0]], got["to_bill"]
+    assert got["again"] == [got["on_day"], got["credits"], got["to_bill"]], f"uploading again changed: {got['again']}"
+    assert got["clash"] == [1, [["G11 Test Math", 3]]], f"double booking: {got['clash']}"
+    return "swapped class in; old one credited; the new one billed; a real double booking still refused"
+
+
 def t_cancelled_classes_credited():
     """A class invoiced and then missed comes off the student's next invoice.
 
@@ -1199,6 +1268,7 @@ for name, fn in [
     ("long names fit their columns", t_long_names_fit_their_columns),
     ("import prices by grade", t_import_prices_by_grade),
     ("cancelled classes credited", t_cancelled_classes_credited),
+    ("a class swapped in the same slot", t_swapped_class_same_slot),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
