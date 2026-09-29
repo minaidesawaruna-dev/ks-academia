@@ -795,11 +795,12 @@ def initialise_database():
                         text(f"ALTER TABLE invoices ADD COLUMN {column_name} {definition}")
                     )
 
-    # A cancelled class is never paid for. Attendance written while that was
-    # not yet true left charges behind, and the same is true of any row that
-    # somehow bypasses sync_invoice_items, so the books are squared here on
-    # every start rather than waiting to be asked. One counting query when
-    # there is nothing to do, and running it twice changes nothing.
+    # A cancelled class is never paid for. A database from before that rule
+    # can still hold charges for cancelled classes, so they are squared as
+    # it is upgraded. (Only on upgrade: a current schema returns at the top.
+    # Day to day, sync_invoice_items keeps cancellations off the bill.) One
+    # counting query when there is nothing to do, and running it twice
+    # changes nothing.
     if count_billed_cancellations():
         backfill_cancellation_credits()
 
@@ -810,12 +811,6 @@ def initialise_database():
     for table in Base.metadata.sorted_tables:
         for index in table.indexes:
             index.create(engine, checkfirst=True)
-
-    # Payment moved from per-class ticks onto the invoice. Any invoice whose
-    # classes were all ticked under the old scheme was fully paid, so it is
-    # recorded as such once rather than reappearing as a debt. A no-op after
-    # the first run, and running it again changes nothing.
-    backfill_invoice_payments()
 
 
 def _fit(value, column):
@@ -1732,6 +1727,29 @@ def _replace_session_attendance(session, session_id, attendance_rows):
     )
 
 
+def _valid_lesson(start_time, end_time, status):
+    """A lesson ends after it starts and has one of the three statuses."""
+    return start_time < end_time and status in {"Scheduled", "Completed", "Cancelled"}
+
+
+def _insert_lesson(session, class_id, teacher_id, session_date, start_time, end_time, status, note,
+                   attendance_rows):
+    """Write one lesson and its roster inside the caller's transaction; returns its id."""
+    class_session = ClassSession(
+        class_id=class_id,
+        teacher_id=teacher_id,
+        session_date=session_date,
+        start_time=start_time,
+        end_time=end_time,
+        status=status,
+        note=(note or "").strip() or None,
+    )
+    session.add(class_session)
+    session.flush()
+    _replace_session_attendance(session, class_session.id, attendance_rows)
+    return class_session.id
+
+
 def create_class_and_first_session(
     name,
     teacher_id,
@@ -1752,8 +1770,7 @@ def create_class_and_first_session(
         not cleaned_name
         or hourly_rate <= 0
         or not _valid_colour(display_color)
-        or start_time >= end_time
-        or status not in {"Scheduled", "Completed", "Cancelled"}
+        or not _valid_lesson(start_time, end_time, status)
     ):
         return "invalid"
 
@@ -1806,24 +1823,9 @@ def create_class_and_first_session(
             )
         )
 
-        class_session = ClassSession(
-            class_id=academy_class.id,
-            teacher_id=teacher_id,
-            session_date=session_date,
-            start_time=start_time,
-            end_time=end_time,
-            status=status,
-            note=(note or "").strip() or None,
-        )
-        session.add(class_session)
-        session.flush()
-        _replace_session_attendance(
-            session,
-            class_session.id,
-            attendance_rows,
-        )
+        new_id = _insert_lesson(session, academy_class.id, teacher_id, session_date, start_time,
+                                end_time, status, note, attendance_rows)
         session.commit()
-        new_id = class_session.id
     # Outside the transaction: every student in the class goes onto their
     # open invoice.
     sync_invoice_items(new_id)
@@ -1842,11 +1844,7 @@ def create_schedule_session(
 ):
     """Create a class and its complete per-student conditions atomically."""
 
-    if start_time >= end_time or status not in {
-        "Scheduled",
-        "Completed",
-        "Cancelled",
-    }:
+    if not _valid_lesson(start_time, end_time, status):
         return "invalid"
 
     with SessionLocal() as session:
@@ -1862,24 +1860,9 @@ def create_schedule_session(
         ):
             return "teacher_conflict"
 
-        class_session = ClassSession(
-            class_id=class_id,
-            teacher_id=teacher_id,
-            session_date=session_date,
-            start_time=start_time,
-            end_time=end_time,
-            status=status,
-            note=(note or "").strip() or None,
-        )
-        session.add(class_session)
-        session.flush()
-        _replace_session_attendance(
-            session,
-            class_session.id,
-            attendance_rows,
-        )
+        new_id = _insert_lesson(session, class_id, teacher_id, session_date, start_time, end_time,
+                                status, note, attendance_rows)
         session.commit()
-        new_id = class_session.id
     sync_invoice_items(new_id)
     return "created"
 
@@ -1972,18 +1955,21 @@ def get_month_attendance(teacher_id, year, month):
 
         by_session: dict[int, list[dict[str, Any]]] = defaultdict(list)
         for attendance, student, session_id in rows:
-            by_session[session_id].append(
-                {
-                    "student_id": student.id,
-                    "student_name": student.full_name,
-                    "is_online": bool(attendance.is_online),
-                    "has_recording": bool(attendance.has_recording),
-                    "is_cancelled": bool(attendance.is_cancelled),
-                    "is_paid": bool(attendance.is_paid),
-                    "note": attendance.note or "",
-                }
-            )
+            by_session[session_id].append(_attendance_entry(attendance, student))
         return dict(by_session)
+
+
+def _attendance_entry(attendance, student):
+    """One student's place in a class, as the schedule screens edit it."""
+    return {
+        "student_id": student.id,
+        "student_name": student.full_name,
+        "is_online": bool(attendance.is_online),
+        "has_recording": bool(attendance.has_recording),
+        "is_cancelled": bool(attendance.is_cancelled),
+        "is_paid": bool(attendance.is_paid),
+        "note": attendance.note or "",
+    }
 
 
 def get_schedule_session(session_id):
@@ -2015,16 +2001,7 @@ def get_schedule_session(session_id):
             "Status": class_session.status,
             "Note": class_session.note or "",
             "Attendance": [
-                {
-                    "student_id": student.id,
-                    "student_name": student.full_name,
-                    "is_online": bool(attendance.is_online),
-                    "has_recording": bool(attendance.has_recording),
-                    "is_cancelled": bool(attendance.is_cancelled),
-                    "is_paid": bool(attendance.is_paid),
-                    "note": attendance.note or "",
-                }
-                for attendance, student in attendance_rows
+                _attendance_entry(attendance, student) for attendance, student in attendance_rows
             ],
         }
 
@@ -2038,11 +2015,7 @@ def update_schedule_session(
     note,
     attendance_rows,
 ):
-    if start_time >= end_time or status not in {
-        "Scheduled",
-        "Completed",
-        "Cancelled",
-    }:
+    if not _valid_lesson(start_time, end_time, status):
         return "invalid"
 
     with SessionLocal() as session:
@@ -2998,37 +2971,31 @@ def _invoice_lines(session, invoice):
     ).all()
     if invoice.status == "Issued":
         return _group_invoice_items(invoice, items, {}, {}, {}, {})
-
-    session_ids = {item.session_id for item in items}
-    lessons = {
-        lesson.id: lesson
-        for lesson in (
-            session.scalars(
-                select(ClassSession).where(ClassSession.id.in_(session_ids))
-            ).all()
-            if session_ids else []
-        )
-    }
-    class_ids = {lesson.class_id for lesson in lessons.values()}
-    teacher_ids = {lesson.teacher_id for lesson in lessons.values()}
-    classes = {
-        item.id: item
-        for item in (
-            session.scalars(
-                select(AcademyClass).where(AcademyClass.id.in_(class_ids))
-            ).all()
-            if class_ids else []
-        )
-    }
-    teachers = {
-        item.id: item
-        for item in (
-            session.scalars(select(Teacher).where(Teacher.id.in_(teacher_ids))).all()
-            if teacher_ids else []
-        )
-    }
-    rate_index = _rate_index(session, class_ids)
+    lessons, classes, teachers, rate_index = _lessons_with_context(
+        session, {item.session_id for item in items}
+    )
     return _group_invoice_items(invoice, items, lessons, classes, teachers, rate_index)
+
+
+def _lessons_with_context(session, session_ids):
+    """What an open invoice's lines are priced and named from.
+
+    Returns ``(lessons, classes, teachers, rate_index)``: the lessons by id,
+    their subjects and teachers by id, and the price index for those
+    subjects -- four queries however many lines there are.
+    """
+    session_ids = {session_id for session_id in session_ids if session_id is not None}
+
+    def by_id(model, ids):
+        if not ids:
+            return {}
+        return {row.id: row for row in session.scalars(select(model).where(model.id.in_(ids))).all()}
+
+    lessons = by_id(ClassSession, session_ids)
+    class_ids = {lesson.class_id for lesson in lessons.values()}
+    classes = by_id(AcademyClass, class_ids)
+    teachers = by_id(Teacher, {lesson.teacher_id for lesson in lessons.values()})
+    return lessons, classes, teachers, _rate_index(session, class_ids)
 
 
 def _credit_totals(session, invoice_ids):
@@ -3128,39 +3095,9 @@ def get_invoices(status=None, student_id=None):
             ).all():
                 items_by_invoice[item.invoice_id].append(item)
 
-        open_session_ids = {
-            item.session_id
-            for items in items_by_invoice.values()
-            for item in items
-        }
-        lessons = {
-            lesson.id: lesson
-            for lesson in (
-                session.scalars(
-                    select(ClassSession).where(ClassSession.id.in_(open_session_ids))
-                ).all()
-                if open_session_ids else []
-            )
-        }
-        class_ids = {lesson.class_id for lesson in lessons.values()}
-        teacher_ids = {lesson.teacher_id for lesson in lessons.values()}
-        classes = {
-            item.id: item
-            for item in (
-                session.scalars(
-                    select(AcademyClass).where(AcademyClass.id.in_(class_ids))
-                ).all()
-                if class_ids else []
-            )
-        }
-        teachers = {
-            item.id: item
-            for item in (
-                session.scalars(select(Teacher).where(Teacher.id.in_(teacher_ids))).all()
-                if teacher_ids else []
-            )
-        }
-        rate_index = _rate_index(session, class_ids)
+        lessons, classes, teachers, rate_index = _lessons_with_context(
+            session, {item.session_id for items in items_by_invoice.values() for item in items}
+        )
 
         # An issued invoice's credits are already inside _net_totals above.
         # An open one has none attached yet, so its draft figure has to look
@@ -3948,54 +3885,6 @@ def get_invoice_payments(year, month, today=None):
         # it has no date; it sorts after every real payment.
         paid.sort(key=lambda item: (item["Paid on"] or date.min, item["Student"]), reverse=True)
         return {"unpaid": unpaid, "paid": paid, "due": due}
-
-
-def backfill_invoice_payments():
-    """Carry the old per-class ticks up onto the invoices they belong to.
-
-    Before payment moved to the invoice, an admin ticked each class. Any
-    issued invoice whose classes were all ticked was, in the old scheme, fully
-    paid -- so it is recorded as paid here rather than reappearing as a debt.
-    """
-    with SessionLocal() as session:
-        candidates = session.scalars(
-            select(Invoice).where(Invoice.status == "Issued", Invoice.paid_on.is_(None))
-        ).all()
-        marked = 0
-        for invoice in candidates:
-            session_ids = [
-                row[0]
-                for row in session.execute(
-                    select(InvoiceItem.session_id).where(
-                        InvoiceItem.invoice_id == invoice.id,
-                        InvoiceItem.session_id.is_not(None),
-                    )
-                ).all()
-            ]
-            if not session_ids:
-                continue
-            flags = [
-                row[0]
-                for row in session.execute(
-                    select(SessionAttendance.is_paid).where(
-                        SessionAttendance.student_id == invoice.student_id,
-                        SessionAttendance.session_id.in_(session_ids),
-                    )
-                ).all()
-            ]
-            if flags and all(flags):
-                total = session.scalar(
-                    select(func.coalesce(func.sum(InvoiceItem.amount), 0.0)).where(
-                        InvoiceItem.invoice_id == invoice.id
-                    )
-                ) or 0.0
-                invoice.paid_on = invoice.issued_on or date.today()
-                invoice.paid_amount = round(float(total), 2)
-                invoice.payment_note = "Carried over from per-class ticks"
-                marked += 1
-        if marked:
-            session.commit()
-        return marked
 
 
 def get_payment_reminders(today=None):

@@ -30,7 +30,7 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _close_spelling, _fold, _shortened, _suffix,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _close_spelling, _shortened, _suffix,
     hangul_fit, name_sound, rate_for_grade, standard_rate, without_brackets,
 )
 
