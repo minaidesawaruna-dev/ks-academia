@@ -1238,6 +1238,22 @@ db.set_class_rate_for_month(db.get_all_classes()[0]["ID"], day(1), 70)
 result["flagged_after"] = sorted(e["ID"] for e in db.get_sent_invoices_out_of_step())
 db.keep_invoice_as_sent(nam_new)
 result["flagged_kept"] = sorted(e["ID"] for e in db.get_sent_invoices_out_of_step())
+
+# A class left off Nam Jihoon's invoice: taught on the 22nd, waiting for his next one.
+sb.backfill({"sessions": [lesson(day(1), everyone), lesson(day(8), everyone, cancelled={"Nam Jihoon"}),
+                          lesson(day(15), everyone, cancelled={"Oh Minseok"}),
+                          lesson(day(22), ["Nam Jihoon"])]}, teacher)
+data = db.get_invoice_for_edit(nam_new)
+status, nam_3, _ = db.replace_invoice(nam_new, {}, extra=data["Extra"], add=[w["ID"] for w in data["Waiting"]])
+result["forgotten"] = [len(data["Waiting"]), status, db.get_invoice(nam_3)["Total"],
+                       [row["Student"] for row in db.get_open_invoice_items_for_month(2026, 9)],
+                       len(db.get_invoices(status="Open"))]
+# Oh Minseok's, brought to the schedule's new price in one go.
+done = db.update_sent_invoices_to_schedule([oh_new])
+oh_3 = done[0][1] if done else None
+result["bulk"] = [len(done), oh_3 and db.get_invoice(oh_3)["Total"],
+                  [e["ID"] for e in db.get_sent_invoices_out_of_step()],
+                  next((r["Owing"] for r in db.get_invoice_payments(2026, 9)["unpaid"] if r["ID"] == oh_3), None)]
 result["ids"] = [nam, oh, nam_new, oh_new]
 print(json.dumps(result, default=str))
 '''
@@ -1273,8 +1289,13 @@ def t_edit_sent_invoice():
     assert got["flagged_before"] == [], got["flagged_before"]
     assert got["flagged_after"] == sorted([nam_new, oh_new]), got["flagged_after"]
     assert got["flagged_kept"] == [oh_new], got["flagged_kept"]
+    # The class left off goes on at today's $70 and is no longer waiting to be billed.
+    assert got["forgotten"] == [1, "replaced", 400.0, [], 0], got["forgotten"]
+    # Only the classes that changed move to $70; the one not charged stays at $0.
+    assert got["bulk"] == [1, 280.0, [], 20.0], got["bulk"]
     return ("replaced under a new number, old one void and kept; $0 class never credited; "
-            "no double refund; overpayment a credit; later price change flagged, keep-as-sent clears it")
+            "no double refund; overpayment a credit; a forgotten class added once; later price "
+            "change flagged, kept as sent or updated in bulk")
 
 
 def t_swapped_class_same_slot():

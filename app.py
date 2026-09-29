@@ -3008,7 +3008,35 @@ def _invoice_editor(detail: dict) -> None:
             st.session_state[f"edit_version_{invoice_id}"] = version + 1
             _rerun()
 
-    st.caption("Extra lines — materials, a discount (as a minus amount). Add or delete rows.")
+    add_ids = []
+    if data["Waiting"]:
+        st.caption(
+            f"Not billed yet — {data['Student']}'s classes these months still waiting for "
+            "their next invoice. Tick one to put it on this invoice instead."
+        )
+        waiting = st.data_editor(
+            [{"Add": False, "Date": entry["Date"], "Subject": entry["Subject"],
+              "Hours": entry["Hours"], "Price/h": entry["Rate"], "Amount": entry["Amount"]}
+             for entry in data["Waiting"]],
+            column_config={
+                "Add": st.column_config.CheckboxColumn(width="small"),
+                "Date": st.column_config.DateColumn(format="D MMM YYYY", width="small"),
+                "Price/h": st.column_config.NumberColumn(format="$%.2f"),
+                "Amount": st.column_config.NumberColumn(format="$%.2f"),
+            },
+            disabled=["Date", "Subject", "Hours", "Price/h", "Amount"],
+            hide_index=True,
+            width="stretch",
+            key=f"edit_waiting_{invoice_id}_{version}",
+        )
+        add_ids = [entry["ID"] for entry, row in zip(data["Waiting"], waiting) if row["Add"]]
+    added = [entry for entry in data["Waiting"] if entry["ID"] in add_ids]
+    unpriced = [entry for entry in added if entry["Rate"] <= db.UNSET_RATE]
+
+    st.caption(
+        "Extra lines — materials, a discount (as a minus amount). Add or delete rows. "
+        "Not for a class on the schedule: tick it above, or it is billed again on the next invoice."
+    )
     extra = st.data_editor(
         pd.DataFrame(
             [{"Description": e["Description"], "Amount": e["Amount"]} for e in data["Extra"]],
@@ -3034,6 +3062,7 @@ def _invoice_editor(detail: dict) -> None:
                and (not row["Hours"] or not row["Price/h"] or row["Price/h"] <= db.UNSET_RATE)]
     gross = round(sum(round(row["Hours"] * row["Price/h"], 2) for row in edited
                       if row["Charge"] and row["Hours"] and row["Price/h"])
+                  + sum(entry["Amount"] for entry in added)
                   + sum(row["Amount"] for row in extra_rows), 2)
     credit = min(data["Credit taken off"], max(gross, 0.0))
     net = round(gross - credit, 2)
@@ -3050,18 +3079,20 @@ def _invoice_editor(detail: dict) -> None:
             "on their next invoice."
         ))
     note = st.text_input("What changed (kept with the old invoice)", key=f"edit_note_{invoice_id}")
+    if unpriced:
+        st.warning("A class ticked to add has no price yet — price its subject first.")
     if missing:
         st.warning("A class that is charged needs hours and a price — or untick Charge.")
     elif gross < 0:
         st.warning("That would ask for less than nothing — check the discount.")
     if st.button(f"Save — void #{data['Number']} and issue the replacement", type="primary",
-                 key=f"edit_save_{invoice_id}", disabled=bool(missing) or gross < 0):
+                 key=f"edit_save_{invoice_id}", disabled=bool(missing or unpriced) or gross < 0):
         lines = {
             line["ID"]: {"Subject": row["Subject"], "Hours": row["Hours"] or 0,
                          "Rate": row["Price/h"] or 0, "Charged": bool(row["Charge"])}
             for line, row in zip(data["Lines"], edited)
         }
-        status, _, number = db.replace_invoice(invoice_id, lines, extra_rows, note)
+        status, _, number = db.replace_invoice(invoice_id, lines, extra_rows, note, add=add_ids)
         if status != "replaced":
             st.warning({
                 "not_issued": "That invoice has already been replaced — look up the new number.",
@@ -3077,12 +3108,39 @@ def _invoice_editor(detail: dict) -> None:
         _rerun()
 
 
+def _replaced_download() -> None:
+    """The invoices just replaced in one go, ready to send -- one file each."""
+    ids = st.session_state.get("invoices_replaced")
+    if not ids:
+        return
+    noun = _EXPORT_NOUN[_send_format()]
+    columns = st.columns([3, 1])
+    columns[0].markdown(f"**{len(ids)} replacement invoice(s) to send**")
+    if columns[1].button("Done", key="invoices_replaced_done", width="stretch"):
+        st.session_state.pop("invoices_replaced", None)
+        st.session_state.pop("invoices_replaced_zip", None)
+        _rerun()
+    made = st.session_state.get("invoices_replaced_zip")
+    if made and made[0] == tuple(ids):
+        st.download_button(
+            f"Download {len(ids)} {noun}(s) (.zip)", data=made[1],
+            file_name=f"replaced-invoices-{dt.date.today():%Y-%m-%d}.zip", mime="application/zip",
+            key="invoices_replaced_dl", type="primary",
+        )
+    elif st.button(f"Make the {noun}s", key="invoices_replaced_make"):
+        with st.spinner(f"Making {len(ids)} {noun}(s)…"):
+            st.session_state["invoices_replaced_zip"] = (
+                tuple(ids), _invoices_zip(db.get_invoices_detailed(ids), as_images=True))
+        _rerun()
+
+
 def _out_of_step_warning() -> None:
     """Sent invoices the schedule has moved away from, and a way to settle each.
 
     A sent invoice changes only when somebody edits it, so a price, class
     time or subject name changed afterwards would otherwise go unnoticed.
     """
+    _replaced_download()
     found = db.get_sent_invoices_out_of_step()
     if not found:
         return
@@ -3090,6 +3148,20 @@ def _out_of_step_warning() -> None:
         f"**{len(found)} sent invoice(s) no longer match the schedule** — a price, class time "
         "or subject name changed after they went out. They stay as sent until you edit them."
     )
+    with st.popover(f"Update all {len(found)} to the schedule"):
+        st.write(
+            f"Voids these {len(found)} invoices and issues replacements with the schedule's "
+            "hours, prices and subject names for the classes listed — nothing else on them "
+            "changes. Credit and payments move across. You then send each parent their new one."
+        )
+        if st.button("Update them all", type="primary", key="oos_update_all"):
+            with st.spinner(f"Replacing {len(found)} invoice(s)…"):
+                done = db.update_sent_invoices_to_schedule([entry["ID"] for entry in found])
+            st.session_state["invoices_replaced"] = [new_id for _, new_id, _ in done]
+            _flash(f"Replaced {len(done)} invoice(s): "
+                   + ", ".join(f"#{old} → #{new}" for old, _, new in done[:8])
+                   + (" …" if len(done) > 8 else "") + ". Download them below the list.")
+            _rerun()
     with st.expander("Which, and what changed"):
         for entry in found[:40]:
             columns = st.columns([6, 1, 1.4])
