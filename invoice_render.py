@@ -257,6 +257,10 @@ def _line_cells(line: dict[str, Any]) -> tuple[str, str, str, str, str, bool]:
     dates = html.escape(format_dates(line.get("Dates") or []))
     quantity = str(line.get("Quantity", 0))
     amount = line.get("Amount", 0)
+    if line.get("Extra"):
+        # A line of the academy's own -- materials, a discount: an amount, no class.
+        text = f"-{_money(abs(amount))}" if amount < 0 else _money(amount)
+        return "", subject, "", "", text, amount < 0
     if line.get("Credit"):
         # A cancelled class already billed for: no unit price to quote,
         # because nothing is being charged.
@@ -267,12 +271,22 @@ def _line_cells(line: dict[str, Any]) -> tuple[str, str, str, str, str, bool]:
             f"${_money(rate)} × {hours:g}h", _money(amount), False)
 
 
+def _status_mark(invoice: dict[str, Any]) -> str:
+    """The banner across an invoice that is not the one to pay: a draft, or a voided one."""
+    if invoice.get("Status") == "Void":
+        by = invoice.get("Replaced by")
+        return ("<div class='draft'>VOID &mdash; replaced by invoice "
+                f"#{by}</div>" if by else "<div class='draft'>VOID</div>")
+    return "<div class='draft'>DRAFT &mdash; not yet issued</div>"
+
+
 def _invoice_sheet(invoice: dict[str, Any]) -> str:
     """The billing content for one invoice -- no <html>/<head>, just the sheet."""
     lines = invoice.get("Lines") or []
     number = invoice.get("Number")
     issued = invoice.get("Issued") or dt.date.today()
     is_draft = invoice.get("Status") != "Issued"
+    replaces = invoice.get("Replaces")
 
     rows = ""
     for line in lines:
@@ -294,9 +308,7 @@ def _invoice_sheet(invoice: dict[str, Any]) -> str:
     if not rows:
         rows = "<tr><td colspan='5' class='mid muted'>No classes on this invoice yet.</td></tr>"
 
-    draft_mark = (
-        "<div class='draft'>DRAFT &mdash; not yet issued</div>" if is_draft else ""
-    )
+    draft_mark = _status_mark(invoice) if is_draft else ""
 
     return f"""<div class="sheet">
   {draft_mark}
@@ -315,6 +327,7 @@ def _invoice_sheet(invoice: dict[str, Any]) -> str:
       <div class="meta">
         <div><b>Date</b> {issued:%d %b %Y}</div>
         <div><b>Invoice no</b> {('#' + str(number)) if number else '—'}</div>
+        {f"<div><b>Replaces</b> #{replaces}</div>" if replaces else ""}
       </div>
     </td>
   </tr></table>
@@ -627,11 +640,8 @@ def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
     issued = invoice.get("Issued") or dt.date.today()
     number = invoice.get("Number")
     parent = invoice.get("Parent")
-    draft = (
-        "<div class='draft'>DRAFT &mdash; not yet issued</div>"
-        if invoice.get("Status") != "Issued"
-        else ""
-    )
+    draft = _status_mark(invoice) if invoice.get("Status") != "Issued" else ""
+    replaces = invoice.get("Replaces")
     who_contact = (
         f"<tr><td class='contact'>{_cjk_spans(html.escape(parent))} &middot; "
         f"{html.escape(invoice.get('Phone', ''))}</td></tr>"
@@ -647,7 +657,7 @@ def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
     {html.escape(ACADEMY['phone'])}</div></td>
   <td class="ttl" style="width:31%"><div class="big">INVOICE</div>
     <div class="meta"><span>Date</span> {issued:%d %b %Y}<br/>
-    <span>Invoice no</span> {('#' + str(number)) if number else '-'}</div></td>
+    <span>Invoice no</span> {('#' + str(number)) if number else '-'}{f"<br/><span>Replaces</span> #{replaces}" if replaces else ""}</div></td>
 </tr>
 <tr class="hdrule"><td colspan="{3 if _LOGO_DATA_URI else 2}">&nbsp;</td></tr>
 </table>

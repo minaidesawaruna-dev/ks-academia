@@ -3,6 +3,7 @@ from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from calendar import month_abbr, monthrange
 from typing import Any
+import json
 import os
 import re
 import threading
@@ -17,6 +18,7 @@ from sqlalchemy import (
     Integer,
     Numeric,
     String,
+    Text,
     Time,
     UniqueConstraint,
     create_engine,
@@ -296,7 +298,7 @@ class Invoice(Base):
 
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey("students.id"), nullable=False, index=True)
-    status = Column(String(10), nullable=False, default="Open")   # Open | Issued
+    status = Column(String(10), nullable=False, default="Open")   # Open | Issued | Void
     invoice_number = Column(Integer, nullable=True)
     issued_on = Column(Date, nullable=True)
     note = Column(String(500), nullable=True)
@@ -346,6 +348,33 @@ class InvoiceItem(Base):
     hours = Column(Numeric(5, 2), nullable=True)
     hourly_rate = Column(Numeric(8, 2), nullable=True)
     amount = Column(Numeric(10, 2), nullable=True)
+
+
+class InvoiceRevision(Base):
+    """A sent invoice somebody looked at again: replaced, or kept as sent.
+
+    A sent invoice is never rewritten. Putting one right voids it -- its
+    number retired, what it said kept here in ``details`` -- and issues a
+    replacement under a new number (``replaced_by_id``). Looking at one the
+    schedule has since moved away from and leaving it as it is records the
+    same way with no replacement, so it is not raised again.
+
+    ``details`` is JSON: the old invoice's lines, totals and payment, and
+    ``seen`` -- each class's hours, price and name on the calendar at that
+    moment, which is what "no longer matches" is measured from afterwards.
+    """
+
+    __tablename__ = "invoice_revisions"
+
+    id = Column(Integer, primary_key=True)
+    invoice_id = Column(Integer, ForeignKey("invoices.id"), nullable=False, index=True)
+    replaced_by_id = Column(Integer, ForeignKey("invoices.id"), nullable=True, index=True)
+    revised_on = Column(Date, nullable=False)
+    details = Column(Text, nullable=False)
+    note = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
 
 
 class Credit(Base):
@@ -1291,7 +1320,8 @@ def _remove_lesson(session, lesson, reason, rate_index):
         invoice = session.get(Invoice, item.invoice_id)
         if invoice is not None and invoice.status == "Issued":
             credit, raised = _raise_credit(session, invoice.student_id, lesson, reason, rate_index)
-            credit.session_id = None      # the class is about to go
+            if credit is not None:
+                credit.session_id = None  # the class is about to go
             item.session_id = None        # ... and so is its line's link
             credited += int(raised)
         else:
@@ -2253,7 +2283,7 @@ def merge_students(keep_id, drop_id, dry_run=False):
             .order_by(Invoice.student_id != keep_id, Invoice.id)
         ).all()
         issued = [invoice for invoice in invoices
-                  if invoice.status == "Issued" and invoice.student_id == drop_id]
+                  if invoice.status in ("Issued", "Void") and invoice.student_id == drop_id]
         for invoice in issued:
             invoice.student_id = keep_id
         # One open invoice: the kept record's if it has one, and every class
@@ -2664,8 +2694,9 @@ def _group_credits(entries):
     for credit, amount in entries:
         # Most credits are a missed class; a price put right afterwards is
         # not, and a parent reading "Cancelled" would look for the class.
-        label = ("Price corrected" if (credit.reason or "").startswith("Price corrected")
-                 else "Cancelled")
+        reason = credit.reason or ""
+        label = ("Price corrected" if reason.startswith("Price corrected")
+                 else "Overpaid" if reason.startswith("Overpaid") else "Cancelled")
         entry = grouped.setdefault(
             (label, credit.class_name or "Cancelled class"), {"dates": [], "amount": 0.0}
         )
@@ -2775,6 +2806,8 @@ def _raise_credit(session, student_id, lesson, reason, rate_index=None):
         return existing, False
 
     billed = _billed_amount(session, student_id, lesson.id)
+    if billed is not None and round(float(billed), 2) <= 0:
+        return None, False  # on a sent invoice, but not charged: nothing to give back
     academy_class = session.get(AcademyClass, lesson.class_id)
     credit = Credit(
         student_id=student_id,
@@ -2924,10 +2957,20 @@ def _group_invoice_items(invoice, items, lessons, classes, teachers, rate_index)
     figures -- so an empty dict is fine there.
     """
     grouped: dict[tuple, dict] = {}
+    own_lines = []
     if invoice.status == "Issued":
         for item in items:
             if not item.session_date:
                 continue
+            if item.hours is None and item.session_id is None:
+                # A line of the admin's own -- materials, a discount -- not a class.
+                own_lines.append({
+                    "Subject": item.class_name or "", "Teacher": "", "Dates": [], "Quantity": 1,
+                    "Hours": 0, "Rate": 0, "Amount": round(float(item.amount or 0), 2), "Extra": True,
+                })
+                continue
+            if not float(item.amount or 0) and not float(item.hours or 0):
+                continue  # kept on the invoice so it is never billed again, but not charged
             key = (
                 item.class_name, item.teacher_name,
                 float(item.hours or 0), float(item.hourly_rate or 0),
@@ -2969,7 +3012,7 @@ def _group_invoice_items(invoice, items, lessons, classes, teachers, rate_index)
             }
         )
     lines.sort(key=lambda line: (line["Dates"][0] if line["Dates"] else date.max))
-    return lines
+    return lines + own_lines
 
 
 def _invoice_lines(session, invoice):
@@ -3082,7 +3125,8 @@ def get_invoices(status=None, student_id=None):
             return []
 
         issued_ids = [invoice.id for invoice, _ in rows if invoice.status == "Issued"]
-        open_ids = [invoice.id for invoice, _ in rows if invoice.status != "Issued"]
+        open_ids = [invoice.id for invoice, _ in rows if invoice.status == "Open"]
+        replaced_by, replaces = _revision_links(session, [invoice.id for invoice, _ in rows])
 
         # The money comes from _net_totals so this agrees with the printable
         # copy and the Payments screen; only the line count is counted here.
@@ -3091,7 +3135,7 @@ def get_invoices(status=None, student_id=None):
         if issued_ids:
             for invoice_id, count in session.execute(
                 select(InvoiceItem.invoice_id, func.count())
-                .where(InvoiceItem.invoice_id.in_(issued_ids))
+                .where(InvoiceItem.invoice_id.in_(issued_ids), InvoiceItem.hours > 0)
                 .group_by(InvoiceItem.invoice_id)
             ).all():
                 issued_counts[invoice_id] = count
@@ -3126,6 +3170,9 @@ def get_invoices(status=None, student_id=None):
                 total = issued_nets.get(invoice.id, 0.0)
                 count = issued_counts.get(invoice.id, 0)
                 lines: list[dict] = []
+            elif invoice.status == "Void":
+                said = replaced_by.get(invoice.id, {})
+                total, count, lines = said.get("total", 0.0), said.get("classes", 0), []
             else:
                 lines = _group_invoice_items(
                     invoice, items_by_invoice.get(invoice.id, []),
@@ -3146,6 +3193,8 @@ def get_invoices(status=None, student_id=None):
                     "Total": round(total, 2),
                     "Lines": lines,
                     "Created": invoice.created_at,
+                    "Replaced by": replaced_by.get(invoice.id, {}).get("number"),
+                    "Replaces": replaces.get(invoice.id),
                 }
             )
         # Newest by what a person reads -- the issue date, then the invoice
@@ -3256,6 +3305,8 @@ def get_invoice(invoice_id):
             return None
         student = session.get(Student, invoice.student_id)
         parent = session.get(Parent, student.parent_id) if student and student.parent_id else None
+        if invoice.status == "Void":
+            return _void_record(session, invoice, student, parent)
         lines = _invoice_lines(session, invoice)
         charges = round(sum(line["Amount"] for line in lines), 2)
         # An issued invoice shows the credits it actually settled; one still
@@ -3267,7 +3318,9 @@ def get_invoice(invoice_id):
             if invoice.status == "Issued"
             else _open_credit_lines(session, invoice.student_id, charges)
         )
-        return _invoice_record(invoice, student, parent, lines)
+        record = _invoice_record(invoice, student, parent, lines)
+        record["Replaces"] = _revision_links(session, [invoice.id])[1].get(invoice.id)
+        return record
 
 
 def _invoice_record(invoice, student, parent, lines):
@@ -3354,6 +3407,7 @@ def get_invoices_detailed(invoice_ids):
         ).all():
             credits_by_invoice.setdefault(credit.invoice_id, []).append(credit)
 
+        replaces = _revision_links(session, ids)[1]
         detailed = []
         for invoice_id in ids:
             invoice = invoices.get(invoice_id)
@@ -3366,6 +3420,9 @@ def get_invoices_detailed(invoice_ids):
                 else None
             )
 
+            if invoice.status == "Void":
+                detailed.append(_void_record(session, invoice, student, parent))
+                continue
             if invoice.status == "Issued":
                 lines = _group_invoice_items(
                     invoice, items_by_invoice.get(invoice_id, []), {}, {}, {}, {}
@@ -3379,7 +3436,9 @@ def get_invoices_detailed(invoice_ids):
                 charges = round(sum(line["Amount"] for line in lines), 2)
                 lines += _open_credit_lines(session, invoice.student_id, charges)
 
-            detailed.append(_invoice_record(invoice, student, parent, lines))
+            record = _invoice_record(invoice, student, parent, lines)
+            record["Replaces"] = replaces.get(invoice_id)
+            detailed.append(record)
         return detailed
 
 
@@ -3500,6 +3559,382 @@ def delete_invoice(invoice_id):
         session.delete(invoice)
         session.commit()
         return "deleted"
+
+
+# ---------------------------------------------------------------------------
+# Putting a sent invoice right
+# ---------------------------------------------------------------------------
+#
+# A sent invoice changes only when somebody edits it, never by itself. Editing
+# voids it -- its number retired, what it said kept -- and issues a replacement
+# under a new number that says which one it replaces. Its classes, the credit
+# it settled and any payment recorded against it move to the replacement.
+
+
+def _is_own_line(item):
+    """A line the admin typed -- materials, a discount -- rather than a class."""
+    return item.hours is None and item.session_id is None
+
+
+def _calendar_now(lessons, classes, rate_index, session_id):
+    """A class as the calendar has it today -- (hours, price, subject) -- or None if gone."""
+    lesson = lessons.get(session_id)
+    if lesson is None:
+        return None
+    academy_class = classes.get(lesson.class_id)
+    return (round(_class_hours(lesson), 2),
+            round(_rate_lookup(rate_index, lesson.class_id, lesson.session_date), 2),
+            academy_class.name if academy_class else "")
+
+
+def _serial(lines):
+    return [{**line, "Dates": [str(day) for day in line.get("Dates") or []]} for line in lines]
+
+
+def _revision_links(session, invoice_ids):
+    """Which of these invoices were replaced, and which replace another.
+
+    Returns ``(replaced_by, replaces)``: for a voided invoice, what replaced
+    it (``{"number", "on", "total", "classes"}``); for a replacement, the
+    number of the invoice it replaced.
+    """
+    ids = list(invoice_ids)
+    if not ids:
+        return {}, {}
+    replaced_by, replaces = {}, {}
+    rows = session.execute(
+        select(InvoiceRevision, Invoice.invoice_number)
+        .join(Invoice, Invoice.id == InvoiceRevision.replaced_by_id)
+        .where(or_(InvoiceRevision.invoice_id.in_(ids), InvoiceRevision.replaced_by_id.in_(ids)))
+    ).all()
+    old_numbers = dict(session.execute(
+        select(Invoice.id, Invoice.invoice_number)
+        .where(Invoice.id.in_({revision.invoice_id for revision, _ in rows}))
+    ).all()) if rows else {}
+    for revision, new_number in rows:
+        said = json.loads(revision.details)
+        replaced_by[revision.invoice_id] = {
+            "number": new_number, "on": revision.revised_on, "total": said.get("total", 0.0),
+            "classes": said.get("classes", 0), "details": said, "note": revision.note or "",
+        }
+        replaces[revision.replaced_by_id] = old_numbers.get(revision.invoice_id)
+    return replaced_by, replaces
+
+
+def _void_record(session, invoice, student, parent):
+    """A voided invoice exactly as it was sent, and what replaced it."""
+    link = _revision_links(session, [invoice.id])[0].get(invoice.id, {})
+    said = link.get("details", {})
+    lines = [{**line, "Dates": [as_date(day) for day in line.get("Dates") or []]}
+             for line in said.get("lines", [])]
+    return {
+        "ID": invoice.id,
+        "Number": invoice.invoice_number,
+        "Student": student.full_name if student else "",
+        "Parent": parent.name if parent else "",
+        "Phone": parent.phone if parent else "",
+        "Status": "Void",
+        "Issued": as_date(said["issued_on"]) if said.get("issued_on") else invoice.issued_on,
+        "Lines": lines,
+        "Total": round(float(said.get("total", 0.0)), 2),
+        "Replaced by": link.get("number"),
+        "Replaced on": link.get("on"),
+        "Note": link.get("note", ""),
+    }
+
+
+def get_invoice_for_edit(invoice_id):
+    """A sent invoice as it can be edited, beside the calendar as it is today.
+
+    ``Lines`` are its classes: the line's id, date, subject, teacher, hours,
+    price and amount as sent, whether it is charged, the class on the
+    calendar now (``Now``: hours, price, subject -- None if it is gone) and
+    any credit waiting for it. ``Extra`` are lines of the admin's own. Also
+    the credit it settled and what has been paid. None unless it is a sent
+    invoice.
+    """
+    with SessionLocal() as session:
+        invoice = session.get(Invoice, invoice_id)
+        if invoice is None or invoice.status != "Issued":
+            return None
+        student = session.get(Student, invoice.student_id)
+        items = session.scalars(
+            select(InvoiceItem).where(InvoiceItem.invoice_id == invoice.id)
+            .order_by(InvoiceItem.session_date, InvoiceItem.id)
+        ).all()
+        lessons, classes, _, rate_index = _lessons_with_context(session, {i.session_id for i in items})
+        lesson_ids = [item.session_id for item in items if item.session_id is not None]
+        waiting = dict(session.execute(
+            select(Credit.session_id, Credit.amount).where(
+                Credit.student_id == invoice.student_id, Credit.status == "Open",
+                Credit.session_id.in_(lesson_ids))
+        ).all()) if lesson_ids else {}
+        lines, extra = [], []
+        for item in items:
+            if _is_own_line(item):
+                extra.append({"ID": item.id, "Description": item.class_name or "",
+                              "Amount": round(float(item.amount or 0), 2)})
+                continue
+            lines.append({
+                "ID": item.id,
+                "Session ID": item.session_id,
+                "Date": item.session_date,
+                "Subject": item.class_name or "",
+                "Teacher": item.teacher_name or "",
+                "Hours": round(float(item.hours or 0), 2),
+                "Rate": round(float(item.hourly_rate or 0), 2),
+                "Amount": round(float(item.amount or 0), 2),
+                "Charged": bool(float(item.amount or 0) or float(item.hours or 0)),
+                "Now": _calendar_now(lessons, classes, rate_index, item.session_id),
+                "Credit waiting": round(float(waiting.get(item.session_id) or 0), 2),
+            })
+        return {
+            "ID": invoice.id,
+            "Number": invoice.invoice_number,
+            "Student": student.full_name if student else "",
+            "Issued": invoice.issued_on,
+            "Lines": lines,
+            "Extra": extra,
+            "Credit taken off": round(_credit_totals(session, [invoice.id]).get(invoice.id, 0.0), 2),
+            "Paid": round(float(invoice.paid_amount), 2) if invoice.paid_amount is not None else None,
+        }
+
+
+def replace_invoice(invoice_id, lines, extra=(), note=None, today=None):
+    """Put a sent invoice right: void it and issue a replacement under a new number.
+
+    ``lines`` is ``{line id: {"Subject", "Hours", "Rate", "Charged"}}`` for its
+    classes; any left out keep their figures. A class not charged stays on
+    the replacement at $0, so it is never billed again. ``extra`` is
+    ``[{"Description", "Amount"}]`` -- lines of the admin's own, a discount
+    as a negative amount -- and takes the place of any the old one had.
+
+    Nothing is refunded twice: a credit waiting for one of these classes is
+    cut to what the class now costs, gone if it costs nothing. The credit
+    the old invoice settled settles the replacement, never past its total,
+    the rest waiting for the next invoice. A payment recorded against the
+    old one counts towards the replacement; any overpayment becomes a
+    credit for the next invoice.
+
+    Returns ``("replaced", new id, new number)``, or ``(reason, None, None)``:
+    "not_issued", "invalid" (a charged class needs hours and a price) or
+    "negative" (the invoice would ask for less than nothing).
+    """
+    today = today or date.today()
+    extra = [
+        {"Description": " ".join(str(entry.get("Description") or "").split()),
+         "Amount": round(float(entry.get("Amount") or 0), 2)}
+        for entry in extra or ()
+    ]
+    extra = [entry for entry in extra if entry["Description"] and entry["Amount"]]
+
+    with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
+        if session.get_bind().dialect.name == "postgresql":
+            session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": INVOICE_NUMBER_START})
+        old = session.get(Invoice, invoice_id)
+        if old is None or old.status != "Issued":
+            return "not_issued", None, None
+        items = session.scalars(select(InvoiceItem).where(InvoiceItem.invoice_id == old.id)).all()
+        classes_on = [item for item in items if not _is_own_line(item)]
+
+        planned = {}
+        for item in classes_on:
+            change = lines.get(item.id, {})
+            charged = bool(change.get("Charged", float(item.amount or 0) or float(item.hours or 0)))
+            hours = round(float(change.get("Hours", item.hours or 0) or 0), 2)
+            rate = round(float(change.get("Rate", item.hourly_rate or 0) or 0), 2)
+            if charged and (hours <= 0 or rate <= UNSET_RATE):
+                return "invalid", None, None
+            subject = " ".join(str(change.get("Subject") or "").split()) or item.class_name
+            planned[item.id] = (charged, hours, rate, subject)
+        gross = round(sum(hours * rate for charged, hours, rate, _ in planned.values() if charged)
+                      + sum(entry["Amount"] for entry in extra), 2)
+        if gross < 0:
+            return "negative", None, None
+
+        # What the old invoice said, kept before anything moves.
+        before = _group_invoice_items(old, items, {}, {}, {}, {}) + _credit_lines(session, old)
+        said = {
+            "issued_on": str(old.issued_on) if old.issued_on else None,
+            "lines": _serial(before),
+            "total": round(sum(line["Amount"] for line in before), 2),
+            "classes": sum(1 for item in classes_on if float(item.hours or 0) > 0),
+            "paid_on": str(old.paid_on) if old.paid_on else None,
+            "paid_amount": float(old.paid_amount) if old.paid_amount is not None else None,
+            "payment_note": old.payment_note,
+        }
+
+        new = Invoice(student_id=old.student_id, status="Issued", issued_on=today, note=old.note,
+                      paid_on=old.paid_on, paid_amount=old.paid_amount, payment_note=old.payment_note)
+        session.add(new)
+        session.flush()
+        month_of = max((item.session_date for item in classes_on if item.session_date), default=today)
+        for item in classes_on:
+            charged, hours, rate, subject = planned[item.id]
+            item.invoice_id = new.id
+            item.class_name = _fit(subject, InvoiceItem.class_name)
+            item.hourly_rate = rate
+            item.hours = hours if charged else 0
+            item.amount = round(hours * rate, 2) if charged else 0
+            if item.session_id is not None:
+                waiting = session.scalar(select(Credit).where(
+                    Credit.student_id == old.student_id, Credit.session_id == item.session_id,
+                    Credit.status == "Open"))
+                if waiting is not None and float(waiting.amount) > float(item.amount) + 0.005:
+                    if float(item.amount) <= 0:
+                        session.delete(waiting)
+                    else:
+                        waiting.amount = item.amount
+        for item in items:
+            if _is_own_line(item):
+                session.delete(item)
+        for entry in extra:
+            session.add(InvoiceItem(
+                invoice_id=new.id, session_id=None, class_name=_fit(entry["Description"], InvoiceItem.class_name),
+                teacher_name=None, teacher_id=None, session_date=month_of,
+                hours=None, hourly_rate=None, amount=entry["Amount"],
+            ))
+
+        # The credit it settled settles the replacement, never past its total.
+        room = gross
+        for credit in session.scalars(
+            select(Credit).where(Credit.invoice_id == old.id).order_by(Credit.session_date, Credit.id)
+        ).all():
+            amount = round(float(credit.amount), 2)
+            if amount <= room:
+                credit.invoice_id = new.id
+                room = round(room - amount, 2)
+            elif room > 0:
+                session.add(Credit(
+                    student_id=credit.student_id, session_id=None, amount=round(amount - room, 2),
+                    class_name=credit.class_name, session_date=credit.session_date, reason=credit.reason,
+                    status="Open", created_on=credit.created_on, note="Balance carried forward",
+                ))
+                credit.amount, credit.invoice_id, room = room, new.id, 0.0
+            else:
+                credit.status, credit.invoice_id, credit.settled_on = "Open", None, None
+        net = round(room, 2)  # what the replacement asks for, its credit taken off
+
+        highest = session.scalar(select(func.max(Invoice.invoice_number)))
+        new.invoice_number = max(INVOICE_NUMBER_START, (highest or 0) + 1)
+        if new.paid_amount is not None and float(new.paid_amount) > net + 0.005:
+            session.add(Credit(
+                student_id=new.student_id, session_id=None,
+                amount=round(float(new.paid_amount) - net, 2),
+                class_name=f"invoice #{new.invoice_number}", session_date=today,
+                reason=f"Overpaid: invoice #{old.invoice_number} corrected to #{new.invoice_number}",
+                status="Open", created_on=today,
+            ))
+            new.paid_amount = net
+        old.status = "Void"
+        old.paid_on = old.paid_amount = old.payment_note = None
+
+        lessons, classes, _, rate_index = _lessons_with_context(
+            session, {item.session_id for item in classes_on})
+        said["seen"] = {str(item.session_id): _calendar_now(lessons, classes, rate_index, item.session_id)
+                        for item in classes_on if item.session_id is not None}
+        session.add(InvoiceRevision(invoice_id=old.id, replaced_by_id=new.id, revised_on=today,
+                                    details=json.dumps(said), note=_fit(note or "", InvoiceRevision.note) or None))
+        session.flush()
+        _sync_lesson_paid_flags(session, new, new.paid_amount is not None
+                                and float(new.paid_amount) >= net - 0.005)
+        number = new.invoice_number
+        new_id = new.id
+        session.commit()
+    return "replaced", new_id, number
+
+
+def keep_invoice_as_sent(invoice_id, today=None):
+    """Leave a sent invoice as it is, though the calendar has moved on since.
+
+    Recorded with what the calendar says now, so it is raised again only if
+    one of its classes changes after this.
+    """
+    with SessionLocal() as session:
+        invoice = session.get(Invoice, invoice_id)
+        if invoice is None or invoice.status != "Issued":
+            return "not_issued"
+        items = session.scalars(select(InvoiceItem).where(
+            InvoiceItem.invoice_id == invoice.id, InvoiceItem.session_id.is_not(None))).all()
+        lessons, classes, _, rate_index = _lessons_with_context(session, {i.session_id for i in items})
+        seen = {str(item.session_id): _calendar_now(lessons, classes, rate_index, item.session_id)
+                for item in items}
+        session.add(InvoiceRevision(invoice_id=invoice.id, replaced_by_id=None,
+                                    revised_on=today or date.today(), details=json.dumps({"seen": seen})))
+        session.commit()
+        return "kept"
+
+
+def get_sent_invoices_out_of_step():
+    """Sent invoices the calendar has moved away from since they went out.
+
+    A class's hours, price or subject name changed after its invoice was
+    sent: the invoice keeps what it said -- it changes only when somebody
+    edits it -- and this is how anyone finds out. Classes a student missed
+    or was taken off are left out, since a credit already settles those,
+    and so is anything already looked at: an invoice replaced or kept as
+    sent is measured from what the calendar said then.
+
+    One entry per invoice, newest first, each with its ``Changes``.
+    """
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(InvoiceItem, Invoice, Student)
+            .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
+            .join(Student, Student.id == Invoice.student_id)
+            .where(Invoice.status == "Issued", InvoiceItem.session_id.is_not(None),
+                   InvoiceItem.hours > 0)
+        ).all()
+        if not rows:
+            return []
+        lesson_ids = {item.session_id for item, _, _ in rows}
+        lessons, classes, _, rate_index = _lessons_with_context(session, lesson_ids)
+        attending = set(session.execute(
+            select(SessionAttendance.session_id, SessionAttendance.student_id)
+            .where(SessionAttendance.session_id.in_(lesson_ids), SessionAttendance.is_cancelled.is_(False))
+        ).all())
+        credited = set(session.execute(
+            select(Credit.session_id, Credit.student_id).where(Credit.session_id.in_(lesson_ids))
+        ).all())
+        # A price put right by credit before this existed names the day, not the class.
+        repriced = {(student_id, as_date(day)) for student_id, day in session.execute(
+            select(Credit.student_id, Credit.session_date).where(
+                Credit.session_id.is_(None), Credit.reason.like("Price corrected%"))
+        ).all() if day}
+        seen: dict[int, dict] = {}
+        for revision in session.scalars(select(InvoiceRevision).order_by(InvoiceRevision.id)).all():
+            looked_at = revision.replaced_by_id or revision.invoice_id
+            seen[looked_at] = json.loads(revision.details).get("seen", {})
+
+        found: dict[int, dict] = {}
+        for item, invoice, student in rows:
+            pair = (item.session_id, invoice.student_id)
+            if pair not in attending or pair in credited:
+                continue
+            if (invoice.student_id, as_date(item.session_date)) in repriced:
+                continue
+            now = _calendar_now(lessons, classes, rate_index, item.session_id)
+            if now is None:
+                continue
+            hours, rate, name = now
+            if list(now) == (seen.get(invoice.id, {}).get(str(item.session_id)) or []):
+                continue
+            changes = []
+            if abs(float(item.hours) - hours) > 0.005:
+                changes.append(f"{float(item.hours):g}h → {hours:g}h")
+            if rate > UNSET_RATE and abs(float(item.hourly_rate or 0) - rate) > 0.005:
+                changes.append(f"${float(item.hourly_rate or 0):,.2f} → ${rate:,.2f}/h")
+            if (item.class_name or "") != _fit(name, InvoiceItem.class_name):
+                changes.append(f"“{item.class_name}” → “{name}”")
+            if not changes:
+                continue
+            entry = found.setdefault(invoice.id, {
+                "ID": invoice.id, "Number": invoice.invoice_number, "Student": student.full_name,
+                "Issued": invoice.issued_on, "Changes": [],
+            })
+            entry["Changes"].append({"Date": item.session_date, "Subject": item.class_name or "",
+                                     "What": ", ".join(changes)})
+        return sorted(found.values(), key=lambda entry: -(entry["Number"] or 0))
 
 
 # ---------------------------------------------------------------------------

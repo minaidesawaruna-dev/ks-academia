@@ -83,19 +83,23 @@ _authenticator = auth.require_login()
 auth.logout_button(_authenticator)
 
 @st.cache_resource
-def _ensure_database_ready() -> bool:
+def _ensure_database_ready(tables: tuple[str, ...]) -> bool:
     """Check the schema once per process rather than once per click.
 
     Streamlit re-runs this file from the top on every interaction, so
     anything at module scope is on the critical path of every button press.
     Even the cheap version of this check is a few round trips, which is
     little beside the database, but paid on every click all the same.
+
+    Keyed on the tables the code defines: a deploy the host picks up without
+    restarting keeps this cache, and would otherwise run code that needs a
+    new table against a database that does not have it yet.
     """
     db.initialise_database()
     return True
 
 
-_ensure_database_ready()
+_ensure_database_ready(tuple(sorted(db.Base.metadata.tables)))
 
 LESSON_STATUSES = ["Scheduled", "Completed", "Cancelled"]
 
@@ -119,6 +123,11 @@ PAID_ROWS = 40
 
 def _rerun() -> None:
     st.rerun()
+
+
+def _md(text: str) -> str:
+    """Money for markdown: two "$" on one line are read as a formula, so escape them."""
+    return text.replace("$", r"\$")
 
 
 def _flash(message: str, kind: str = "success") -> None:
@@ -2527,6 +2536,7 @@ def _invoice_table(invoice: dict) -> None:
                 # Same treatment the printable copy gives it.
                 "Unit price": (
                     "credit" if line.get("Credit")
+                    else "" if line.get("Extra")
                     else f"${line['Rate']:,.2f} × {line['Hours']:g}h"
                 ),
                 "Amount": f"{line['Amount']:,.2f}",
@@ -2835,10 +2845,21 @@ def _issued_lookup_section(counts: dict) -> None:
     if not counts["issued_count"]:
         return
     st.markdown(f"#### Issued invoices ({counts['issued_count']})")
+    # Set by "Edit" on the warning above, or by saving a replacement: the
+    # invoice to open, applied before the widgets it fills are drawn.
+    wanted = st.session_state.pop("issued_search_next", None)
+    if wanted is not None:
+        st.session_state["issued_search"] = wanted
+        st.session_state["invoice_show_issued"] = True
+        st.session_state.pop("issued_pick", None)
     if not st.checkbox("Look one up", key="invoice_show_issued"):
         return
     with st.container():
-        issued = db.get_invoices(status="Issued")
+        # A voided invoice is still one a parent may quote, so it can be found.
+        issued = sorted(
+            db.get_invoices(status="Issued") + db.get_invoices(status="Void"),
+            key=lambda item: -(item["Number"] or 0),
+        )
         search = st.text_input(
             "Find by student or invoice number", key="issued_search"
         )
@@ -2854,7 +2875,8 @@ def _issued_lookup_section(counts: dict) -> None:
         st.dataframe(
             [
                 {
-                    "Invoice": f"#{item['Number']}",
+                    "Invoice": f"#{item['Number']}" + (
+                        f" · void, now #{item['Replaced by']}" if item["Status"] == "Void" else ""),
                     "Student": item["Student"],
                     "Issued": item["Issued"],
                     "Classes": item["Classes"],
@@ -2868,13 +2890,225 @@ def _issued_lookup_section(counts: dict) -> None:
         if not found:
             return
         labels = {
-            f"#{item['Number']} · {item['Student']}": item["ID"] for item in found[:100]
+            f"#{item['Number']} · {item['Student']}"
+            + (" · void" if item["Status"] == "Void" else ""): item["ID"]
+            for item in found[:100]
         }
         chosen = st.selectbox("Open a copy", list(labels), key="issued_pick")
         detail = db.get_invoice(labels[chosen])
+        if detail["Status"] == "Void":
+            st.warning(
+                f"Void — replaced by invoice #{detail['Replaced by']} on "
+                f"{detail['Replaced on']:%d %b %Y}. This is what #{detail['Number']} said."
+                + (f" Why: {detail['Note']}" if detail.get("Note") else "")
+            )
+            _invoice_table(detail)
+            return
+        if detail.get("Replaces"):
+            st.caption(f"Replaces invoice #{detail['Replaces']}.")
         _invoice_table(detail)
-        _invoice_download(detail, "dl_issued")
+        columns = st.columns([1.4, 1.6, 3])
+        with columns[0]:
+            _invoice_download(detail, "dl_issued")
+        with columns[1]:
+            _send_copy(detail, "send_issued")
+        if st.toggle("Edit this invoice", key=f"invoice_edit_{detail['ID']}"):
+            _invoice_editor(detail)
 
+
+
+def _send_copy(detail: dict, key: str) -> None:
+    """The one file to send a parent for this invoice -- made only when asked,
+    because an image means starting a browser."""
+    fmt = _send_format()
+    if fmt == "html":
+        return
+    noun = _EXPORT_NOUN[fmt]
+    made = st.session_state.get(f"{key}_file")
+    if made and made[0] == (detail["ID"], detail["Total"]):
+        st.download_button(
+            f"Download the {noun}", data=made[1], file_name=_invoice_filename(detail, fmt),
+            mime="image/png" if fmt == "png" else "application/pdf",
+            key=f"{key}_dl", width="stretch",
+        )
+    elif st.button(f"Make the {noun} to send", key=f"{key}_make", width="stretch"):
+        render = render_invoices_png if fmt == "png" else render_invoices_pdf
+        st.session_state[f"{key}_file"] = ((detail["ID"], detail["Total"]), render([detail])[0])
+        _rerun()
+
+
+def _schedule_now_text(line: dict) -> str:
+    """What the calendar says about a class today, beside what the invoice said."""
+    now = line["Now"]
+    if now is None:
+        return "class no longer on the schedule"
+    hours, rate, name = now
+    differences = []
+    if line["Charged"] and abs(hours - line["Hours"]) > 0.005:
+        differences.append(f"{hours:g}h")
+    if rate > db.UNSET_RATE and abs(rate - line["Rate"]) > 0.005:
+        differences.append(f"${rate:,.2f}/h")
+    if name != line["Subject"]:
+        differences.append(f"“{name}”")
+    return ", ".join(differences) if differences else "same"
+
+
+def _invoice_editor(detail: dict) -> None:
+    """Put a sent invoice right, by hand: it is voided and a replacement issued.
+
+    A sent invoice never changes by itself. This is the one way it does:
+    somebody edits its classes and lines, and saving voids it -- number
+    retired, what it said kept -- and issues a replacement under a new
+    number that says which one it replaces. The credit it settled and any
+    payment recorded move across.
+    """
+    invoice_id = detail["ID"]
+    data = db.get_invoice_for_edit(invoice_id)
+    if data is None:
+        return
+    st.caption(
+        f"Saving voids #{data['Number']} and issues a replacement under a new number, "
+        "which says it replaces it. Send the parent the new one."
+    )
+    version = st.session_state.get(f"edit_version_{invoice_id}", 0)
+    use_now = st.session_state.get(f"edit_use_now_{invoice_id}", False)
+    rows = []
+    for line in data["Lines"]:
+        now = line["Now"] if use_now else None
+        hours = line["Hours"] if line["Charged"] else (line["Now"][0] if line["Now"] else 0.0)
+        rows.append({
+            "Date": line["Date"],
+            "Subject": now[2] if now else line["Subject"],
+            "Hours": now[0] if now else hours,
+            "Price/h": now[1] if now and now[1] > db.UNSET_RATE else line["Rate"],
+            "Charge": line["Charged"],
+            "Schedule now": _schedule_now_text(line),
+        })
+    edited = st.data_editor(
+        rows,
+        column_config={
+            "Date": st.column_config.DateColumn(format="D MMM YYYY", width="small"),
+            "Subject": st.column_config.TextColumn(width="medium"),
+            "Hours": st.column_config.NumberColumn(min_value=0.0, step=0.25, width="small"),
+            "Price/h": st.column_config.NumberColumn(min_value=0.0, step=5.0, format="$%.2f", width="small"),
+            "Charge": st.column_config.CheckboxColumn(
+                width="small", help="Untick to keep the class on the invoice without charging for it."),
+            "Schedule now": st.column_config.TextColumn(
+                width="medium", help="What the schedule says today, where it differs from the invoice."),
+        },
+        disabled=["Date", "Schedule now"],
+        hide_index=True,
+        width="stretch",
+        key=f"edit_lines_{invoice_id}_{version}",
+    )
+    if not use_now and any(row["Schedule now"] not in ("same", "class no longer on the schedule")
+                           for row in rows):
+        if st.button("Use the schedule's figures", key=f"edit_use_now_btn_{invoice_id}"):
+            st.session_state[f"edit_use_now_{invoice_id}"] = True
+            st.session_state[f"edit_version_{invoice_id}"] = version + 1
+            _rerun()
+
+    st.caption("Extra lines — materials, a discount (as a minus amount). Add or delete rows.")
+    extra = st.data_editor(
+        pd.DataFrame(
+            [{"Description": e["Description"], "Amount": e["Amount"]} for e in data["Extra"]],
+            columns=["Description", "Amount"],
+        ).astype({"Description": "string", "Amount": "float"}),
+        column_config={
+            "Description": st.column_config.TextColumn(width="large"),
+            "Amount": st.column_config.NumberColumn(format="$%.2f", step=5.0),
+        },
+        num_rows="dynamic",
+        hide_index=True,
+        width="stretch",
+        key=f"edit_extra_{invoice_id}_{version}",
+    )
+    extra_rows = [
+        {"Description": str(row["Description"]).strip(), "Amount": float(row["Amount"])}
+        for row in extra.to_dict("records")
+        if isinstance(row.get("Description"), str) and row["Description"].strip()
+        and pd.notna(row.get("Amount")) and float(row["Amount"]) != 0
+    ]
+
+    missing = [row for row in edited if row["Charge"]
+               and (not row["Hours"] or not row["Price/h"] or row["Price/h"] <= db.UNSET_RATE)]
+    gross = round(sum(round(row["Hours"] * row["Price/h"], 2) for row in edited
+                      if row["Charge"] and row["Hours"] and row["Price/h"])
+                  + sum(row["Amount"] for row in extra_rows), 2)
+    credit = min(data["Credit taken off"], max(gross, 0.0))
+    net = round(gross - credit, 2)
+    summary = f"New total **${net:,.2f}** (was ${detail['Total']:,.2f})"
+    if credit:
+        summary += f", after ${credit:,.2f} credit already taken off"
+    st.markdown(_md(summary + "."))
+    paid = data["Paid"]
+    if paid is not None and abs(paid - net) > 0.005:
+        st.caption(_md(
+            f"${paid:,.2f} has been paid: ${net - paid:,.2f} more will be owed."
+            if net > paid else
+            f"${paid:,.2f} has been paid: the ${paid - net:,.2f} paid over becomes a credit "
+            "on their next invoice."
+        ))
+    note = st.text_input("What changed (kept with the old invoice)", key=f"edit_note_{invoice_id}")
+    if missing:
+        st.warning("A class that is charged needs hours and a price — or untick Charge.")
+    elif gross < 0:
+        st.warning("That would ask for less than nothing — check the discount.")
+    if st.button(f"Save — void #{data['Number']} and issue the replacement", type="primary",
+                 key=f"edit_save_{invoice_id}", disabled=bool(missing) or gross < 0):
+        lines = {
+            line["ID"]: {"Subject": row["Subject"], "Hours": row["Hours"] or 0,
+                         "Rate": row["Price/h"] or 0, "Charged": bool(row["Charge"])}
+            for line, row in zip(data["Lines"], edited)
+        }
+        status, _, number = db.replace_invoice(invoice_id, lines, extra_rows, note)
+        if status != "replaced":
+            st.warning({
+                "not_issued": "That invoice has already been replaced — look up the new number.",
+                "invalid": "A class that is charged needs hours and a price — or untick Charge.",
+                "negative": "That would ask for less than nothing — check the discount.",
+            }.get(status, f"Could not save that ({status})."))
+            return
+        for key in [k for k in st.session_state if k.startswith(("edit_", "invoice_edit_"))]:
+            st.session_state.pop(key, None)
+        st.session_state["issued_search_next"] = str(number)
+        _flash(_md(f"#{data['Number']} is void; replaced by #{number} for ${net:,.2f}. "
+                   "Download the new one below and send it."))
+        _rerun()
+
+
+def _out_of_step_warning() -> None:
+    """Sent invoices the schedule has moved away from, and a way to settle each.
+
+    A sent invoice changes only when somebody edits it, so a price, class
+    time or subject name changed afterwards would otherwise go unnoticed.
+    """
+    found = db.get_sent_invoices_out_of_step()
+    if not found:
+        return
+    st.warning(
+        f"**{len(found)} sent invoice(s) no longer match the schedule** — a price, class time "
+        "or subject name changed after they went out. They stay as sent until you edit them."
+    )
+    with st.expander("Which, and what changed"):
+        for entry in found[:40]:
+            columns = st.columns([6, 1, 1.4])
+            changes = "; ".join(f"{change['Date']:%d %b} {change['Subject']}: {change['What']}"
+                                for change in entry["Changes"][:3])
+            more = len(entry["Changes"]) - 3
+            columns[0].markdown(_md(f"**#{entry['Number']}** · {entry['Student']} — {changes}"
+                                    + (f" and {more} more" if more > 0 else "")))
+            if columns[1].button("Edit", key=f"oos_edit_{entry['ID']}", width="stretch"):
+                st.session_state["invoice_reference_open"] = True
+                st.session_state["issued_search_next"] = str(entry["Number"])
+                st.session_state[f"invoice_edit_{entry['ID']}"] = True
+                _rerun()
+            if columns[2].button("Keep as sent", key=f"oos_keep_{entry['ID']}", width="stretch"):
+                db.keep_invoice_as_sent(entry["ID"])
+                _flash(f"#{entry['Number']} kept as sent.")
+                _rerun()
+        if len(found) > 40:
+            st.caption(f"And {len(found) - 40} more — the newest are shown.")
 
 
 def _unpriced_warning(year: int, month: int) -> None:
@@ -3074,7 +3308,8 @@ def invoices_tab() -> None:
             f" · ${summary['credit_outstanding']:,.2f} credit for cancelled "
             "classes comes off automatically"
         )
-    st.caption(trail)
+    st.caption(_md(trail))
+    _out_of_step_warning()
 
     month_items = db.get_open_invoice_items_for_month(year, month)
     # Only warn when something is actually about to go out. A month that is
@@ -3156,7 +3391,7 @@ def _part_payment_form(unpaid: list[dict], year: int, month: int) -> None:
                     f" ${short:,.2f} still owing — they stay on the list until "
                     "it comes in."
                 )
-            _flash(message)
+            _flash(_md(message))
             _rerun()
         else:
             st.warning(f"Could not record that ({outcome}).")

@@ -898,7 +898,7 @@ def t_missing_indexes_added():
         result = run(["-c", _INDEX_SCRIPT], {"DATABASE_URL": url})
         assert result.returncode == 0, result.stderr[-600:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
-    assert len(got["dropped"]) == 4 and got["before"] is False, got
+    assert len(got["dropped"]) == 6 and got["before"] is False, got
     assert got["after"] == got["dropped"] and got["current"] is True, got
     return f"{len(got['after'])} indexes restored on start; the check then passes"
 
@@ -1183,6 +1183,100 @@ def t_reupload_same_month():
             "kept; a child written twice kept once; the screen's forecast matched; past schedules replaced")
 
 
+_REPLACE_SCRIPT = r'''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+everyone = ["Nam Jihoon", "Oh Minseok"]
+
+def lesson(day, names, cancelled=()):
+    return {"date": day, "class_name": "G11 Test Math", "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Cancelled" if n in cancelled else "Attending"}
+                                           for n in names]}
+
+def owed(who):
+    return sorted([c["Amount"], c["Status"], c["Reason"].split(":")[0]] for c in db.get_credits() if c["Student"] == who)
+
+day = lambda d: dt.date(2026, 9, d)
+sb.backfill({"sessions": [lesson(day(d), everyone) for d in (1, 8, 15)]}, teacher)
+issued = {}
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    issued[row["Student"]] = db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)[1]
+# After sending: Oh Minseok misses the 15th, so a credit waits for him.
+sb.backfill({"sessions": [lesson(day(1), everyone), lesson(day(8), everyone),
+                          lesson(day(15), everyone, cancelled={"Oh Minseok"})]}, teacher)
+result = {"flagged_at_first": [e["ID"] for e in db.get_sent_invoices_out_of_step()]}
+
+nam = issued["Nam Jihoon"]
+top = max(db.get_invoice(i)["Number"] for i in issued.values())
+lines = db.get_invoice_for_edit(nam)["Lines"]
+status, nam_new, number = db.replace_invoice(
+    nam, {lines[0]["ID"]: {"Rate": 60}, lines[1]["ID"]: {"Charged": False}},
+    extra=[{"Description": "Materials", "Amount": 20}, {"Description": "Discount", "Amount": -10}], note="a test")
+new, old = db.get_invoice(nam_new), db.get_invoice(nam)
+result["nam"] = [status, number == top + 1, new["Total"], new["Replaces"] == old["Number"],
+                 old["Status"], old["Total"], old["Replaced by"] == number,
+                 sorted(line["Subject"] for line in new["Lines"])]
+# He then misses the 8th -- the class he was not charged for: nothing to give back.
+sb.backfill({"sessions": [lesson(day(1), everyone), lesson(day(8), everyone, cancelled={"Nam Jihoon"}),
+                          lesson(day(15), everyone, cancelled={"Oh Minseok"})]}, teacher)
+result["nam_credits"] = owed("Nam Jihoon")
+
+oh = issued["Oh Minseok"]
+db.mark_invoice_paid(oh)
+fifteenth = next(line for line in db.get_invoice_for_edit(oh)["Lines"] if line["Date"] == day(15))
+status, oh_new, _ = db.replace_invoice(oh, {fifteenth["ID"]: {"Charged": False}})
+paid = next(row for row in db.get_invoice_payments(2026, 9)["paid"] if row["ID"] == oh_new)
+result["oh"] = [status, db.get_invoice(oh_new)["Total"], paid["Paid amount"], owed("Oh Minseok")]
+result["refused"] = [db.replace_invoice(oh, {})[0],
+                     db.replace_invoice(oh_new, {fifteenth["ID"]: {"Charged": True, "Hours": 0}})[0],
+                     db.replace_invoice(oh_new, {}, extra=[{"Description": "Discount", "Amount": -999}])[0]]
+result["void"] = sorted(row["Number"] for row in db.get_invoices(status="Void"))
+result["flagged_before"] = [e["ID"] for e in db.get_sent_invoices_out_of_step()]
+db.set_class_rate_for_month(db.get_all_classes()[0]["ID"], day(1), 70)
+result["flagged_after"] = sorted(e["ID"] for e in db.get_sent_invoices_out_of_step())
+db.keep_invoice_as_sent(nam_new)
+result["flagged_kept"] = sorted(e["ID"] for e in db.get_sent_invoices_out_of_step())
+result["ids"] = [nam, oh, nam_new, oh_new]
+print(json.dumps(result, default=str))
+'''
+
+
+def t_edit_sent_invoice():
+    """A sent invoice changes only when somebody edits it, and then under a new number.
+
+    Editing voids the old invoice -- what it said kept -- and issues a
+    replacement saying which one it replaces. A class not charged stays on it
+    at $0, so it is never billed again and a later absence raises no credit.
+    Nothing is refunded twice: a credit waiting for a class taken off is
+    dropped, and a payment over the new total becomes a credit instead. A
+    price changed after sending is flagged until the invoice is replaced or
+    kept as sent.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "replace.db").replace("\\", "/")
+        result = run(["-c", _REPLACE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    nam, oh, nam_new, oh_new = got["ids"]
+    assert got["flagged_at_first"] == [], got["flagged_at_first"]
+    assert got["nam"] == ["replaced", True, 260.0, True, "Void", 390.0, True,
+                          ["Discount", "G11 Test Math", "G11 Test Math", "Materials"]], got["nam"]
+    assert got["nam_credits"] == [], f"a credit for a class never charged: {got['nam_credits']}"
+    assert got["oh"] == ["replaced", 260.0, 260.0, [[130.0, "Open", "Overpaid"]]], got["oh"]
+    assert got["refused"] == ["not_issued", "invalid", "negative"], got["refused"]
+    assert len(got["void"]) == 2, got["void"]
+    assert got["flagged_before"] == [], got["flagged_before"]
+    assert got["flagged_after"] == sorted([nam_new, oh_new]), got["flagged_after"]
+    assert got["flagged_kept"] == [oh_new], got["flagged_kept"]
+    return ("replaced under a new number, old one void and kept; $0 class never credited; "
+            "no double refund; overpayment a credit; later price change flagged, keep-as-sent clears it")
+
+
 def t_swapped_class_same_slot():
     """A class the workbook replaces with another at the same time is swapped, not lost.
 
@@ -1392,6 +1486,7 @@ for name, fn in [
     ("cancelled classes credited", t_cancelled_classes_credited),
     ("a class swapped in the same slot", t_swapped_class_same_slot),
     ("re-uploading an updated month", t_reupload_same_month),
+    ("editing a sent invoice", t_edit_sent_invoice),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
