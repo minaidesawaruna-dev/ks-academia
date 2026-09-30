@@ -1183,6 +1183,90 @@ def t_reupload_same_month():
             "kept; a child written twice kept once; the screen's forecast matched; past schedules replaced")
 
 
+_APART_SCRIPT = r'''
+import copy, datetime as dt, json, db, schedule_backfill as sb, schedule_parser as sp
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(d, side=()):
+    # The class's own cell lists the roster; a child written in the cell beside it
+    # ("Recording") is in the lesson too, but the parser does not count them as
+    # sitting together.
+    attendance = [{"student_name": n, "status": "Attending", "source": "F3"} for n in ("Nam Jihoon", "Bang Hayun")]
+    attendance += [{"student_name": n, "status": "Recording", "source": "G3"} for n in side]
+    return {"date": dt.date(2026, 1, d), "class_name": "G11 Test Econs", "start_time": dt.time(9),
+            "end_time": dt.time(11), "warnings": [], "attendance": attendance,
+            "coordinate": "F3", "cell": "Jan!F3"}
+
+workbook = [lesson(4, side=["Bang Hayoon"])] + [lesson(d) for d in (11, 18, 25)]
+# The first import kept the two apart, and January was invoiced.
+sb.backfill({"sessions": copy.deepcopy(workbook)}, teacher)
+for row in db.get_open_invoice_items_for_month(2026, 1):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 1)
+hayoon = db.get_student_id_by_name("Bang Hayoon")
+db.remember_student_aliases([(db.get_student_id_by_name("Bang Hayun"), "Bang Ha Yun")])
+
+# The same workbook uploaded again.
+preview = {"sessions": copy.deepcopy(workbook), "dates_shown": [s["date"] for s in workbook]}
+preview["name_reviews"] = sp.canonicalise_names(preview["sessions"])["reviews"]
+pair = lambda reviews: next(r for r in reviews if set(r["names"]) == {"Bang Hayun", "Bang Hayoon"})
+result = {"parser_says_same": pair(preview["name_reviews"])["likely_same"]}
+
+def defaults(reviews):
+    return {i: "merge" if r["likely_same"] else "separate" for i, r in enumerate(reviews)}
+
+def forecast(reviews):
+    planned = {**preview, "sessions": copy.deepcopy(preview["sessions"]), "name_reviews": reviews}
+    planned["sessions"] = sb.apply_review_decisions(planned, defaults(reviews))
+    return sb.plan_import(planned, teacher, dates=planned["dates_shown"])[(2026, 1)]
+
+result["old_default"] = dict(forecast(preview["name_reviews"]))
+marked = sb.mark_names_on_file(preview["name_reviews"])
+result["marked"] = [pair(marked)["likely_same"], pair(marked)["reason_text"].endswith("two different students on file")]
+result["planned"] = dict(forecast(marked))
+preview["name_reviews"] = marked
+preview["sessions"] = sb.apply_review_decisions(preview, defaults(marked))
+done = sb.backfill(preview, teacher, dates=preview["dates_shown"])["created"]
+result["done"] = [done.get("sessions_updated", 0), done.get("sessions_unchanged", 0)]
+result["credits"] = len(db.get_credits())
+result["hayoon_billed"] = sum(1 for i in db.get_invoices(status="Issued")
+                              for line in db.get_invoice(i["ID"])["Lines"] if i["Student"] == "Bang Hayoon")
+# Neither student on file, or the same student under an alias: left as the parser said.
+result["untouched"] = [r["likely_same"] for r in sb.mark_names_on_file([
+    {"names": ["Nam Jihoon", "Nam Jihun"], "likely_same": True, "reason_text": ""},
+    {"names": ["Bang Hayun", "Bang Ha Yun"], "likely_same": True, "reason_text": ""}])]
+print(json.dumps(result))
+'''
+
+
+def t_reupload_keeps_students_apart():
+    """Two spellings on file as two students start on "keep separate" when a workbook comes back.
+
+    On live, re-uploading an unchanged January started one pair on "merge":
+    two children one letter apart, one written beside the class ("Recording"),
+    so the parser didn't count them as sitting together. The default merge
+    took one child off a class they'd been billed for and credited it back.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "apart.db").replace("\\", "/")
+        result = run(["-c", _APART_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["parser_says_same"] is True, "the parser no longer starts this pair on merge; rethink the test"
+    assert got["old_default"].get("changed_invoiced", 0) == 1, got["old_default"]
+    assert got["marked"] == [False, True], got["marked"]
+    assert got["planned"].get("changed", 0) == 0 and got["planned"].get("unchanged") == 4, got["planned"]
+    assert got["done"] == [0, 4], got["done"]
+    assert got["credits"] == 0, f"{got['credits']} credit(s) raised by re-uploading an unchanged month"
+    assert got["hayoon_billed"] == 1, got["hayoon_billed"]
+    assert got["untouched"] == [True, True], got["untouched"]
+    return "an unchanged month re-uploaded changes nothing; a pair on file apart starts on keep separate"
+
+
 _REPLACE_SCRIPT = r'''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -1507,6 +1591,7 @@ for name, fn in [
     ("cancelled classes credited", t_cancelled_classes_credited),
     ("a class swapped in the same slot", t_swapped_class_same_slot),
     ("re-uploading an updated month", t_reupload_same_month),
+    ("re-uploading keeps two students apart", t_reupload_keeps_students_apart),
     ("editing a sent invoice", t_edit_sent_invoice),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

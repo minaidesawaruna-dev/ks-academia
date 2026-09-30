@@ -697,6 +697,7 @@ def _import_upload_panel() -> None:
     preview = schedule_backfill.restrict_to_months(
         preview, [tuple(map(int, key.split("-"))) for key in chosen_months]
     )
+    preview["name_reviews"] = schedule_backfill.mark_names_on_file(preview["name_reviews"])
     # Questions below are numbered within the months chosen, so their answers
     # must not carry over to a different choice of months.
     scope = f"{generation}_{'_'.join(sorted(chosen_months))}"

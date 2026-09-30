@@ -901,6 +901,29 @@ def restrict_to_months(preview: dict[str, Any], months) -> dict[str, Any]:
     }
 
 
+def mark_names_on_file(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The name questions, a pair that is two different students on file starting on "keep separate".
+
+    Two spellings already on file as two students were told apart before --
+    at an earlier import, or by hand. Starting that question on "merge" undid
+    it: a re-uploaded January moved a child's class onto a sibling spelled one
+    letter differently, took them off a class they had been billed for, and
+    credited it back.
+    """
+    if not reviews:
+        return reviews
+    name_to_id = {**db.get_student_aliases(),
+                  **{item["Name"].casefold(): item["ID"] for item in db.get_all_students()}}
+    marked = []
+    for review in reviews:
+        ids = [name_to_id.get(name.casefold()) for name in review["names"]]
+        if None not in ids and ids[0] != ids[1]:
+            review = {**review, "likely_same": False,
+                      "reason_text": review["reason_text"] + " -- two different students on file"}
+        marked.append(review)
+    return marked
+
+
 def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 name_overrides: dict[str, str] | None = None,
                 student_matches: dict[str, int] | None = None,
