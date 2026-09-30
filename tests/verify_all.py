@@ -1267,6 +1267,50 @@ def t_reupload_keeps_students_apart():
     return "an unchanged month re-uploaded changes nothing; a pair on file apart starts on keep separate"
 
 
+_CLASH_SCRIPT = r'''
+import datetime as dt, json, copy, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+day = dt.date(2026, 10, 5)
+
+def lesson(name, date, start, end):
+    return {"date": date, "class_name": name, "start_time": dt.time(*start), "end_time": dt.time(*end),
+            "warnings": [], "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}
+
+sb.backfill({"sessions": [lesson("G10 Test Math", dt.date(2026, 9, 28), (16, 0), (17, 30))]}, teacher)
+# One upload: Math's next lesson, and a new subject written over it -- two new lessons at once.
+upload = {"sessions": [lesson("G10 Test Math", day, (16, 0), (17, 30)),
+                       lesson("G11 Test Chem", day, (16, 30), (18, 0)),
+                       lesson("G11 Test Chem", dt.date(2026, 10, 12), (16, 30), (18, 0))]}
+plan = sb.plan_import(copy.deepcopy(upload), teacher, dates=[day, dt.date(2026, 10, 12)])[(2026, 10)]
+done = sb.backfill(upload, teacher, dates=[day, dt.date(2026, 10, 12)])["created"]
+on_calendar = len(db.get_teacher_lessons_on(teacher, {day, dt.date(2026, 10, 12)}))
+print(json.dumps({"plan": {k: plan[k] for k in ("new", "clash")}, "created": done.get("sessions_created", 0),
+                  "on_calendar": on_calendar}))
+'''
+
+
+def t_forecast_clash_in_one_upload():
+    """Two new lessons at one time in one upload: the screen says so before the import.
+
+    The forecast only checked lessons already on the calendar, so a class the
+    same upload had just placed never counted, and "What this changes" said
+    new where the import then refused a clash (live, a teacher's October).
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "clash.db").replace("\\", "/")
+        result = run(["-c", _CLASH_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["plan"] == {"new": 1, "clash": 2}, got
+    assert got["created"] == got["plan"]["new"] == got["on_calendar"], got
+    return "forecast 1 new, 2 not added -- what the import then did"
+
+
 _REPLACE_SCRIPT = r'''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -1592,6 +1636,7 @@ for name, fn in [
     ("a class swapped in the same slot", t_swapped_class_same_slot),
     ("re-uploading an updated month", t_reupload_same_month),
     ("re-uploading keeps two students apart", t_reupload_keeps_students_apart),
+    ("a clash inside one upload is forecast", t_forecast_clash_in_one_upload),
     ("editing a sent invoice", t_edit_sent_invoice),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

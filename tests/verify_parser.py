@@ -662,6 +662,8 @@ def t_notes_typed_onto_names():
         "Seo Yerin(13일보강)": ("Seo Yerin", "13일보강"),
         "Park Hana 보강": ("Park Hana", "보강"),
         "Choi Doyun(시간잘못보고옴)": ("Choi Doyun", "시간잘못보고옴"),
+        "Oh Minseok(예정)": ("Oh Minseok", "예정"),
+        "Park Hana(체험)": ("Park Hana", "체험"),
     }.items():
         got = sp._roster_names(line, [])
         assert [(n, note) for n, note, _ in got] == [want], (line, got)
@@ -836,6 +838,47 @@ def t_absence_notes():
     return "a note warns only when someone it names is still listed, or it matches nobody"
 
 
+def t_second_calendar():
+    """A second calendar pasted under the month is flagged, and not read into the one above.
+
+    Its day labels sit in other columns, so reading it as part of the top grid
+    filed its lessons under the wrong days -- the 10th's class on the 3rd.
+    """
+    wb = Workbook()
+    ws = _grid(wb.active, [(None, [("3(MON)", LESSON), ("5(WED)", None), ("7(FRI)", None)])])
+    ws.title = "Aug"
+    for column, label in ((2, "10(MON)"), (3, "11(TUE)"), (4, "12(WED)")):
+        ws.cell(row=14, column=column, value=label)
+    for offset, value in enumerate(GRID_TIMES):
+        ws.cell(row=15 + offset, column=1, value=value)
+    ws.cell(row=15, column=2, value="G11 Chem\n9am-11am\nSeo Yerin")
+    buf = io.BytesIO()
+    wb.save(buf)
+    out = sp.parse_workbook(io.BytesIO(buf.getvalue()), ["Aug"], 2026)
+    got = [(s["date"], s["class_name"]) for s in out["sessions"]]
+    assert got == [(dt.date(2026, 8, 3), "G10 Math")], got
+    flagged = [w for w in out["warnings"] if w.get("kind") == "second_calendar"]
+    assert len(flagged) == 1 and "row 14" in flagged[0]["message"] and flagged[0]["coordinate"] == "A14", flagged
+    return "the top calendar read, the second one named by its row, none of it misfiled"
+
+
+def t_subject_spelling_on_file():
+    """Two spellings of a subject: the one on file wins, and two classes on file stay two.
+
+    Merging toward the spelling a workbook used most sent a teacher's lessons
+    to the other class on file, where each clashed with itself.
+    """
+    import schedule_backfill as sb
+    names = ["G11 Test Econs HL A"] * 3 + ["G11 TEST ECONS HL_A"] * 2 + ["G11 Test Econs HL_A"]
+    sessions = [{"class_name": name} for name in names]
+    pairs = lambda on_file: [(m["keep"], m["drop"]) for m in sb.suggest_subject_merges(sessions, on_file)]
+    assert pairs(()) == [("G11 Test Econs HL A", "G11 TEST ECONS HL_A"),
+                         ("G11 Test Econs HL A", "G11 Test Econs HL_A")], pairs(())
+    assert pairs({"g11 test econs hl_a"}) == [("G11 TEST ECONS HL_A", "G11 Test Econs HL A")], pairs({"g11 test econs hl_a"})
+    assert pairs({"g11 test econs hl_a", "g11 test econs hl a"}) == [], "two classes on file were offered as one"
+    return "on file wins; two on file left apart; a case-only difference not asked"
+
+
 def t_joined_times():
     cell = sp.parse_cell("G9 English\n6pm7.30pm\nSeo Yerin")
     assert cell["time_range"] == (dt.time(18), dt.time(19, 30)), cell
@@ -878,6 +921,8 @@ for name, fn in [
     ("absence written on the name", t_absence_written_on_the_name),
     ("grade tag is not a nickname", t_grade_tag_is_not_a_nickname),
     ("notes typed onto names", t_notes_typed_onto_names),
+    ("a second calendar on one sheet", t_second_calendar),
+    ("a subject spelled two ways, one on file", t_subject_spelling_on_file),
     ("a name written in Hangul", t_name_written_in_hangul),
     ("a typo in one class", t_typo_in_one_class),
     ("a teacher's own students, shortened", t_teachers_own_students),

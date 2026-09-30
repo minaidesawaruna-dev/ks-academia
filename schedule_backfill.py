@@ -116,7 +116,13 @@ def _subject_key(name: str) -> str:
     return re.sub(r"[^0-9a-z\uac00-\ud7a3]", "", name.casefold())
 
 
-def suggest_subject_merges(sessions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def teacher_subjects(teacher_id: int | None) -> set[str]:
+    """A teacher's subjects on file, by name casefolded (none for a new teacher)."""
+    teacher = next((t for t in db.get_all_teachers() if t["ID"] == teacher_id), None)
+    return set(_teacher_classes(teacher)) if teacher else set()
+
+
+def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[dict[str, Any]]:
     """Subject names in one workbook that are the same class typed two ways.
 
     Only names that are *identical* once case, spacing and punctuation are
@@ -125,9 +131,18 @@ def suggest_subject_merges(sessions: list[dict[str, Any]]) -> list[dict[str, Any
     genuinely different classes and guessing would merge two teachers' worth
     of billing into one.
 
+    ``on_file`` is the teacher's subjects already in the app (casefolded). A
+    spelling on file wins, so the upload lands on the class that has the
+    lessons. Two spellings that are both subjects on file are not offered:
+    they are two classes in the app, and merging them in an upload filed one
+    class's lessons under the other, where they clashed with themselves and
+    their changes were never applied. Names that differ only in case are
+    already one subject and are not asked about.
+
     Nothing is merged here. Each pair is returned for a human to confirm, in
     the same spirit as the student name reviews.
     """
+    on_file = {name.casefold() for name in on_file}
     counts: dict[str, int] = defaultdict(int)
     for session in sessions:
         counts[session["class_name"]] += 1
@@ -140,11 +155,13 @@ def suggest_subject_merges(sessions: list[dict[str, Any]]) -> list[dict[str, Any
     for variants in grouped.values():
         if len(variants) < 2:
             continue
-        # The spelling used most often wins; a tie falls to the longer one,
-        # which is usually the one with the spaces typed properly.
-        variants.sort(key=lambda name: (-counts[name], -len(name), name))
+        # A spelling on file first, then the one used most often; a tie falls
+        # to the longer one, which is usually the one with the spaces typed properly.
+        variants.sort(key=lambda name: (name.casefold() not in on_file, -counts[name], -len(name), name))
         keep, *drop = variants
         for other in drop:
+            if other.casefold() == keep.casefold() or other.casefold() in on_file:
+                continue
             suggestions.append(
                 {
                     "keep": keep,
@@ -976,7 +993,9 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             on_calendar[day].append((lesson["Start"], lesson["End"], lesson["ID"]))
 
     def clashes(session, excluded=None):
-        return any(start < session["end_time"] and end > session["start_time"] and lesson_id != excluded
+        # A lesson this upload adds has no id yet (None), and still takes its time.
+        return any(start < session["end_time"] and end > session["start_time"]
+                   and (excluded is None or lesson_id != excluded)
                    for start, end, lesson_id in on_calendar[session["date"]])
 
     for class_name, class_sessions in sorted(by_class.items()):

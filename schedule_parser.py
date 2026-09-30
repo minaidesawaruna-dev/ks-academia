@@ -834,7 +834,8 @@ def _split_subject_line(line: str) -> tuple[str, str | None]:
 # came at the wrong time -- as opposed to a tag that tells two children apart:
 # "(G9 UWC D)", "(G7)", "(Emma)". Left on the name, each note made a new student.
 _NOTE_IN_BRACKETS = re.compile(
-    r"(?i)보강|시간|결석|늦|일찍|잘못|\d+\s*일|\d\s*(?:[.:]\s*\d+)?\s*[ap]\.?\s?m|\bKR\b|[가-힣]{5,}"
+    # 예정 "planned", 체험 "trial", 미정 "not decided": short, but notes, not a Korean name.
+    r"(?i)보강|시간|결석|늦|일찍|잘못|예정|체험|미정|\d+\s*일|\d\s*(?:[.:]\s*\d+)?\s*[ap]\.?\s?m|\bKR\b|[가-힣]{5,}"
 )
 # "Ayoon 보강": Ayoon, at a make-up class.
 _TRAILING_NOTE = re.compile(r"\s+(보강)\s*$")
@@ -1169,14 +1170,38 @@ def _find_header_row(worksheet, max_scan: int = 8) -> tuple[int, dict[int, tuple
     return best_row, best_days
 
 
-def _time_axis(worksheet, header_row: int) -> tuple[dict[int, dt.time], set[int]]:
+def _second_calendar(worksheet, header_row: int) -> tuple[int, list[str]] | None:
+    """A second row of day labels further down the sheet: ``(row, its labels)``.
+
+    A teacher reworking some weeks may paste a new calendar under the month's
+    grid, with its own day labels in different columns. Read as part of the
+    grid above, its lessons land on whatever day that column is up top -- the
+    12th's lessons filed under the 16th -- so the sheet is read only down to
+    it, and which calendar is right is left to a person.
+    """
+    last_column = (worksheet.max_column or 1) + 1
+    for row in range(header_row + 1, (worksheet.max_row or header_row) + 1):
+        labels = []
+        for column in range(1, last_column):
+            value = worksheet.cell(row=row, column=column).value
+            match = isinstance(value, str) and DAY_HEADER_RE.match(value)
+            if match and 1 <= int(match.group("day")) <= 31 and (
+                    not match.group("dow") or match.group("dow").strip().lower() in WEEKDAYS):
+                labels.append(value.strip())
+        if len(labels) >= 3:
+            return row, labels
+    return None
+
+
+def _time_axis(worksheet, header_row: int, last_row: int | None = None) -> tuple[dict[int, dt.time], set[int]]:
     """Return ``(row -> time)`` and the set of columns used as a time axis."""
     counts: dict[int, int] = {}
     row_times: dict[int, dt.time] = {}
+    last_row = min(last_row or (worksheet.max_row or 1), worksheet.max_row or 1)
 
     for column in range(1, (worksheet.max_column or 1) + 1):
         hits = 0
-        for row in range(header_row + 1, (worksheet.max_row or 1) + 1):
+        for row in range(header_row + 1, last_row + 1):
             value = worksheet.cell(row=row, column=column).value
             if isinstance(value, dt.datetime):
                 value = value.time()
@@ -1612,13 +1637,15 @@ def _warning(
     coordinate: str | None = None,
     date: dt.date | None = None,
     cell_text: Any = None,
+    kind: str | None = None,
 ) -> dict[str, Any]:
     """One warning, kept structured so the screen can point at the cell.
 
     ``text`` repeats the single line the parser has always produced, so
     anything that only prints warnings keeps working unchanged; the separate
     fields let the import screen show the worksheet, the cell reference and
-    what is actually typed in that cell.
+    what is actually typed in that cell. ``kind`` marks the few the screen
+    puts in front of everyone rather than in the list.
     """
     where = f"{sheet}!{coordinate}" if coordinate else sheet
     stamp = f" ({date.isoformat()})" if date else ""
@@ -1630,6 +1657,7 @@ def _warning(
         "message": message,
         "cell_text": cell_text if isinstance(cell_text, str) else None,
         "text": f"{where}{stamp}: {message}",
+        "kind": kind,
     }
 
 
@@ -1713,7 +1741,18 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             _warning("no day headers such as '15(SAT)' were found.", sheet=sheet_name)
         ], [], []
 
-    row_times, time_columns = _time_axis(worksheet, header_row)
+    second = _second_calendar(worksheet, header_row)
+    last_row = second[0] - 1 if second else None
+    if second:
+        row, labels = second
+        warnings.append(_warning(
+            f"a second calendar starts at row {row} ({labels[0]} to {labels[-1]}), with its own "
+            "day labels. Only the calendar at the top was read — nothing below row "
+            f"{row - 1}. If the lower one is the up-to-date plan, delete the one that isn't "
+            "and upload again.",
+            sheet=sheet_name, coordinate=f"A{row}", cell_text=" · ".join(labels), kind="second_calendar"))
+
+    row_times, time_columns = _time_axis(worksheet, header_row, last_row)
     if not row_times:
         warnings.append(
             _warning(
@@ -1791,6 +1830,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
     # note become a status cell would hang it on whichever class sat above.
     axis_end = max(row_times) if row_times else (worksheet.max_row or header_row)
     max_row = min(worksheet.max_row or axis_end, axis_end + 20) if row_times else axis_end
+    if last_row:
+        max_row = min(max_row, last_row)
     max_column = worksheet.max_column or 1
     header_columns = sorted(days)
 

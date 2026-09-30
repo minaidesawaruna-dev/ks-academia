@@ -716,6 +716,10 @@ def _import_upload_panel() -> None:
 
     _import_detail(preview)
 
+    # Too big to leave in the folded list: a whole calendar that was not read.
+    for warning in preview["warnings"]:
+        if warning.get("kind") == "second_calendar":
+            st.warning(f"Worksheet `{warning['sheet']}`: {warning['message']}")
     _warning_panel(preview)
 
     decisions: dict[int, str] = {}
@@ -800,7 +804,8 @@ def _import_upload_panel() -> None:
 
 
         merged_into: dict[str, str] = {}
-        merges = schedule_backfill.suggest_subject_merges(preview["sessions"])
+        merges = schedule_backfill.suggest_subject_merges(
+            preview["sessions"], schedule_backfill.teacher_subjects(teacher_id))
         if merges:
             st.markdown(f"**Subjects typed two ways ({len(merges)})**")
             st.caption("Same subject typed differently — merging keeps its billing together.")
