@@ -31,7 +31,7 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _close_spelling, _shortened, _suffix,
+    GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, _bare, _close_spelling, _one_letter_apart, _shortened, _suffix,
     hangul_fit, name_sound, rate_for_grade, standard_rate, without_brackets,
 )
 
@@ -368,6 +368,19 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
                     "parsed_name": name, "existing_name": found[0]["Name"], "existing_id": found[0]["ID"],
                     "similarity": 0.0, "reason": "short" if short else "spelling",
                     "tag": None, "existing_tag": None, "likely_same": len(found) == 1,
+                }
+                candidates.append(best)
+                continue
+            # One letter off one of theirs, in a name too short for the check
+            # above: asked, but not assumed -- one letter is also how two
+            # siblings' names differ.
+            letter = [item for item in existing
+                      if item["ID"] in theirs and _one_letter_apart(name, item["Name"])]
+            if letter:
+                best = {
+                    "parsed_name": name, "existing_name": letter[0]["Name"], "existing_id": letter[0]["ID"],
+                    "similarity": 0.0, "reason": "letter", "tag": None, "existing_tag": None,
+                    "likely_same": False,
                 }
                 candidates.append(best)
                 continue

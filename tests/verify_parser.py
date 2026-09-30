@@ -723,7 +723,12 @@ def t_teachers_own_students():
     # Two of theirs fit: asked, not assumed.
     found = _suggested({1: "Park Hana", 2: "Kim Hana"}, ["Hana"], taught={1, 2})
     assert found.get("Hana", (0, False))[1] is False, found
-    return "'Hana' is the teacher's Park Hana Leong; a name that fits two of theirs is asked"
+    # One letter off a short name of theirs -- 86% alike, under the typo check -- is
+    # asked, but not assumed: it could as well be a sibling. Not theirs: not asked.
+    found = _suggested({1: "Oh Mina", 2: "Nam Jihoon"}, ["Oh Mino", "Oh Mian"], taught={1})
+    assert found.get("Oh Mino") == (1, False) and found.get("Oh Mian") == (1, False), found
+    assert "Oh Mino" not in _suggested({2: "Oh Mina"}, ["Oh Mino"], taught={1}), "not theirs"
+    return "'Hana' is the teacher's Park Hana Leong; two that fit are asked; one letter off is asked"
 
 
 def t_sound_alike_reviews():

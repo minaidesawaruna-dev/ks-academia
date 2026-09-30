@@ -1396,6 +1396,24 @@ def _close_spelling(parsed: str, full: str) -> bool:
                difflib.SequenceMatcher(None, *ordered).ratio()) >= MERGE_THRESHOLD
 
 
+def _one_letter_apart(parsed: str, full: str) -> bool:
+    """One letter changed, added or dropped, or two swapped: "Oh Mino" and "Oh Mina".
+
+    A short name has too few letters for _close_spelling's 88% to notice one
+    wrong one -- "Oh Mino" is 86% of "Oh Mina" -- so it came in as a new
+    student without anyone being asked.
+    """
+    a, b = _bare(parsed), _bare(full)
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diff = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    short, longer = sorted((a, b), key=len)
+    return any(longer[:i] + longer[i + 1:] == short for i in range(len(longer)))
+
+
 def _shortened(parsed: str, full: str) -> bool:
     """Whether ``parsed`` is ``full`` cut short or with a name added.
 

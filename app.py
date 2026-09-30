@@ -751,6 +751,7 @@ def _import_upload_panel() -> None:
                 "tag": "same name, tagged differently",
                 "grade": "same name, with a grade written in front",
                 "sound": "same name, spelled another way",
+                "letter": "one letter different",
             }.get(candidate["reason"], "similar spelling")
             choice = st.radio(
                 f"'{candidate['parsed_name']}' — {reason_text} to existing "
