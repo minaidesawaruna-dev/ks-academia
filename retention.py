@@ -428,33 +428,30 @@ class LogisticModel:
         return ((X - self.mean) / self.scale) * self.weights[1:]
 
 
-def fit_logistic(X: np.ndarray, y, ridge: float = RIDGE, iterations: int = 100) -> LogisticModel:
-    """Newton's method on the ridge-penalised log-likelihood.
+def fit_logistic(X: np.ndarray, y, ridge: float = RIDGE) -> LogisticModel:
+    """scikit-learn's LogisticRegression with an L2 (ridge) penalty, C = 1 / ridge.
 
     Features are standardised first, so one penalty treats them evenly; the
     intercept is not penalised. A small penalty keeps the fit stable with a
     few hundred leavers and features that overlap (a first month is also a
-    short tenure).
+    short tenure). scikit-learn gives no standard errors, so the covariance
+    behind the factor chart's 95% ranges is the usual one for a penalised
+    fit: the inverse of the penalised information matrix at its weights.
     """
+    from sklearn.linear_model import LogisticRegression  # only when the Data tab fits
+
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
     mean = X.mean(axis=0)
     scale = X.std(axis=0)
     scale[scale == 0] = 1.0
-    design = np.column_stack([np.ones(len(X)), (X - mean) / scale])
+    standardised = (X - mean) / scale
+    fit = LogisticRegression(C=1.0 / ridge if ridge else np.inf, tol=1e-10, max_iter=1000)
+    fit.fit(standardised, y)
+    weights = np.concatenate([fit.intercept_, fit.coef_[0]])
+    design = np.column_stack([np.ones(len(X)), standardised])
     penalty = np.full(design.shape[1], float(ridge))
     penalty[0] = 0.0
-    rate = min(max(float(y.mean()), 1e-6), 1 - 1e-6)
-    weights = np.zeros(design.shape[1])
-    weights[0] = math.log(rate / (1 - rate))
-    for _ in range(iterations):
-        p = _sigmoid(design @ weights)
-        gradient = design.T @ (p - y) + penalty * weights
-        information = (design * (p * (1 - p))[:, None]).T @ design + np.diag(penalty)
-        step = np.linalg.lstsq(information, gradient, rcond=None)[0]
-        weights = weights - step
-        if np.abs(step).max() < 1e-10:
-            break
     p = _sigmoid(design @ weights)
     information = (design * (p * (1 - p))[:, None]).T @ design + np.diag(penalty)
     return LogisticModel(mean, scale, weights, np.linalg.pinv(information))

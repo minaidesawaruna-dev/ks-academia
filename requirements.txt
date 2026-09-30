@@ -4,6 +4,10 @@
 streamlit==1.61.1
 pandas==3.0.5
 altair==6.2.2
+
+# The retention model on the Data tab: logistic regression, the standard
+# implementation rather than a hand-written one.
+scikit-learn==1.9.1
 SQLAlchemy==2.0.52
 openpyxl==3.1.5
 
