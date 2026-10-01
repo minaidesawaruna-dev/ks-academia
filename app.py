@@ -3224,7 +3224,47 @@ def _unpriced_warning(year: int, month: int) -> None:
         )
 
 
-def _past_invoices_section(counts: dict) -> None:
+def _month_download(year: int, month: int) -> None:
+    """A month's issued invoices as one zip again, any time, from any browser.
+
+    The download offered after issuing lives in the browser that issued them,
+    and only until the next batch: issuing October took September's away, and
+    its 34 files could then only be made one invoice at a time.
+    """
+    period = f"{calendar.month_name[month]} {year}"
+    issued = db.get_issued_invoices_for_month(year, month)
+    st.markdown(f"###### Download {period}'s invoices ({len(issued)})")
+    if not issued:
+        st.caption(f"None issued for {period} yet.")
+        return
+    days: dict = {}
+    for item in issued:
+        if item["Issued"]:
+            days[item["Issued"]] = days.get(item["Issued"], 0) + 1
+    options = ["all"] + sorted(days, reverse=True)
+    choice = st.selectbox(
+        "Which", options, key=f"month_download_pick_{year}_{month}", label_visibility="collapsed",
+        format_func=lambda o: f"All {len(issued)}" if o == "all" else f"Issued {o:%d %b %Y} — {days[o]}",
+    )
+    chosen = issued if choice == "all" else [item for item in issued if item["Issued"] == choice]
+    noun = _send_noun()
+    wanted = (year, month, tuple(item["ID"] for item in chosen))
+    made = st.session_state.get("month_download_file")
+    if made and made[0] == wanted:
+        st.download_button(
+            f"📱 Download {len(chosen)} {noun}(s) (.zip)", data=made[1], mime="application/zip",
+            file_name=f"invoices-{period.replace(' ', '-')}-{len(chosen)}.zip",
+            key="month_download_button", width="stretch",
+        )
+    elif st.button(f"Make the {len(chosen)} {noun}(s)", key="month_download_make", width="stretch"):
+        with st.spinner(f"Making {len(chosen)} {noun}(s)…"):
+            details = db.get_invoices_detailed([item["ID"] for item in chosen])
+            # One batch kept at a time: a month of them runs to tens of megabytes.
+            st.session_state["month_download_file"] = (wanted, _invoices_zip(details, as_images=True))
+        _rerun()
+
+
+def _past_invoices_section(counts: dict, year: int, month: int) -> None:
     """Everything that is reference rather than workflow, kept out of the way.
 
     Looking an old invoice up, browsing what is still accumulating, checking
@@ -3236,6 +3276,8 @@ def _past_invoices_section(counts: dict) -> None:
         "Past invoices, credits and lookups", key="invoice_reference_open"
     ):
         return
+
+    _month_download(year, month)
 
     st.markdown(f"###### Still accumulating, any month ({counts['open_count']})")
     open_ones = db.get_invoices(status="Open")
@@ -3427,7 +3469,7 @@ def invoices_tab() -> None:
     # Sits below the month's figures rather than on top of them, and belongs
     # to the month it was issued for.
     _just_issued_panel(year, month)
-    _past_invoices_section(counts)
+    _past_invoices_section(counts, year, month)
 
 
 # ---------------------------------------------------------------------------

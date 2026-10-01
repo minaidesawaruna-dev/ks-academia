@@ -3231,6 +3231,31 @@ def get_invoice_counts():
         return {"open_count": int(open_count), "issued_count": int(issued_count)}
 
 
+def get_issued_invoices_for_month(year, month):
+    """Every invoice issued for a month's classes, oldest number first, with the day it was issued.
+
+    The same rule as the month's "already sent" figure: an issued invoice
+    with a class in that month. A void one is left out -- its replacement is
+    the one a parent should have.
+    """
+    first_day = date(year, month, 1)
+    last_day = date(year, month, monthrange(year, month)[1])
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Invoice.id, Invoice.invoice_number, Invoice.issued_on)
+            .join(InvoiceItem, InvoiceItem.invoice_id == Invoice.id)
+            .where(
+                Invoice.status == "Issued",
+                InvoiceItem.session_date >= first_day,
+                InvoiceItem.session_date <= last_day,
+            )
+            .distinct()
+            .order_by(Invoice.invoice_number)
+        ).all()
+    return [{"ID": invoice_id, "Number": number, "Issued": as_date(issued) if issued else None}
+            for invoice_id, number, issued in rows]
+
+
 def get_month_invoice_summary(year, month):
     """The billing position for one month of classes.
 

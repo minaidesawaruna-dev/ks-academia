@@ -1311,6 +1311,51 @@ def t_forecast_clash_in_one_upload():
     return "forecast 1 new, 2 not added -- what the import then did"
 
 
+_MONTH_FILES_SCRIPT = r'''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(day):
+    return {"date": day, "class_name": "G11 Test Math", "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in ("Nam Jihoon", "Oh Minseok")]}
+
+sb.backfill({"sessions": [lesson(dt.date(2026, 9, d)) for d in (1, 8)] + [lesson(dt.date(2026, 10, 6))]}, teacher)
+september = [db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)[1] for row in db.get_open_invoice_items_for_month(2026, 9)]
+october = [db.issue_invoice_for_month(row["Invoice ID"], 2026, 10)[1] for row in db.get_open_invoice_items_for_month(2026, 10)]
+voided = september[0]
+lines = db.get_invoice_for_edit(voided)["Lines"]
+_, replacement, _ = db.replace_invoice(voided, {lines[0]["ID"]: {"Rate": 60}}, note="a test")
+listed = db.get_issued_invoices_for_month(2026, 9)
+print(json.dumps({"september": sorted(september), "october": sorted(october), "voided": voided, "replacement": replacement,
+                  "listed": [item["ID"] for item in listed], "dated": all(item["Issued"] for item in listed),
+                  "listed_october": [item["ID"] for item in db.get_issued_invoices_for_month(2026, 10)]}))
+'''
+
+
+def t_month_invoices_again():
+    """A month's issued invoices can be listed again for one download, whichever browser asks.
+
+    The download after issuing lived only until the next batch: issuing
+    October took September's away. Void ones are left out -- their
+    replacement is what a parent should have.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "month.db").replace("\\", "/")
+        result = run(["-c", _MONTH_FILES_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    want = sorted([i for i in got["september"] if i != got["voided"]] + [got["replacement"]])
+    assert sorted(got["listed"]) == want, got
+    assert got["voided"] not in got["listed"] and got["dated"], got
+    assert sorted(got["listed_october"]) == got["october"], got
+    return "September's issued invoices, the replacement in and the void one out; October's apart"
+
+
 _REPLACE_SCRIPT = r'''
 import datetime as dt, json, db, schedule_backfill as sb
 db.initialise_database()
@@ -1638,6 +1683,7 @@ for name, fn in [
     ("re-uploading keeps two students apart", t_reupload_keeps_students_apart),
     ("a clash inside one upload is forecast", t_forecast_clash_in_one_upload),
     ("editing a sent invoice", t_edit_sent_invoice),
+    ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
     ("merge a child, name a subject", t_merge_and_name),
