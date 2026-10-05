@@ -3659,6 +3659,20 @@ def _retention_report(version: tuple, today: dt.date) -> dict:
     return report
 
 
+def _level_axis(first: str | None = None) -> alt.Axis:
+    """An axis of months, or other short labels, written level.
+
+    Vega-Lite stands a category axis's labels on end, so "Jan" to "Sep" read
+    sideways. Labels like "Aug 2025" keep the year for the first month and
+    each January only, on a second line, so fourteen months fit side by side.
+    """
+    if first is None:
+        return alt.Axis(labelAngle=0)
+    return alt.Axis(labelAngle=0, labelExpr=(
+        f"datum.label == '{first}' || slice(datum.label, 0, 3) == 'Jan'"
+        " ? split(datum.label, ' ') : slice(datum.label, 0, 3)"))
+
+
 _EFFECTS = ["Raises the chance of leaving", "Lowers it", "No clear effect"]
 # How much wider than its own bottom a factor's range may run before it is
 # telling nobody anything: a hundredfold. "No clear effect" is a finding and
@@ -3805,7 +3819,7 @@ def _retention_view() -> None:
     # share of them never came back.
     months, thin = _chartable_months(report["months"])
     order = list(months["label"])
-    shared = alt.X("label:N", sort=order, title=None)
+    shared = alt.X("label:N", sort=order, title=None, axis=_level_axis(order[0]))
     tips = [alt.Tooltip("label:N", title="Month"),
             alt.Tooltip("active:Q", title="Students taught"),
             alt.Tooltip("joined:Q", title="First on record"),
@@ -3875,7 +3889,7 @@ def _retention_view() -> None:
         alt.Chart(drift)
         .mark_bar(color="#eb6834")
         .encode(
-            x=alt.X("label:N", sort=list(drift["label"]), title="Lessons that month"),
+            x=alt.X("label:N", sort=list(drift["label"]), title="Lessons that month", axis=_level_axis()),
             y=alt.Y("share:Q", title="Was their last month", axis=alt.Axis(format="%")),
             tooltip=[alt.Tooltip("label:N", title="Lessons that month"),
                      alt.Tooltip("months:Q", title="Student-months"),
@@ -4158,7 +4172,7 @@ def _teaching_view() -> None:
         alt.Chart(frame)
         .mark_bar(color="#2a78d6")
         .encode(
-            x=alt.X("Month name:N", sort=order, title=None),
+            x=alt.X("Month name:N", sort=order, title=None, axis=_level_axis()),
             y=alt.Y("Students:Q", title="Students"),
             tooltip=[alt.Tooltip("Month name:N", title="Month"), "Students:Q", "Lessons:Q",
                      alt.Tooltip("Hours:Q", title="Teaching hours", format=",.1f"), "Teachers:Q"],
@@ -4194,7 +4208,7 @@ def _teaching_view() -> None:
             alt.Chart(teachers[teachers["Teacher"].isin(picked)])
             .mark_line(point=True)
             .encode(
-                x=alt.X("Month name:N", sort=order, title=None),
+                x=alt.X("Month name:N", sort=order, title=None, axis=_level_axis()),
                 y=alt.Y(f"{measure}:Q", title=_TEACHING_MEASURES[measure]),
                 color=alt.Color("Teacher:N", sort=picked, legend=alt.Legend(
                     title=None, orient="bottom", columns=4, labelLimit=0)),
@@ -4275,7 +4289,7 @@ def data_tab() -> None:
         alt.Chart(stacked)
         .mark_bar()
         .encode(
-            x=alt.X("Month name:N", sort=order, title=None),
+            x=alt.X("Month name:N", sort=order, title=None, axis=_level_axis()),
             y=alt.Y("Amount:Q", stack=True, title="All teachers", axis=alt.Axis(format="$,.0f")),
             color=alt.Color("Kind:N", scale=alt.Scale(
                 domain=["Invoiced", "Still to invoice"], range=["#2a78d6", "#a9c8ee"]),
@@ -4323,7 +4337,7 @@ def data_tab() -> None:
             alt.Chart(frame[frame["Teacher"].isin(picked)])
             .mark_line(point=True)
             .encode(
-                x=alt.X("Month name:N", sort=order, title=None),
+                x=alt.X("Month name:N", sort=order, title=None, axis=_level_axis()),
                 y=alt.Y("Month total:Q", title="Invoiced + still to invoice",
                         axis=alt.Axis(format="$,.0f")),
                 color=alt.Color("Teacher:N", sort=picked, legend=alt.Legend(
