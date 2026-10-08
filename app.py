@@ -3403,6 +3403,83 @@ def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
     _rerun()
 
 
+def _next_number_control() -> None:
+    """The next invoice's number, and a way to choose another.
+
+    For invoices written outside the app, whose numbers the next one here
+    must not repeat. A number an invoice in the app already has is not
+    refused outright: who has it is shown under it, with the choice of giving
+    their invoice another number instead.
+    """
+    numbering = db.get_next_invoice_number()
+    with st.popover(f"Next invoice number: #{numbering['next']}"):
+        with st.form("next_number_form", border=False):
+            chosen = st.number_input(
+                "Next invoice number", min_value=db.INVOICE_NUMBER_START, value=numbering["next"],
+                step=1, help=f"Numbering carries on from here. A free number below "
+                             f"#{numbering['top']} is used once, then numbering goes back to "
+                             f"#{numbering['top']} and up.",
+            )
+            if st.form_submit_button("Save", type="primary"):
+                outcome, detail = db.set_next_invoice_number(chosen)
+                if outcome == "set":
+                    st.session_state.pop("number_clash", None)
+                    _flash(f"The next invoice will be #{detail}.")
+                elif outcome == "taken":
+                    st.session_state["number_clash"] = {"wanted": int(chosen), "holder": detail}
+                else:
+                    _flash(f"Numbers below #{detail} are the academy's invoices from before the "
+                           "app, which it can't check.", "warning")
+                _rerun()
+        # In the popover, under the number that clashed: a rerun that leaves
+        # the label as it was keeps the popover open, which would cover a
+        # warning placed below it on the page.
+        _number_clash(numbering)
+
+
+def _number_clash(numbering: dict) -> None:
+    """A number chosen that an invoice already has: whose it is, and a way to free it."""
+    clash = st.session_state.get("number_clash")
+    if not clash:
+        return
+    wanted, holder = clash["wanted"], clash["holder"]
+    issued = f", issued {db.as_date(holder['Issued']):%d %b %Y}" if holder.get("Issued") else ""
+    st.warning(
+        f"**#{wanted} is already used** by {holder['Student']}'s invoice"
+        f"{' (void)' if holder['Status'] == 'Void' else ''}{issued}."
+    )
+    with st.form("number_clash_form", border=False):
+        move_to = st.number_input(
+            f"New number for {holder['Student']}'s invoice", min_value=db.INVOICE_NUMBER_START,
+            value=numbering["top"], step=1,
+        )
+        move = st.form_submit_button(f"Renumber it and use #{wanted} next", type="primary",
+                                     width="stretch")
+        cancel = st.form_submit_button("Keep it, choose another number", width="stretch")
+    st.caption(
+        f"If {holder['Student']} already has it as #{wanted}, send them the re-made one from "
+        "Past invoices: it shows the new number."
+    )
+    if cancel:
+        st.session_state.pop("number_clash", None)
+        _rerun()
+    if move:
+        outcome, detail = db.move_invoice_number(wanted, move_to)
+        if outcome == "taken":
+            st.error(f"#{int(move_to)} is used too, by {detail['Student']}'s invoice. Try another.")
+            return
+        if outcome == "low":
+            st.error(f"Numbers below #{detail} are the academy's invoices from before the app.")
+            return
+        st.session_state.pop("number_clash", None)
+        if outcome == "moved":
+            _flash(f"{detail['Student']}'s invoice is now #{detail['To']}. "
+                   f"The next invoice will be #{wanted}.")
+        else:
+            _flash(f"The next invoice will be #{wanted}.")
+        _rerun()
+
+
 def invoices_tab() -> None:
 
     # The month leads and everything below is that month's: an invoice is
@@ -3443,6 +3520,7 @@ def invoices_tab() -> None:
     if not month_items:
         st.info(f"Nothing left to bill for {period}.")
     else:
+        _next_number_control()
         # A form, as on Payments: ticking is instant, and the button is above
         # the list rather than below every student in it.
         with st.form(f"invoice_form_{year}_{month}", border=False):

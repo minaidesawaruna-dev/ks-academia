@@ -491,6 +491,7 @@ def t_read_functions_all_run():
             lambda: db.get_all_student_month_breakdowns(year, month),
         "get_invoices": lambda: db.get_invoices(),
         "get_invoice_counts": lambda: db.get_invoice_counts(),
+        "get_next_invoice_number": lambda: db.get_next_invoice_number(),
         "get_month_invoice_summary": lambda: db.get_month_invoice_summary(year, month),
         "get_open_invoice_items_for_month":
             lambda: db.get_open_invoice_items_for_month(year, month),
@@ -1471,6 +1472,95 @@ def t_edit_sent_invoice():
             "change flagged, kept as sent or updated in bulk")
 
 
+_NUMBERING_SCRIPT = r'''
+import datetime as dt, json, db, schedule_backfill as sb
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+everyone = ["Nam Jihoon", "Oh Minseok", "Seo Yuna"]
+
+def lesson(day):
+    return {"date": dt.date(2026, 9, day), "class_name": "G11 Test Math", "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in everyone]}
+
+def brief(outcome):
+    kind, detail = outcome
+    return [kind, {k: detail[k] for k in ("Student", "Number", "Status") if k in detail}
+            if isinstance(detail, dict) else detail]
+
+sb.backfill({"sessions": [lesson(1), lesson(8)]}, teacher)
+open_ = {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, 9)}
+number = lambda invoice: db.get_invoice(invoice)["Number"]
+result = {"fresh": db.get_next_invoice_number()}
+nam = db.issue_invoice_for_month(open_["Nam Jihoon"], 2026, 9)[1]
+result["first"] = number(nam)
+result["taken"] = brief(db.set_next_invoice_number(7323))
+result["low"] = db.set_next_invoice_number(7000)
+result["typo"] = db.set_next_invoice_number(9000)
+result["lowered"] = db.set_next_invoice_number(8000)
+result["chosen"] = db.get_next_invoice_number()
+oh = db.issue_invoice_for_month(open_["Oh Minseok"], 2026, 9)[1]
+result["second"] = [number(oh), db.get_next_invoice_number()]
+# Paid, then edited: the replacement says what it corrected, by number, on an overpaid credit.
+db.mark_invoice_paid(oh)
+eighth = next(line for line in db.get_invoice_for_edit(oh)["Lines"] if line["Date"] == dt.date(2026, 9, 8))
+_, oh_new, oh_new_number = db.replace_invoice(oh, {eighth["ID"]: {"Charged": False}})
+result["replacement"] = oh_new_number
+# Its number wanted for the next invoice: who has it, then moved out of the way.
+result["clash"] = brief(db.set_next_invoice_number(oh_new_number))
+result["onto_void"] = brief(db.move_invoice_number(oh_new_number, 8000))
+result["moved"] = brief(db.move_invoice_number(oh_new_number, 8002)) + [number(oh_new)]
+result["after_move"] = db.get_next_invoice_number()
+result["credit_text"] = sorted([c["Subject"], c["Reason"]] for c in db.get_credits()
+                               if c["Student"] == "Oh Minseok")
+result["void_says"] = db.get_invoice(oh)["Replaced by"]
+seo = db.issue_invoice_for_month(open_["Seo Yuna"], 2026, 9)[1]
+result["third"] = [number(seo), db.get_next_invoice_number()]
+numbers = [row["Number"] for row in db.get_invoices() if row["Number"] is not None]
+result["unique"] = [len(numbers), len(set(numbers))]
+print(json.dumps(result, default=str))
+'''
+
+
+def t_next_invoice_number():
+    """The admin chooses the next invoice's number; one already used can be freed, never shared.
+
+    For invoices written outside the app. A number below the app's first is
+    refused, since those are the academy's earlier invoices it can't check.
+    A number in use is reported with whose it is; renumbering that invoice
+    frees it, and the credits naming it by number follow it. A free number
+    below the top is used once, then numbering returns to the top.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "numbering.db").replace("\\", "/")
+        result = run(["-c", _NUMBERING_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-900:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["fresh"] == {"next": 7323, "top": 7323}, got["fresh"]
+    assert got["first"] == 7323, got["first"]
+    assert got["taken"] == ["taken", {"Student": "Nam Jihoon", "Number": 7323, "Status": "Issued"}], got["taken"]
+    assert got["low"] == ["low", 7323], got["low"]
+    assert got["typo"] == ["set", 9000] and got["lowered"] == ["set", 8000], got
+    assert got["chosen"] == {"next": 8000, "top": 7324}, got["chosen"]
+    assert got["second"] == [8000, {"next": 8001, "top": 8001}], got["second"]
+    assert got["replacement"] == 8001, got["replacement"]
+    assert got["clash"] == ["taken", {"Student": "Oh Minseok", "Number": 8001, "Status": "Issued"}], got["clash"]
+    assert got["onto_void"] == ["taken", {"Student": "Oh Minseok", "Number": 8000, "Status": "Void"}], got
+    assert got["moved"] == ["moved", {"Student": "Oh Minseok", "Number": 8002, "Status": "Issued"}, 8002], got
+    assert got["after_move"] == {"next": 8001, "top": 8003}, got["after_move"]
+    assert any("#8002" in text for pair in got["credit_text"] for text in pair), got["credit_text"]
+    assert not any("#8001" in text for pair in got["credit_text"] for text in pair), got["credit_text"]
+    assert got["void_says"] == 8002, got["void_says"]
+    assert got["third"] == [8001, {"next": 8003, "top": 8003}], got["third"]
+    assert got["unique"] == [4, 4], got["unique"]
+    return ("next number chosen; one in use reported with whose it is, renumbered out of the way "
+            "with its credits; a freed number used once; none ever shared")
+
+
 def t_swapped_class_same_slot():
     """A class the workbook replaces with another at the same time is swapped, not lost.
 
@@ -1683,6 +1773,7 @@ for name, fn in [
     ("re-uploading keeps two students apart", t_reupload_keeps_students_apart),
     ("a clash inside one upload is forecast", t_forecast_clash_in_one_upload),
     ("editing a sent invoice", t_edit_sent_invoice),
+    ("choosing the next invoice number", t_next_invoice_number),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

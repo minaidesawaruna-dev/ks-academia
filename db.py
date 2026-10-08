@@ -509,6 +509,19 @@ class DistinctStudents(Base):
     )
 
 
+class Setting(Base):
+    """A value the admin chose, kept by name.
+
+    So far only where invoice numbering carries on from, for when invoices
+    were written outside the app and the next one here must follow them.
+    """
+
+    __tablename__ = "settings"
+
+    key = Column(String(50), primary_key=True)
+    value = Column(String(200), nullable=False)
+
+
 def mark_students_distinct(first_id, second_id):
     """Remember that two students are different children."""
     first_id, second_id = sorted((int(first_id), int(second_id)))
@@ -2563,6 +2576,113 @@ def find_duplicate_students():
 
 # The academy's existing invoices run to #7322, so new ones continue from there.
 INVOICE_NUMBER_START = 7323
+NEXT_NUMBER_SETTING = "next_invoice_number"
+
+
+def _top_free_number(session) -> int:
+    """One past the highest number ever used, void invoices included."""
+    highest = session.scalar(select(func.max(Invoice.invoice_number)))
+    return max(INVOICE_NUMBER_START, (highest or 0) + 1)
+
+
+def _number_holder(session, number):
+    """The invoice carrying ``number``, if any -- a void one included."""
+    return session.scalar(select(Invoice).where(Invoice.invoice_number == number))
+
+
+def _next_invoice_number(session) -> int:
+    """The number the next invoice issued will carry.
+
+    The number the admin chose, while it is still free; otherwise one past
+    the highest ever used. A choice above the highest carries numbering on
+    from there; a free one below it -- one freed by renumbering the invoice
+    that had it -- is used once, and numbering then goes back to the top.
+    Checked as it is taken, so no two invoices ever share a number.
+    """
+    chosen = session.get(Setting, NEXT_NUMBER_SETTING)
+    if chosen is not None:
+        number = int(chosen.value)
+        if number >= INVOICE_NUMBER_START and _number_holder(session, number) is None:
+            return number
+    return _top_free_number(session)
+
+
+def _holder_summary(session, invoice) -> dict:
+    student = session.get(Student, invoice.student_id)
+    return {"ID": invoice.id, "Number": invoice.invoice_number, "Status": invoice.status,
+            "Student": student.full_name if student else "", "Issued": invoice.issued_on}
+
+
+def _lock_numbers(session) -> None:
+    if session.get_bind().dialect.name == "postgresql":
+        session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": INVOICE_NUMBER_START})
+
+
+def _choose_next(session, number) -> None:
+    chosen = session.get(Setting, NEXT_NUMBER_SETTING)
+    if chosen is None:
+        session.add(Setting(key=NEXT_NUMBER_SETTING, value=str(number)))
+    else:
+        chosen.value = str(number)
+
+
+def get_next_invoice_number() -> dict:
+    """``{"next": the next invoice's number, "top": one past the highest used}``."""
+    with SessionLocal() as session:
+        return {"next": _next_invoice_number(session), "top": _top_free_number(session)}
+
+
+def set_next_invoice_number(number) -> tuple[str, Any]:
+    """Make ``number`` the next invoice's.
+
+    Returns ``("set", number)``; ``("taken", the invoice that has it)``, which
+    ``move_invoice_number`` can free; or ``("low", INVOICE_NUMBER_START)`` for
+    a number among the academy's invoices from before the app, which it has
+    no record of and so cannot check.
+    """
+    number = int(number)
+    if number < INVOICE_NUMBER_START:
+        return "low", INVOICE_NUMBER_START
+    with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
+        _lock_numbers(session)
+        holder = _number_holder(session, number)
+        if holder is not None:
+            return "taken", _holder_summary(session, holder)
+        _choose_next(session, number)
+        session.commit()
+        return "set", number
+
+
+def move_invoice_number(wanted, move_to) -> tuple[str, Any]:
+    """Renumber the invoice that has ``wanted`` to ``move_to``; ``wanted`` goes to the next invoice.
+
+    For a number the admin needs that an invoice in the app already has.
+    Credits naming that invoice by number are renamed with it. Returns
+    ``("moved", {"Student", "From", "To"})``; ``("taken", the invoice that
+    has it)`` or ``("low", INVOICE_NUMBER_START)`` when ``move_to`` can't be
+    used; or ``("set", wanted)`` when nothing has ``wanted`` any more.
+    """
+    wanted, move_to = int(wanted), int(move_to)
+    if min(wanted, move_to) < INVOICE_NUMBER_START:
+        return "low", INVOICE_NUMBER_START
+    with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
+        _lock_numbers(session)
+        holder, moved = _number_holder(session, wanted), None
+        if holder is not None:
+            other = _number_holder(session, move_to)
+            if other is not None:
+                return "taken", _holder_summary(session, other)
+            holder.invoice_number = move_to
+            named = re.compile(rf"#{wanted}(?!\d)")
+            for credit in session.scalars(select(Credit).where(or_(
+                    Credit.class_name.contains(f"#{wanted}"), Credit.reason.contains(f"#{wanted}")))):
+                if credit.class_name:
+                    credit.class_name = _fit(named.sub(f"#{move_to}", credit.class_name), Credit.class_name)
+                credit.reason = _fit(named.sub(f"#{move_to}", credit.reason or ""), Credit.reason)
+            moved = {**_holder_summary(session, holder), "From": wanted, "To": move_to}
+        _choose_next(session, wanted)
+        session.commit()
+        return ("moved", moved) if moved else ("set", wanted)
 
 
 def as_date(value) -> date:
@@ -3560,8 +3680,7 @@ def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
         items_total = sum(float(item.amount or 0) for item, _ in in_month)
         _apply_credits(session, target, items_total, when)
 
-        highest = session.scalar(select(func.max(Invoice.invoice_number)))
-        target.invoice_number = max(INVOICE_NUMBER_START, (highest or 0) + 1)
+        target.invoice_number = _next_invoice_number(session)
         target.issued_on = when
         target.status = "Issued"
         session.commit()
@@ -3902,8 +4021,7 @@ def replace_invoice(invoice_id, lines, extra=(), note=None, today=None, add=()):
                 credit.status, credit.invoice_id, credit.settled_on = "Open", None, None
         net = round(room, 2)  # what the replacement asks for, its credit taken off
 
-        highest = session.scalar(select(func.max(Invoice.invoice_number)))
-        new.invoice_number = max(INVOICE_NUMBER_START, (highest or 0) + 1)
+        new.invoice_number = _next_invoice_number(session)
         if new.paid_amount is not None and float(new.paid_amount) > net + 0.005:
             session.add(Credit(
                 student_id=new.student_id, session_id=None,
