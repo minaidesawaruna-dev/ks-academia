@@ -2921,6 +2921,88 @@ def _issued_lookup_section(counts: dict) -> None:
             _send_copy(detail, "send_issued")
         if st.toggle("Edit this invoice", key=f"invoice_edit_{detail['ID']}"):
             _invoice_editor(detail)
+        if st.toggle("Change its number", key=f"invoice_renumber_{detail['ID']}"):
+            _number_changer(detail)
+
+
+def _forget_made_files() -> None:
+    """Drop invoice files already made: after a renumbering they show an old number.
+
+    Each is made again, with the new one, when it is next asked for.
+    """
+    for key in [k for k in st.session_state if k.startswith("invoices_zip_png_")
+                or k in ("invoices_replaced_zip", "month_download_file", "send_issued_file")]:
+        st.session_state.pop(key, None)
+
+
+def _number_changer(detail: dict) -> None:
+    """Give one sent invoice another number.
+
+    A number another invoice has is not refused outright: whose it is is
+    shown, with the choice of giving that one another number -- this
+    invoice's old number swaps the two.
+    """
+    key = f"renumber_{detail['ID']}"
+    with st.form(f"{key}_form", border=False):
+        number = st.number_input("New number", min_value=db.INVOICE_NUMBER_START,
+                                 value=int(detail["Number"]), step=1)
+        if st.form_submit_button("Change the number", type="primary"):
+            outcome, info = db.renumber_invoice(detail["ID"], number)
+            if outcome == "taken":
+                st.session_state[f"{key}_clash"] = {"wanted": int(number), "holder": info}
+                _rerun()
+            st.session_state.pop(f"{key}_clash", None)
+            _renumbered(detail, outcome, info)
+    clash = st.session_state.get(f"{key}_clash")
+    if not clash:
+        return
+    wanted, holder = clash["wanted"], clash["holder"]
+    issued = f", issued {db.as_date(holder['Issued']):%d %b %Y}" if holder.get("Issued") else ""
+    st.warning(
+        f"**#{wanted} is already used** by {holder['Student']}'s invoice"
+        f"{' (void)' if holder['Status'] == 'Void' else ''}{issued}."
+    )
+    with st.form(f"{key}_clash_form", border=False):
+        move_to = st.number_input(
+            f"New number for {holder['Student']}'s invoice", min_value=db.INVOICE_NUMBER_START,
+            value=db.get_next_invoice_number()["top"], step=1,
+            help=f"#{detail['Number']} swaps the two invoices' numbers.",
+        )
+        move = st.form_submit_button(f"Renumber it and give this one #{wanted}", type="primary",
+                                     width="stretch")
+        cancel = st.form_submit_button("Keep it, choose another number", width="stretch")
+    if cancel:
+        st.session_state.pop(f"{key}_clash", None)
+        _rerun()
+    if move:
+        outcome, info = db.renumber_invoice(detail["ID"], wanted, move_holder_to=move_to)
+        if outcome == "move_taken":
+            st.error(f"#{int(move_to)} is used too, by {info['Student']}'s invoice. Try another.")
+            return
+        st.session_state.pop(f"{key}_clash", None)
+        _renumbered(detail, outcome, info)
+
+
+def _renumbered(detail: dict, outcome: str, info) -> None:
+    """Say what a renumbering did, and open the invoice again under its new number."""
+    if outcome == "renumbered":
+        _forget_made_files()
+        moved = info["Moved"]
+        _flash(
+            f"{info['Student']}'s invoice #{info['From']} is now #{info['To']}."
+            + (f" {moved['Student']}'s #{moved['From']} is now #{moved['To']}." if moved else "")
+            + " If a parent already has the old number, send them the re-made one."
+            + f" The next new invoice will be #{db.get_next_invoice_number()['next']}."
+        )
+        st.session_state.pop(f"invoice_renumber_{detail['ID']}", None)
+        st.session_state["issued_search_next"] = str(info["To"])
+        _rerun()
+    elif outcome == "same":
+        st.info("That is already its number.")
+    elif outcome == "low":
+        st.error(f"Numbers below #{info} are the academy's invoices from before the app.")
+    else:
+        st.warning("Only a sent invoice can be given another number.")
 
 
 
@@ -2932,7 +3014,7 @@ def _send_copy(detail: dict, key: str) -> None:
         return
     noun = _EXPORT_NOUN[fmt]
     made = st.session_state.get(f"{key}_file")
-    if made and made[0] == (detail["ID"], detail["Total"]):
+    if made and made[0] == (detail["ID"], detail["Total"], detail["Number"]):
         st.download_button(
             f"Download the {noun}", data=made[1], file_name=_invoice_filename(detail, fmt),
             mime="image/png" if fmt == "png" else "application/pdf",
@@ -2940,7 +3022,8 @@ def _send_copy(detail: dict, key: str) -> None:
         )
     elif st.button(f"Make the {noun} to send", key=f"{key}_make", width="stretch"):
         render = render_invoices_png if fmt == "png" else render_invoices_pdf
-        st.session_state[f"{key}_file"] = ((detail["ID"], detail["Total"]), render([detail])[0])
+        st.session_state[f"{key}_file"] = ((detail["ID"], detail["Total"], detail["Number"]),
+                                           render([detail])[0])
         _rerun()
 
 
@@ -3457,8 +3540,8 @@ def _number_clash(numbering: dict) -> None:
                                      width="stretch")
         cancel = st.form_submit_button("Keep it, choose another number", width="stretch")
     st.caption(
-        f"If {holder['Student']} already has it as #{wanted}, send them the re-made one from "
-        "Past invoices: it shows the new number."
+        f"If {holder['Student']} already has it as #{wanted}, send them the re-made one: "
+        "Past invoices → Look one up. It shows the new number."
     )
     if cancel:
         st.session_state.pop("number_clash", None)
@@ -3473,6 +3556,7 @@ def _number_clash(numbering: dict) -> None:
             return
         st.session_state.pop("number_clash", None)
         if outcome == "moved":
+            _forget_made_files()
             _flash(f"{detail['Student']}'s invoice is now #{detail['To']}. "
                    f"The next invoice will be #{wanted}.")
         else:
@@ -3507,6 +3591,7 @@ def invoices_tab() -> None:
             "classes comes off automatically"
         )
     st.caption(_md(trail))
+    _next_number_control()
     _out_of_step_warning()
 
     month_items = db.get_open_invoice_items_for_month(year, month)
@@ -3520,7 +3605,6 @@ def invoices_tab() -> None:
     if not month_items:
         st.info(f"Nothing left to bill for {period}.")
     else:
-        _next_number_control()
         # A form, as on Payments: ticking is instant, and the button is above
         # the list rather than below every student in it.
         with st.form(f"invoice_form_{year}_{month}", border=False):

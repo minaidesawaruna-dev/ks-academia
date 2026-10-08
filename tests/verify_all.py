@@ -1517,6 +1517,17 @@ result["credit_text"] = sorted([c["Subject"], c["Reason"]] for c in db.get_credi
 result["void_says"] = db.get_invoice(oh)["Replaced by"]
 seo = db.issue_invoice_for_month(open_["Seo Yuna"], 2026, 9)[1]
 result["third"] = [number(seo), db.get_next_invoice_number()]
+# One sent invoice given another number: Seo Yuna's #8001.
+result["same"] = db.renumber_invoice(seo, 8001)
+result["re_taken"] = brief(db.renumber_invoice(seo, 7323))
+result["re_onto_void"] = brief(db.renumber_invoice(seo, 7323, move_holder_to=8000))
+kind, done = db.renumber_invoice(seo, 7323, move_holder_to=8001)
+result["swapped"] = [kind, done["From"], done["To"], done["Moved"], number(seo), number(nam)]
+result["re_credit"] = list(db.renumber_invoice(oh_new, 8010))[0:1] + [number(oh_new), db.get_invoice(oh)["Replaced by"]]
+result["re_credit_text"] = sorted([c["Subject"], c["Reason"]] for c in db.get_credits() if c["Student"] == "Oh Minseok")
+result["re_void"] = db.renumber_invoice(oh, 8020)
+result["re_low"] = db.renumber_invoice(seo, 7000)
+result["re_next"] = db.get_next_invoice_number()
 numbers = [row["Number"] for row in db.get_invoices() if row["Number"] is not None]
 result["unique"] = [len(numbers), len(set(numbers))]
 print(json.dumps(result, default=str))
@@ -1556,9 +1567,21 @@ def t_next_invoice_number():
     assert not any("#8001" in text for pair in got["credit_text"] for text in pair), got["credit_text"]
     assert got["void_says"] == 8002, got["void_says"]
     assert got["third"] == [8001, {"next": 8003, "top": 8003}], got["third"]
+    assert got["same"] == ["same", 8001], got["same"]
+    assert got["re_taken"] == ["taken", {"Student": "Nam Jihoon", "Number": 7323, "Status": "Issued"}], got
+    assert got["re_onto_void"] == ["move_taken", {"Student": "Oh Minseok", "Number": 8000, "Status": "Void"}], got
+    assert got["swapped"] == ["renumbered", 8001, 7323, {"Student": "Nam Jihoon", "From": 7323, "To": 8001},
+                              7323, 8001], got["swapped"]
+    assert got["re_credit"] == ["renumbered", 8010, 8010], got["re_credit"]
+    assert any("#8010" in text for pair in got["re_credit_text"] for text in pair), got["re_credit_text"]
+    assert not any("#8002" in text for pair in got["re_credit_text"] for text in pair), got["re_credit_text"]
+    assert got["re_void"] == ["not_issued", None], got["re_void"]
+    assert got["re_low"] == ["low", 7323], got["re_low"]
+    assert got["re_next"] == {"next": 8011, "top": 8011}, got["re_next"]
     assert got["unique"] == [4, 4], got["unique"]
     return ("next number chosen; one in use reported with whose it is, renumbered out of the way "
-            "with its credits; a freed number used once; none ever shared")
+            "with its credits; a freed number used once; a sent invoice renumbered or two swapped; "
+            "a void one keeps its number; none ever shared")
 
 
 def t_swapped_class_same_slot():

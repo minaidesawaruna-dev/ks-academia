@@ -2653,6 +2653,23 @@ def set_next_invoice_number(number) -> tuple[str, Any]:
         return "set", number
 
 
+def _rename_numbers_in_credits(session, renamed: dict) -> None:
+    """Credits naming an invoice by number -- "Overpaid: invoice #8590 corrected
+    to #8601" -- follow it to its new one. All at once, so two swapped
+    numbers swap here too rather than both ending up as one of them."""
+    if not renamed:
+        return
+    def follow(match):
+        number = int(match.group(1))
+        return f"#{renamed[number]}" if number in renamed else match.group(0)
+    naming = [column.contains(f"#{number}") for number in renamed
+              for column in (Credit.class_name, Credit.reason)]
+    for credit in session.scalars(select(Credit).where(or_(*naming))):
+        if credit.class_name:
+            credit.class_name = _fit(re.sub(r"#(\d+)", follow, credit.class_name), Credit.class_name)
+        credit.reason = _fit(re.sub(r"#(\d+)", follow, credit.reason or ""), Credit.reason)
+
+
 def move_invoice_number(wanted, move_to) -> tuple[str, Any]:
     """Renumber the invoice that has ``wanted`` to ``move_to``; ``wanted`` goes to the next invoice.
 
@@ -2673,16 +2690,57 @@ def move_invoice_number(wanted, move_to) -> tuple[str, Any]:
             if other is not None:
                 return "taken", _holder_summary(session, other)
             holder.invoice_number = move_to
-            named = re.compile(rf"#{wanted}(?!\d)")
-            for credit in session.scalars(select(Credit).where(or_(
-                    Credit.class_name.contains(f"#{wanted}"), Credit.reason.contains(f"#{wanted}")))):
-                if credit.class_name:
-                    credit.class_name = _fit(named.sub(f"#{move_to}", credit.class_name), Credit.class_name)
-                credit.reason = _fit(named.sub(f"#{move_to}", credit.reason or ""), Credit.reason)
+            _rename_numbers_in_credits(session, {wanted: move_to})
             moved = {**_holder_summary(session, holder), "From": wanted, "To": move_to}
         _choose_next(session, wanted)
         session.commit()
         return ("moved", moved) if moved else ("set", wanted)
+
+
+def renumber_invoice(invoice_id, number, move_holder_to=None) -> tuple[str, Any]:
+    """Give a sent invoice the number ``number``.
+
+    If another invoice has it, that one is given ``move_holder_to`` first --
+    the sent invoice's own old number swaps the two. Credits naming either
+    by number follow. Returns ``("renumbered", {"Student", "From", "To",
+    "Moved"})``, ``Moved`` being ``{"Student", "From", "To"}`` for the other
+    invoice or None; ``("taken", the invoice that has the number)`` when
+    ``move_holder_to`` isn't given; ``("move_taken", the invoice that has
+    it)`` when ``move_holder_to`` is used too; ``("low",
+    INVOICE_NUMBER_START)``; ``("same", number)``; or ``("not_issued", None)``
+    for an invoice not sent, or void -- a void one is the record of what a
+    parent was sent, so it keeps its number.
+    """
+    number = int(number)
+    move_to = int(move_holder_to) if move_holder_to is not None else None
+    if number < INVOICE_NUMBER_START or (move_to is not None and move_to < INVOICE_NUMBER_START):
+        return "low", INVOICE_NUMBER_START
+    with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
+        _lock_numbers(session)
+        invoice = session.get(Invoice, invoice_id)
+        if invoice is None or invoice.status != "Issued":
+            return "not_issued", None
+        if invoice.invoice_number == number:
+            return "same", number
+        renamed, moved = {}, None
+        holder = _number_holder(session, number)
+        if holder is not None:
+            if move_to is None:
+                return "taken", _holder_summary(session, holder)
+            other = _number_holder(session, move_to)
+            if other is not None and other.id != invoice.id:
+                return "move_taken", _holder_summary(session, other)
+            holder.invoice_number = move_to
+            renamed[number] = move_to
+            moved = {"Student": _holder_summary(session, holder)["Student"], "From": number, "To": move_to}
+        old = invoice.invoice_number
+        invoice.invoice_number = number
+        renamed[old] = number
+        _rename_numbers_in_credits(session, renamed)
+        result = {"Student": _holder_summary(session, invoice)["Student"], "From": old, "To": number,
+                  "Moved": moved}
+        session.commit()
+        return "renumbered", result
 
 
 def as_date(value) -> date:
