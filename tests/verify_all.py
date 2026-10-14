@@ -1584,6 +1584,117 @@ def t_next_invoice_number():
             "a void one keeps its number; none ever shared")
 
 
+_CLASS_EDIT_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event
+
+# Postgres refuses to delete a row others still point at; SQLite only does
+# when asked. Asked here, so this runs as the live database would.
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, names, subject, start, end):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": dt.time(start),
+            "end_time": dt.time(end), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sb.backfill({"sessions": [lesson(1, ["Nam Jihoon", "Oh Minseok"], "G11 Test Math", 16, 18),
+                          lesson(8, ["Nam Jihoon", "Oh Minseok"], "G11 Test Math", 16, 18),
+                          lesson(1, ["Kang Minji"], "G11 Test Bio", 18, 19)]}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(1, ["Seo Yuna"], "G11 Test Chem", 17, 19)]}, ids["Teacher B"])
+classes = {(item["Class"], item["Date"].day if hasattr(item["Date"], "day") else int(str(item["Date"])[-2:])): item["ID"]
+           for teacher in ids.values() for item in db.get_month_schedule(teacher, 2026, 9)}
+math_1, math_8, chem_1 = classes[("G11 Test Math", 1)], classes[("G11 Test Math", 8)], classes[("G11 Test Chem", 1)]
+students = {s["Name"]: s["ID"] for s in db.get_all_students()}
+open_ = {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, 9)}
+db.issue_invoice_for_month(open_["Nam Jihoon"], 2026, 9)
+
+result = {}
+# Delete for good: Nam was invoiced for the 8th, so he is owed it; Oh's open charge simply goes.
+result["deleted"] = list(db.delete_schedule_session(math_8))
+result["gone"] = db.get_schedule_session(math_8) is None
+result["credits"] = sorted([c["Student"], c["Reason"], c["Amount"]] for c in db.get_credits())
+result["oh_open"] = [row["Classes"] for row in db.get_open_invoice_items_for_month(2026, 9) if row["Student"] == "Oh Minseok"]
+result["again"] = list(db.delete_schedule_session(math_8))
+
+def roster(session_id):
+    return [row["student_name"] for row in db.get_schedule_session(session_id)["Attendance"]]
+
+def save(session_id, names):
+    detail = db.get_schedule_session(session_id)
+    return db.update_schedule_session(
+        session_id=session_id, session_date=detail["Date"], start_time=detail["Start"], end_time=detail["End"],
+        status=detail["Status"], note=detail["Note"],
+        attendance_rows=[{"student_id": students[n]} for n in names])
+
+# Seo Yuna, then Kang Minji, added to the 1st's maths: first come, first served.
+result["before"] = roster(math_1)
+save(math_1, roster(math_1) + ["Seo Yuna"])
+save(math_1, roster(math_1) + ["Kang Minji"])
+result["added"] = roster(math_1)
+save(math_1, list(reversed(roster(math_1))))
+result["resaved"] = roster(math_1)
+
+# Seo Yuna has chemistry 17-19 with another teacher; Kang Minji's biology starts as maths ends.
+result["class_clash"] = [[c["Student"], c["Class"], c["Teacher"]] for c in db.get_session_clashes(math_1)]
+result["ahead"] = [c["Class"] for c in db.find_student_clashes(
+    [students["Seo Yuna"], students["Kang Minji"]], [dt.date(2026, 9, 1)], dt.time(16), dt.time(18),
+    excluded_session_id=math_1)]
+result["month"] = [[c["Student"], c["First"]["Class"], c["Second"]["Class"]] for c in db.get_month_student_clashes(2026, 9)]
+chem = db.get_schedule_session(chem_1)
+db.update_schedule_session(session_id=chem_1, session_date=chem["Date"], start_time=chem["Start"],
+                           end_time=chem["End"], status=chem["Status"], note=chem["Note"],
+                           attendance_rows=[{"student_id": students["Seo Yuna"], "is_cancelled": True}])
+result["after_cancel"] = [len(db.get_session_clashes(math_1)), len(db.get_month_student_clashes(2026, 9))]
+
+# Taken out: the order of the rest stands.
+save(math_1, [n for n in roster(math_1) if n != "Oh Minseok"])
+result["taken_out"] = roster(math_1)
+print(json.dumps(result, default=str))
+"""
+
+
+def t_class_edits():
+    """Deleting a class works where links are enforced; students keep the order added; double bookings show.
+
+    "Delete for good" deleted the class before its invoice lines, which
+    Postgres refuses -- so on the live app nothing was ever deleted. A
+    student invoiced for a deleted class is owed it back; an open charge just
+    goes. A save keeps students in the order they were added, however the
+    rows arrive. A student in two classes at once is found, whoever teaches
+    them, until one of the two is cancelled for them.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "classes.db").replace("\\", "/")
+        result = run(["-c", _CLASS_EDIT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1200:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["deleted"] == ["deleted", 1] and got["gone"], got["deleted"]
+    assert got["credits"] == [["Nam Jihoon", "Class deleted", 130.0]], got["credits"]
+    assert got["oh_open"] == [1], got["oh_open"]
+    assert got["again"] == ["missing", 0], got["again"]
+    assert got["before"] == ["Nam Jihoon", "Oh Minseok"], got["before"]
+    assert got["added"] == ["Nam Jihoon", "Oh Minseok", "Seo Yuna", "Kang Minji"], got["added"]
+    assert got["resaved"] == got["added"], got["resaved"]
+    assert got["class_clash"] == [["Seo Yuna", "G11 Test Chem", "Teacher B"]], got["class_clash"]
+    assert got["ahead"] == ["G11 Test Chem"], got["ahead"]
+    assert got["month"] == [["Seo Yuna", "G11 Test Math", "G11 Test Chem"]], got["month"]
+    assert got["after_cancel"] == [0, 0], got["after_cancel"]
+    assert got["taken_out"] == ["Nam Jihoon", "Seo Yuna", "Kang Minji"], got["taken_out"]
+    return ("class deleted with links enforced, invoiced student credited; order added kept through "
+            "a save; a double booking across teachers found, gone once cancelled; one taken out")
+
+
 def t_swapped_class_same_slot():
     """A class the workbook replaces with another at the same time is swapped, not lost.
 
@@ -1797,6 +1908,7 @@ for name, fn in [
     ("a clash inside one upload is forecast", t_forecast_clash_in_one_upload),
     ("editing a sent invoice", t_edit_sent_invoice),
     ("choosing the next invoice number", t_next_invoice_number),
+    ("deleting a class, order added, double bookings", t_class_edits),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

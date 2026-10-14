@@ -1,6 +1,6 @@
 from pathlib import Path
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from calendar import month_abbr, monthrange
 from typing import Any
 import json
@@ -1737,11 +1737,17 @@ def _teacher_has_conflict(
 
 
 def _replace_session_attendance(session, session_id, attendance_rows):
-    for old_row in session.scalars(
-        select(SessionAttendance).where(
-            SessionAttendance.session_id == session_id
-        )
-    ).all():
+    # Every save rewrites the roster, so each student's place in the order
+    # they were added is carried across: places in a class are sometimes
+    # first come, first served, and a save must not reshuffle them.
+    added, place = {}, {}
+    for position, old_row in enumerate(session.scalars(
+        select(SessionAttendance)
+        .where(SessionAttendance.session_id == session_id)
+        .order_by(SessionAttendance.created_at, SessionAttendance.id)
+    ).all()):
+        added[old_row.student_id] = old_row.created_at
+        place[old_row.student_id] = position
         session.delete(old_row)
 
     # One place per student in a class, the first given: two rows for one
@@ -1751,7 +1757,10 @@ def _replace_session_attendance(session, session_id, attendance_rows):
         if row["student_id"] not in seen:
             seen.add(row["student_id"])
             first_rows.append(row)
-    attendance_rows = first_rows
+    # Written back in that order, newcomers after in the order given: two
+    # added in the same second are told apart only by the order written.
+    attendance_rows = sorted(first_rows, key=lambda row: place.get(row["student_id"], len(place)))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     student_ids = [row["student_id"] for row in attendance_rows]
     valid_ids = set(
         session.scalars(
@@ -1772,6 +1781,10 @@ def _replace_session_attendance(session, session_id, attendance_rows):
             is_paid=bool(row.get("is_paid")),
             on_roster=1,
             note=(row.get("note") or "").strip() or None,
+            # A newcomer is stamped here rather than by the database's
+            # default, which SQLite writes in a form that sorts before the
+            # stamps carried across from the same second.
+            created_at=added.get(row["student_id"]) or now,
         )
         for row in attendance_rows
         if row["student_id"] in valid_ids
@@ -2001,7 +2014,7 @@ def get_month_attendance(teacher_id, year, month):
                 ClassSession.session_date >= first_day,
                 ClassSession.session_date <= last_day,
             )
-            .order_by(Student.full_name)
+            .order_by(SessionAttendance.created_at, SessionAttendance.id)
         ).all()
 
         by_session: dict[int, list[dict[str, Any]]] = defaultdict(list)
@@ -2039,7 +2052,9 @@ def get_schedule_session(session_id):
             select(SessionAttendance, Student)
             .join(Student, SessionAttendance.student_id == Student.id)
             .where(SessionAttendance.session_id == session_id)
-            .order_by(Student.full_name)
+            # In the order they were added: places in a class are sometimes
+            # first come, first served.
+            .order_by(SessionAttendance.created_at, SessionAttendance.id)
         ).all()
         return {
             "ID": class_session.id,
@@ -2094,21 +2109,110 @@ def update_schedule_session(
     return "updated"
 
 
-def delete_schedule_session(session_id):
+def delete_schedule_session(session_id) -> tuple[str, int]:
+    """Delete one class, settling what it was billed, as a re-upload does.
+
+    Its charges come off invoices still open; a student already invoiced for
+    it is owed it back as a credit, the sent invoice untouched. Done in that
+    order, in one go: deleting the class first was refused outright by
+    Postgres, whose invoice lines and credits still pointed at it -- so on
+    the live app "Delete for good" never deleted anything. Returns
+    ``("deleted", credits raised)`` or ``("missing", 0)``.
+    """
     with SessionLocal() as session:
-        class_session = session.get(ClassSession, session_id)
-        if class_session is None:
-            return False
-        for attendance in session.scalars(
-            select(SessionAttendance).where(
-                SessionAttendance.session_id == session_id
-            )
-        ).all():
-            session.delete(attendance)
-        session.delete(class_session)
+        lesson = session.get(ClassSession, session_id)
+        if lesson is None:
+            return "missing", 0
+        rate_index = _rate_index(session, {lesson.class_id})
+        credited, _ = _remove_lesson(session, lesson, "Class deleted", rate_index)
         session.commit()
-    remove_invoice_items(session_id)
-    return True
+        return "deleted", credited
+
+
+def _clash_entry(lesson, academy_class, teacher, student) -> dict:
+    return {
+        "Student": student.full_name, "Student ID": student.id, "Date": lesson.session_date,
+        "Class": academy_class.name, "Teacher": teacher.name if teacher else "",
+        "Start": lesson.start_time, "End": lesson.end_time, "Session ID": lesson.id,
+    }
+
+
+def _bookings(session, student_ids=None, dates=None, start_time=None, end_time=None,
+              excluded_session_id=None, between=None):
+    """Classes students are really booked into: not cancelled, and not marked
+    cancelled for them -- they won't be there, so it can't clash."""
+    query = (
+        select(ClassSession, AcademyClass, Teacher, Student)
+        .select_from(SessionAttendance)
+        .join(ClassSession, SessionAttendance.session_id == ClassSession.id)
+        .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
+        .outerjoin(Teacher, ClassSession.teacher_id == Teacher.id)
+        .join(Student, SessionAttendance.student_id == Student.id)
+        .where(SessionAttendance.is_cancelled.is_(False), ClassSession.status != "Cancelled")
+    )
+    if student_ids is not None:
+        query = query.where(SessionAttendance.student_id.in_(student_ids))
+    if dates is not None:
+        query = query.where(ClassSession.session_date.in_(dates))
+    if start_time is not None and end_time is not None:
+        query = query.where(ClassSession.start_time < end_time, ClassSession.end_time > start_time)
+    if excluded_session_id is not None:
+        query = query.where(ClassSession.id != excluded_session_id)
+    if between is not None:
+        query = query.where(ClassSession.session_date.between(*between))
+    return session.execute(
+        query.order_by(ClassSession.session_date, Student.full_name, ClassSession.start_time)
+    ).all()
+
+
+def find_student_clashes(student_ids, dates, start_time, end_time, excluded_session_id=None) -> list[dict]:
+    """Other classes these students are booked into, at an overlapping time on these dates.
+
+    Whoever teaches them: a student taking three or four subjects is
+    otherwise checked by hand, class by class. ``excluded_session_id`` is
+    the class being edited, which can't clash with itself.
+    """
+    if not student_ids or not dates or start_time is None or end_time is None:
+        return []
+    with SessionLocal() as session:
+        return [_clash_entry(*row) for row in _bookings(
+            session, list(student_ids), list(dates), start_time, end_time, excluded_session_id)]
+
+
+def get_session_clashes(session_id) -> list[dict]:
+    """The other classes this class's students are booked into at the same time."""
+    with SessionLocal() as session:
+        lesson = session.get(ClassSession, session_id)
+        if lesson is None or lesson.status == "Cancelled":
+            return []
+        here = session.scalars(select(SessionAttendance.student_id).where(
+            SessionAttendance.session_id == session_id, SessionAttendance.is_cancelled.is_(False))).all()
+        if not here:
+            return []
+        return [_clash_entry(*row) for row in _bookings(
+            session, here, [lesson.session_date], lesson.start_time, lesson.end_time, session_id)]
+
+
+def get_month_student_clashes(year, month) -> list[dict]:
+    """Every student booked into two classes at once this month, any teachers.
+
+    ``[{"Student", "Date", "First": clash entry, "Second": clash entry}]``.
+    """
+    first_day = date(year, month, 1)
+    last_day = date(year, month, monthrange(year, month)[1])
+    with SessionLocal() as session:
+        by_day = defaultdict(list)
+        for row in _bookings(session, between=(first_day, last_day)):
+            entry = _clash_entry(*row)
+            by_day[(entry["Student ID"], entry["Date"])].append(entry)
+    found = []
+    for (_, day), entries in sorted(by_day.items(), key=lambda item: (item[0][1], item[1][0]["Student"])):
+        entries.sort(key=lambda entry: entry["Start"])
+        for index, first in enumerate(entries):
+            for second in entries[index + 1:]:
+                if second["Start"] < first["End"] and second["End"] > first["Start"]:
+                    found.append({"Student": first["Student"], "Date": day, "First": first, "Second": second})
+    return found
 
 
 def set_student_note(student_id, note):

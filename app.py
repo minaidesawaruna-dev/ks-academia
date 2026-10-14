@@ -1868,6 +1868,66 @@ def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) 
     return ""
 
 
+def _clash_lines(clashes: list, dated: bool = False) -> str:
+    """Students booked into another class at the same time, a line each."""
+    lines = [
+        f"**{item['Student']}** is also in {item['Class']}"
+        + (f" ({item['Teacher']})" if item["Teacher"] else "")
+        + (f", {db.as_date(item['Date']):%a %d %b}" if dated else "")
+        + f", {db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}"
+        for item in clashes[:8]
+    ]
+    if len(clashes) > 8:
+        lines.append(f"…and {len(clashes) - 8} more")
+    return "  \n".join(lines)
+
+
+def _roster_rows(attendance: list) -> list:
+    """A class's roster as it is saved, in the order the students were added."""
+    return [
+        {
+            "student_id": row["student_id"],
+            "is_online": bool(row.get("is_online")),
+            "has_recording": bool(row.get("has_recording")),
+            "is_cancelled": bool(row.get("is_cancelled")),
+            "is_paid": bool(row.get("is_paid")),
+            "note": row.get("note") or "",
+        }
+        for row in attendance
+    ]
+
+
+def _saved_message(message: str, lesson_id: int) -> None:
+    """Flash ``message``, with a warning if a student is now booked twice at once."""
+    clashes = db.get_session_clashes(lesson_id)
+    if clashes:
+        _flash(message + " Booked into two classes at once:  \n" + _clash_lines(clashes), "warning")
+    else:
+        _flash(message)
+
+
+def _month_clashes(year: int, month: int) -> None:
+    """Every student booked into two classes at once this month, whichever teachers."""
+    clashes = db.get_month_student_clashes(year, month)
+    if not clashes:
+        return
+    with st.expander(
+        f"{len(clashes)} double booking(s) in {calendar.month_name[month]} — "
+        "a student in two classes at once",
+        icon=":material/warning:",
+    ):
+        for item in clashes:
+            first, second = item["First"], item["Second"]
+            st.markdown(
+                f"**{item['Student']}** · {db.as_date(item['Date']):%a %d %b} · "
+                + " and ".join(
+                    f"{side['Class']} ({side['Teacher']}) "
+                    f"{db.as_time(side['Start']):%H:%M}–{db.as_time(side['End']):%H:%M}"
+                    for side in (first, second)
+                )
+            )
+
+
 def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
     classes = db.get_teacher_classes_for_schedule(teacher_id, dt.date(year, month, 1))
     students = db.get_all_students()
@@ -1969,6 +2029,14 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
             st.warning(f"That time is taken. {clash}")
         if times_set and start >= end:
             st.warning("The end time needs to be after the start.")
+        elif times_set and selected_ids:
+            booked = db.find_student_clashes(
+                selected_ids, [when + dt.timedelta(weeks=week) for week in range(extra + 1)],
+                start, end,
+            )
+            if booked:
+                st.warning("Booked into another class at this time:  \n"
+                           + _clash_lines(booked, dated=bool(extra)))
 
         if st.button("Add class", type="primary", key="add_lesson_go",
                      disabled=not times_set,
@@ -2066,6 +2134,9 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
         f"#### {detail['Class']} · {db.as_date(detail['Date']):%a %d %b} · "
         f"{db.as_time(detail['Start']):%H:%M}–{db.as_time(detail['End']):%H:%M}"
     )
+    clashes = db.get_session_clashes(lesson_id)
+    if clashes:
+        st.warning("Booked into another class at the same time:  \n" + _clash_lines(clashes))
 
     with st.expander("Edit the class", expanded=True):
         columns = st.columns([1.4, 1, 1, 1.2])
@@ -2104,19 +2175,16 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             key=f"add_{lesson_id}",
             placeholder="Pick one or more names",
         )
+        if adding:
+            booked = db.find_student_clashes(
+                [lookup[name] for name in adding], [db.as_date(detail["Date"])],
+                db.as_time(detail["Start"]), db.as_time(detail["End"]), excluded_session_id=lesson_id,
+            )
+            if booked:
+                st.warning("Booked into another class at this time:  \n" + _clash_lines(booked))
         if add_columns[1].button("Add", key=f"addgo_{lesson_id}",
                                  width="stretch", disabled=not adding):
-            existing = [
-                {
-                    "student_id": row["student_id"],
-                    "is_online": bool(row.get("is_online")),
-                    "has_recording": bool(row.get("has_recording")),
-                    "is_cancelled": bool(row.get("is_cancelled")),
-                    "is_paid": bool(row.get("is_paid")),
-                    "note": row.get("note") or "",
-                }
-                for row in attendance
-            ]
+            existing = _roster_rows(attendance)
             for name in adding:
                 existing.append(_blank_row(lookup[name]))
             outcome = db.update_schedule_session(
@@ -2129,25 +2197,57 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 attendance_rows=existing,
             )
             if outcome in ("updated", "success", True):
-                _flash(f"Added {len(adding)} student(s).")
+                _saved_message(f"Added {len(adding)} student(s).", lesson_id)
                 _rerun()
             else:
                 st.warning(_explain(str(outcome)))
 
-        st.caption("For this class only. Paid fills in when the invoice is paid on Payments.")
+        # Taking a student out had no button of its own: a row could be
+        # deleted in the table and saved, which nobody found, and "Delete"
+        # below -- tried instead -- is for the whole class.
+        on_class = [row["student_name"] for row in attendance]
+        if on_class:
+            out_columns = st.columns([4, 1])
+            removing = out_columns[0].multiselect(
+                "Take students out of this class", on_class, key=f"out_{lesson_id}",
+                placeholder="Pick one or more names",
+                help="Anyone already invoiced for this class is owed it back as a credit.",
+            )
+            if out_columns[1].button("Remove", key=f"outgo_{lesson_id}",
+                                     width="stretch", disabled=not removing):
+                kept = _roster_rows([row for row in attendance if row["student_name"] not in removing])
+                outcome = db.update_schedule_session(
+                    session_id=lesson_id,
+                    session_date=db.as_date(detail["Date"]),
+                    start_time=db.as_time(detail["Start"]),
+                    end_time=db.as_time(detail["End"]),
+                    status=detail["Status"],
+                    note=detail.get("Note") or "",
+                    attendance_rows=kept,
+                )
+                if outcome in ("updated", "success", True):
+                    _flash(f"Took {len(removing)} student(s) out of this class.")
+                    _rerun()
+                else:
+                    st.warning(_explain(str(outcome)))
+
+        st.caption("In the order they were added. For this class only. "
+                   "Paid fills in when the invoice is paid on Payments.")
         rows = [
             {
+                "No.": number,
                 "Student": row["student_name"],
                 "Condition": _condition_of(row),
                 "Paid": bool(row.get("is_paid")),
                 "Note": row.get("note") or "",
             }
-            for row in attendance
+            for number, row in enumerate(attendance, 1)
         ]
         edited = st.data_editor(
-            rows or [{"Student": None, "Condition": IN_CLASS, "Paid": False, "Note": ""}],
+            rows or [{"No.": None, "Student": None, "Condition": IN_CLASS, "Paid": False, "Note": ""}],
             num_rows="dynamic",
             column_config={
+                "No.": st.column_config.NumberColumn(width=50, disabled=True),
                 "Student": st.column_config.SelectboxColumn(
                     options=sorted(lookup), required=True, width="medium"
                 ),
@@ -2228,7 +2328,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                     # The class moved out of the month on screen; follow it
                     # rather than leaving the user staring at an empty grid.
                     st.session_state["month"] = (when.year, when.month)
-                _flash("Saved.")
+                _saved_message("Saved.", lesson_id)
                 _rerun()
             else:
                 st.warning(_explain(str(outcome)))
@@ -2293,10 +2393,16 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 _rerun()
 
         with buttons[2].popover("Delete", width="stretch"):
-            st.write("Removes this class and its attendance. The subject stays.")
+            st.write("Deletes this whole class, for everyone in it. To take one student "
+                     "out, use Remove above. Anyone already invoiced for it gets a credit.")
             if st.button("Delete for good", key=f"del_{lesson_id}"):
-                db.delete_schedule_session(lesson_id)
+                outcome, credited = db.delete_schedule_session(lesson_id)
                 st.session_state.pop("selected_lesson", None)
+                if outcome == "deleted":
+                    _flash("Class deleted." + (f" {credited} student(s) already invoiced for it "
+                                               "get a credit." if credited else ""))
+                else:
+                    _flash("That class was already gone.", "info")
                 _rerun()
 
     with st.expander(f"Edit the subject — {detail['Class']}"):
@@ -2373,6 +2479,7 @@ def schedule_tab() -> None:
 
     _anchor("grid-top")
     year, month = _month_navigator()
+    _month_clashes(year, month)
     summary = db.get_month_schedule(teacher_id, year, month)
     # One query for the whole month's rosters, rather than three per class.
     # The grid only needs each card's student names and their conditions,
