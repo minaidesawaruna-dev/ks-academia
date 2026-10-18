@@ -51,6 +51,7 @@ import db
 import retention
 import schedule_backfill
 import schedule_parser
+import schedule_writer
 from schedule_parser import UNNAMED_CLASS
 from schedule_grid import render_month_grid
 from invoice_render import (
@@ -4715,6 +4716,265 @@ def data_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
+_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": "", "Students": [], "Every week": False}
+
+
+def _as_date(value):
+    if value is None or value == "" or (isinstance(value, float) and value != value):
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    return dt.date.fromisoformat(str(value)[:10])
+
+
+def _as_clock(value):
+    if value is None or value == "" or (isinstance(value, float) and value != value):
+        return None
+    if isinstance(value, dt.datetime):
+        return value.time()
+    if isinstance(value, dt.time):
+        return value
+    return dt.time.fromisoformat(str(value)[:8])
+
+
+def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int]:
+    """The table's rows as lessons, each weekly one repeated to the month's end.
+
+    Returns ``(lessons, rows not filled in yet, rows outside the month)``.
+    """
+    last = dt.date(year, month, calendar.monthrange(year, month)[1])
+    lessons, unfinished, elsewhere = [], 0, 0
+    for row in rows:
+        when, start, end = _as_date(row.get("Date")), _as_clock(row.get("Start")), _as_clock(row.get("End"))
+        subject = (row.get("Subject") or "").strip()
+        if not (when and start and end and subject):
+            unfinished += any([when, start, end, subject, row.get("Students")])
+            continue
+        if (when.year, when.month) != (year, month):
+            elsewhere += 1
+            continue
+        students = [name.strip() for name in row.get("Students") or [] if name and name.strip()]
+        day = when
+        while day <= last:
+            lessons.append({"date": day, "start": start, "end": end, "subject": subject,
+                             "students": list(dict.fromkeys(students))})
+            if not row.get("Every week"):
+                break
+            day += dt.timedelta(weeks=1)
+    lessons.sort(key=lambda lesson: (lesson["date"], lesson["start"]))
+    return lessons, unfinished, elsewhere
+
+
+def _plan_problems(lessons: list) -> list[str]:
+    """What would make the sheet wrong: a class ending before it starts, or two at once."""
+    problems = []
+    for lesson in lessons:
+        if lesson["end"] <= lesson["start"]:
+            problems.append(f"{lesson['date']:%a %d %b} {lesson['subject']}: ends before it starts.")
+    by_day: dict = {}
+    for lesson in lessons:
+        by_day.setdefault(lesson["date"], []).append(lesson)
+    for day, items in by_day.items():
+        for index, first in enumerate(items):
+            for second in items[index + 1:]:
+                if second["start"] < first["end"] and second["end"] > first["start"]:
+                    problems.append(f"{day:%a %d %b}: {first['subject']} and {second['subject']} overlap "
+                                    "— a teacher can only take one class at a time.")
+    return problems
+
+
+def _plan_clashes(lessons: list, teacher_name: str, lookup: dict, year: int, month: int) -> list[str]:
+    """Students booked into another teacher's class at the same time, from what is in the app.
+
+    One query for the month. The teacher's own classes in the app are left
+    out: their sheet, once uploaded, replaces them.
+    """
+    ids = {lookup[name] for lesson in lessons for name in lesson["students"] if name in lookup}
+    first = dt.date(year, month, 1)
+    booked = [item for item in db.get_student_bookings(ids, first, dt.date(year, month,
+                                                       calendar.monthrange(year, month)[1]))
+              if item["Teacher"].casefold() != teacher_name.casefold()]
+    lines = []
+    for lesson in lessons:
+        for item in booked:
+            if (item["Student"] in lesson["students"] and db.as_date(item["Date"]) == lesson["date"]
+                    and db.as_time(item["Start"]) < lesson["end"] and db.as_time(item["End"]) > lesson["start"]):
+                lines.append(f"**{item['Student']}** · {lesson['date']:%a %d %b} {lesson['subject']} — also in "
+                             f"{item['Class']} ({item['Teacher']}), "
+                             f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}")
+    return lines
+
+
+def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
+    """A sheet's month as table rows -- one exported before, or a teacher's own --
+    and how many Online / Recording / Cancelled marks it had, which the table
+    doesn't hold: those are kept on the sheet itself."""
+    data = upload.getvalue()
+
+    def month_of(name):
+        try:
+            return schedule_parser.infer_month(name)
+        except ValueError:
+            return None
+
+    chosen = next((name for name in schedule_parser.get_sheet_names(data) if month_of(name) == month), None)
+    if chosen is None:
+        return None, 0
+    preview = schedule_parser.parse_workbook(data, [chosen], year)
+    sessions = [item for item in preview["sessions"] if (item["date"].year, item["date"].month) == (year, month)]
+    marks = sum(entry["status"] != schedule_parser.ATTENDING for item in sessions for entry in item["attendance"])
+    return [
+        {"Date": item["date"], "Start": item["start_time"], "End": item["end_time"],
+         "Subject": item["class_name"], "Students": [entry["student_name"] for entry in item["attendance"]],
+         "Every week": False}
+        for item in sorted(sessions, key=lambda item: (item["date"], item["start_time"]))
+    ] or None, marks
+
+
+def create_schedule_tab() -> None:
+    """Plan one teacher's month and download it as their schedule sheet.
+
+    Nothing here is saved in the app: the sheet is the schedule. It goes to
+    the teacher on Google Drive, they mark Online / Recording / Cancelled on
+    it, and it comes back through the upload on Teachers like any workbook --
+    which is when its new teacher and new students are created.
+    """
+    st.caption("Plan a teacher's month and download it as their schedule sheet. Nothing is saved "
+               "in the app until the sheet is uploaded on Teachers.")
+    teachers = [item for item in db.get_all_teachers() if item["Active"]]
+    labels = {item["Name"]: item["ID"] for item in teachers}
+    # A screen not drawn loses its widgets' state, so going to another screen
+    # and back reset the month and teacher under a table still full of the
+    # month planned. What they held is kept beside them and put back. Seeded
+    # through session state, not the widgets' defaults, which Streamlit
+    # refuses to combine.
+    ahead = dt.date.today().replace(day=1) + dt.timedelta(days=32)
+    for key, default in (("plan_year", ahead.year), ("plan_month", ahead.month),
+                         ("plan_teacher_mode", "Existing teacher" if teachers else "New teacher"),
+                         ("plan_teacher", next(iter(labels), None)), ("plan_new_teacher", "")):
+        if key not in st.session_state:
+            kept = st.session_state.get(f"plan_kept_{key}", default)
+            if key != "plan_teacher" or kept in labels:
+                st.session_state[key] = kept
+    columns = st.columns(2)
+    year = int(columns[0].number_input("Year", min_value=2020, max_value=dt.date.today().year + 1,
+                                       step=1, key="plan_year"))
+    month = int(columns[1].selectbox("Month", options=list(range(1, 13)),
+                                     format_func=lambda value: calendar.month_name[value], key="plan_month"))
+    period = f"{calendar.month_name[month]} {year}"
+    mode = st.radio("Teacher", ["Existing teacher", "New teacher"], horizontal=True,
+                    key="plan_teacher_mode", label_visibility="collapsed")
+    teacher_id = None
+    if mode == "New teacher" or not teachers:
+        teacher_name = st.text_input("Teacher name", key="plan_new_teacher").strip()
+    else:
+        teacher_name = st.selectbox("Teacher", list(labels), key="plan_teacher")
+        teacher_id = labels[teacher_name]
+    for key in ("plan_year", "plan_month", "plan_teacher_mode", "plan_teacher", "plan_new_teacher"):
+        if key in st.session_state:
+            st.session_state[f"plan_kept_{key}"] = st.session_state[key]
+
+    students = db.get_all_students()
+    lookup = {item["Name"]: item["ID"] for item in students}
+    subjects = sorted({item["Class"] for item in db.get_teacher_classes_for_schedule(
+        teacher_id, dt.date(year, month, 1))}, key=str.casefold) if teacher_id else []
+
+    with st.expander("Start from a sheet"):
+        upload = st.file_uploader(f"A schedule sheet with {calendar.month_name[month]} in it (.xlsx)",
+                                  type=["xlsx"], key="plan_upload")
+        if upload is not None and st.button("Put its lessons in the table", key="plan_load"):
+            rows, marks = _rows_from_sheet(upload, year, month)
+            if rows is None:
+                st.warning(f"No lessons for {period} found in that sheet.")
+            else:
+                st.session_state["plan_rows"] = rows
+                st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
+                if marks:
+                    _flash(f"{len(rows)} lessons put in the table. Its {marks} Online / Recording / "
+                           "Cancelled mark(s) stay on that sheet: a sheet downloaded from here starts "
+                           "without them.", "warning")
+                else:
+                    _flash(f"{len(rows)} lessons put in the table.")
+                _rerun()
+
+    # The table keeps its rows across the other screens: a widget's own state
+    # goes when its screen isn't drawn, so the rows are kept beside it and a
+    # fresh table is started from them on the way back.
+    version = st.session_state.get("plan_version", 0)
+    table_key = f"plan_table_{version}"
+    if table_key not in st.session_state:
+        st.session_state["plan_base"] = st.session_state.get("plan_rows") or [dict(_PLAN_BLANK)]
+    first_day = dt.date(year, month, 1)
+    last_day = dt.date(year, month, calendar.monthrange(year, month)[1])
+    st.markdown(f"**Lessons in {period}**")
+    edited = st.data_editor(
+        st.session_state["plan_base"],
+        num_rows="dynamic",
+        key=table_key,
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Date": st.column_config.DateColumn(min_value=first_day, max_value=last_day,
+                                                format="ddd D MMM", required=True),
+            "Start": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
+            "End": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
+            "Subject": st.column_config.TextColumn(
+                width="medium",
+                help=("This teacher's subjects on file: " + ", ".join(subjects)) if subjects else None),
+            "Students": st.column_config.MultiselectColumn(
+                options=sorted(lookup, key=str.casefold), accept_new_options=True, width="large",
+                help="Pick students on file, or type a new name."),
+            "Every week": st.column_config.CheckboxColumn(
+                help="Repeats on the same weekday to the end of the month."),
+        },
+    )
+    st.session_state["plan_rows"] = edited
+    if subjects:
+        st.caption("Subjects on file: " + ", ".join(subjects))
+
+    lessons, unfinished, elsewhere = _planned_lessons(edited, year, month)
+    if unfinished:
+        st.caption(f"{unfinished} row(s) not filled in yet (date, times and subject) — left out.")
+    if elsewhere:
+        st.warning(f"{elsewhere} row(s) fall outside {period} — left out.")
+    problems = _plan_problems(lessons)
+    for problem in problems:
+        st.error(problem)
+    new_names = sorted({name for lesson in lessons for name in lesson["students"] if name not in lookup},
+                       key=str.casefold)
+    if new_names:
+        st.info("New students, created when the sheet is uploaded: " + ", ".join(new_names))
+    clashes = _plan_clashes(lessons, teacher_name, lookup, year, month) if lessons and teacher_name else []
+    if clashes:
+        st.warning("Booked into another class at the same time:  \n" + "  \n".join(clashes[:12])
+                   + (f"  \n…and {len(clashes) - 12} more" if len(clashes) > 12 else ""))
+
+    if lessons:
+        st.caption(f"{len(lessons)} lessons on {len({lesson['date'] for lesson in lessons})} days, "
+                   f"{len({name for lesson in lessons for name in lesson['students']})} students.")
+    ready = bool(lessons and teacher_name and not problems)
+    st.download_button(
+        f"Download {teacher_name or 'the'} sheet for {period} (.xlsx)",
+        data=schedule_writer.write_month(lessons, year, month) if ready else b"",
+        file_name=f"{teacher_name} Schedule {calendar.month_abbr[month]} {year}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary", disabled=not ready, key="plan_download",
+        help=None if ready else "Add a teacher and at least one complete lesson, without overlaps.",
+    )
+    st.caption(
+        "Upload it to Google Drive and open it with Google Sheets; the worksheet is named "
+        f"{calendar.month_abbr[month]}, ready to copy into the teacher's yearly sheet. Teachers write "
+        "Online, Recording or Cancelled, then the names, in the column to the right of a class. To bring "
+        "it into the app, download it from Google Sheets as .xlsx and upload it on Teachers."
+    )
+    if st.button("Clear the table", key="plan_clear"):
+        st.session_state["plan_rows"] = [dict(_PLAN_BLANK)]
+        st.session_state["plan_version"] = version + 1
+        _rerun()
+
+
 def reminders_tab() -> None:
     st.caption("Due on the 20th of the following month. Record payments on Payments.")
 
@@ -4786,6 +5046,7 @@ SECTIONS = {
     "Teachers": teachers_tab,
     "Students": students_tab,
     "Schedule": schedule_tab,
+    "Create schedule": create_schedule_tab,
     "Invoices": invoices_tab,
     "Payments": payments_tab,
     "Credits": credits_tab,

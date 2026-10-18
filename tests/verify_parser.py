@@ -907,6 +907,45 @@ def t_online_day_label():
     return "an ONLINE day is recognised and its lessons marked online"
 
 
+
+def t_written_sheet_reads_back():
+    """A month written by the Create schedule screen parses back exactly as planned.
+
+    Times at a quarter past, noon, late evening; two classes sharing a half
+    hour; a class with nobody listed yet; statuses in the column beside;
+    every day of the month shown, so an upload covers the whole month.
+    """
+    import schedule_writer as sw
+
+    T, D = dt.time, (lambda day: dt.date(2026, 11, day))
+    planned = [
+        {"date": D(2), "start": T(16), "end": T(18), "subject": "G11 Chem HL B",
+         "students": ["Nam Jihoon", "Oh Minseok"]},
+        {"date": D(2), "start": T(18), "end": T(19, 30), "subject": "G9 Math", "students": ["Seo Yuna"]},
+        {"date": D(4), "start": T(11, 15), "end": T(13, 15), "subject": "G12 Econs SL A",
+         "students": ["Kang Minji", "Ryu Dami"], "statuses": {"Kang Minji": "Online", "Ryu Dami": "Cancelled"}},
+        {"date": D(7), "start": T(9), "end": T(11), "subject": "G10 Eng", "students": []},
+        {"date": D(8), "start": T(9), "end": T(10, 15), "subject": "G8 Sci", "students": ["Seong Hyerin"]},
+        {"date": D(8), "start": T(10, 15), "end": T(11), "subject": "G8 Sci", "students": ["Seong Hyerin"],
+         "statuses": {"Seong Hyerin": "Recording"}},
+        {"date": D(12), "start": T(12), "end": T(13, 30), "subject": "IB Bio HL", "students": ["Choi Ian"]},
+        {"date": D(30), "start": T(21), "end": T(22), "subject": "Late 1:1", "students": ["Jung Hana"]},
+    ]
+    data = sw.write_month(planned, 2026, 11)
+    assert sp.get_sheet_names(data) == ["Nov"], sp.get_sheet_names(data)
+    preview = sp.parse_workbook(data, ["Nov"], 2026)
+    got = sorted((s["date"], s["start_time"], s["end_time"], s["class_name"],
+                  tuple(sorted((a["student_name"], a["status"]) for a in s["attendance"])))
+                 for s in preview["sessions"])
+    want = sorted((p["date"], p["start"], p["end"], p["subject"],
+                   tuple(sorted((n, p.get("statuses", {}).get(n, sp.ATTENDING)) for n in p["students"])))
+                  for p in planned)
+    assert got == want, [g for g in got if g not in want] + [w for w in want if w not in got]
+    assert not preview["warnings"], preview["warnings"]
+    assert len(preview["dates_shown"]) == 30, len(preview["dates_shown"])
+    assert sw.time_label(T(11, 15), T(13, 15)) == "11.15am-1.15pm"
+    return "8 lessons back exactly, statuses included, no warnings, all 30 days shown"
+
 for name, fn in [
     ("time ranges parse", t_time_ranges),
     ("status vocabulary incl. Korean", t_status_vocabulary),
@@ -958,6 +997,7 @@ for name, fn in [
     ("ONLINE day labels", t_online_day_label),
     ("standard rate by grade", t_standard_rate_by_grade),
     ("status stays with its student", t_status_stays_with_student),
+    ("a written sheet reads back", t_written_sheet_reads_back),
 ]:
     check(name, fn)
 

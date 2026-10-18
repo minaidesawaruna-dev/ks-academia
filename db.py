@@ -2179,6 +2179,19 @@ def find_student_clashes(student_ids, dates, start_time, end_time, excluded_sess
             session, list(student_ids), list(dates), start_time, end_time, excluded_session_id)]
 
 
+def get_student_bookings(student_ids, first_day, last_day) -> list[dict]:
+    """Every class these students are really booked into between two dates, in one query.
+
+    For checking a whole planned month against the app at once: asking
+    lesson by lesson would be a round trip to the database for each.
+    """
+    if not student_ids:
+        return []
+    with SessionLocal() as session:
+        return [_clash_entry(*row) for row in _bookings(
+            session, list(student_ids), between=(first_day, last_day))]
+
+
 def get_session_clashes(session_id) -> list[dict]:
     """The other classes this class's students are booked into at the same time."""
     with SessionLocal() as session:
