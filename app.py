@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import calendar
 import copy
+import difflib
 import datetime as dt
 import io
 import os
@@ -4716,7 +4717,14 @@ def data_tab() -> None:
 # ---------------------------------------------------------------------------
 
 
-_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": "", "Students": [], "Every week": False}
+_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": [], "Students": [], "Every week": False}
+
+
+def _subjects_in(value) -> list:
+    """A Subject cell's names. A pick-list cell, so a list -- one name, unless two were picked."""
+    if isinstance(value, str):
+        value = [value]
+    return [name.strip() for name in value or [] if isinstance(name, str) and name.strip()]
 
 
 def _as_date(value):
@@ -4739,16 +4747,19 @@ def _as_clock(value):
     return dt.time.fromisoformat(str(value)[:8])
 
 
-def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int]:
+def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int, int]:
     """The table's rows as lessons, each weekly one repeated to the month's end.
 
-    Returns ``(lessons, rows not filled in yet, rows outside the month)``.
+    Returns ``(lessons, rows not filled in yet, rows outside the month, rows
+    given more than one subject)`` -- the last taken with their first.
     """
     last = dt.date(year, month, calendar.monthrange(year, month)[1])
-    lessons, unfinished, elsewhere = [], 0, 0
+    lessons, unfinished, elsewhere, doubled = [], 0, 0, 0
     for row in rows:
         when, start, end = _as_date(row.get("Date")), _as_clock(row.get("Start")), _as_clock(row.get("End"))
-        subject = (row.get("Subject") or "").strip()
+        subjects = _subjects_in(row.get("Subject"))
+        subject = subjects[0] if subjects else ""
+        doubled += len(subjects) > 1
         if not (when and start and end and subject):
             unfinished += any([when, start, end, subject, row.get("Students")])
             continue
@@ -4764,7 +4775,7 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int]
                 break
             day += dt.timedelta(weeks=1)
     lessons.sort(key=lambda lesson: (lesson["date"], lesson["start"]))
-    return lessons, unfinished, elsewhere
+    return lessons, unfinished, elsewhere, doubled
 
 
 def _plan_problems(lessons: list) -> list[str]:
@@ -4827,7 +4838,7 @@ def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
     marks = sum(entry["status"] != schedule_parser.ATTENDING for item in sessions for entry in item["attendance"])
     return [
         {"Date": item["date"], "Start": item["start_time"], "End": item["end_time"],
-         "Subject": item["class_name"], "Students": [entry["student_name"] for entry in item["attendance"]],
+         "Subject": [item["class_name"]], "Students": [entry["student_name"] for entry in item["attendance"]],
          "Every week": False}
         for item in sorted(sessions, key=lambda item: (item["date"], item["start_time"]))
     ] or None, marks
@@ -4878,8 +4889,14 @@ def create_schedule_tab() -> None:
 
     students = db.get_all_students()
     lookup = {item["Name"]: item["ID"] for item in students}
-    subjects = sorted({item["Class"] for item in db.get_teacher_classes_for_schedule(
-        teacher_id, dt.date(year, month, 1))}, key=str.casefold) if teacher_id else []
+    # The teacher's subjects on file, then any typed into the table: a new
+    # subject typed once is offered on the next row, spelled the same.
+    subjects: dict = {}
+    on_file = [item["Class"] for item in db.get_teacher_classes_for_schedule(
+        teacher_id, dt.date(year, month, 1))] if teacher_id else []
+    for name in sorted(on_file, key=str.casefold) + [name for row in st.session_state.get("plan_rows") or []
+                                                     for name in _subjects_in(row.get("Subject"))]:
+        subjects.setdefault(name.casefold(), name)
 
     with st.expander("Start from a sheet"):
         upload = st.file_uploader(f"A schedule sheet with {calendar.month_name[month]} in it (.xlsx)",
@@ -4920,9 +4937,9 @@ def create_schedule_tab() -> None:
                                                 format="ddd D MMM", required=True),
             "Start": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
             "End": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
-            "Subject": st.column_config.TextColumn(
-                width="medium",
-                help=("This teacher's subjects on file: " + ", ".join(subjects)) if subjects else None),
+            "Subject": st.column_config.MultiselectColumn(
+                options=list(subjects.values()), accept_new_options=True, width="medium",
+                help="Pick one of the teacher's subjects, or type a new one. One per lesson."),
             "Students": st.column_config.MultiselectColumn(
                 options=sorted(lookup, key=str.casefold), accept_new_options=True, width="large",
                 help="Pick students on file, or type a new name."),
@@ -4931,21 +4948,32 @@ def create_schedule_tab() -> None:
         },
     )
     st.session_state["plan_rows"] = edited
-    if subjects:
-        st.caption("Subjects on file: " + ", ".join(subjects))
 
-    lessons, unfinished, elsewhere = _planned_lessons(edited, year, month)
+    lessons, unfinished, elsewhere, doubled = _planned_lessons(edited, year, month)
     if unfinished:
         st.caption(f"{unfinished} row(s) not filled in yet (date, times and subject) — left out.")
     if elsewhere:
         st.warning(f"{elsewhere} row(s) fall outside {period} — left out.")
     problems = _plan_problems(lessons)
+    if doubled:
+        problems.insert(0, f"{doubled} lesson(s) have more than one subject — one per lesson.")
     for problem in problems:
         st.error(problem)
     new_names = sorted({name for lesson in lessons for name in lesson["students"] if name not in lookup},
                        key=str.casefold)
     if new_names:
         st.info("New students, created when the sheet is uploaded: " + ", ".join(new_names))
+    # A subject typed rather than picked is a new one -- said so, as for
+    # students, with the one on file it is close to: "G12 Bio" picked by
+    # Enter half-typed would otherwise quietly become a second subject.
+    known = {name.casefold() for name in on_file}
+    new_subjects = sorted({lesson["subject"] for lesson in lessons if lesson["subject"].casefold() not in known},
+                          key=str.casefold)
+    if new_subjects:
+        st.info("New subjects, created when the sheet is uploaded: " + ", ".join(
+            name + (f" (close to {close[0]})" if (close := difflib.get_close_matches(name, on_file, n=1,
+                                                                                     cutoff=0.7)) else "")
+            for name in new_subjects))
     clashes = _plan_clashes(lessons, teacher_name, lookup, year, month) if lessons and teacher_name else []
     if clashes:
         st.warning("Booked into another class at the same time:  \n" + "  \n".join(clashes[:12])
