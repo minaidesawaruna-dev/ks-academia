@@ -34,6 +34,8 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+import schedule_parser
+
 SLOT_MINUTES = 30
 # Pale enough that black text reads on every one; a subject keeps its colour
 # across the month, as teachers colour theirs by hand.
@@ -171,3 +173,34 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
     out = io.BytesIO()
     workbook.save(out)
     return out.getvalue()
+
+
+def readback_problems(lessons: list, data: bytes, year: int, month: int) -> list[str]:
+    """Lessons the sheet wouldn't give back as planned, read with the upload's own parser.
+
+    A comma in a name reads as two students, a number drops it, and a name
+    starting Online / Rec / Cancel reads as a status: caught here, before
+    the sheet goes to a teacher, rather than at upload a month later.
+    """
+    same = schedule_parser.normalise_name
+    back = schedule_parser.parse_workbook(data, [month_sheet_name(month)], year)["sessions"]
+    read = {(item["date"], item["start_time"], item["end_time"]): item for item in back}
+    lines = []
+    for lesson in lessons:
+        label = f"{lesson['date']:%a %d %b} {lesson['subject']}"
+        got = read.get((lesson["date"], lesson["start"], lesson["end"]))
+        if got is None:
+            lines.append(f"{label}: this lesson wouldn't be read back from the sheet.")
+            continue
+        if got["class_name"] != lesson["subject"]:
+            lines.append(f"{label}: the subject would read back as “{got['class_name']}”.")
+        planned = {same(name): name for name in lesson["students"]}
+        returned = {same(entry["student_name"]): entry["student_name"] for entry in got["attendance"]}
+        extra = [name for key, name in returned.items() if key not in planned]
+        for key, name in planned.items():
+            if key not in returned:
+                lines.append(f"{label}: “{name}” would read back as "
+                             + (", ".join(f"“{other}”" for other in extra) if extra else "nobody")
+                             + " — a comma, a number, or Online / Rec / Cancel at the start changes how a "
+                               "name is read.")
+    return lines

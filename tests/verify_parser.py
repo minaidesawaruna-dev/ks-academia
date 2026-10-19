@@ -946,6 +946,30 @@ def t_written_sheet_reads_back():
     assert sw.time_label(T(11, 15), T(13, 15)) == "11.15am-1.15pm"
     return "8 lessons back exactly, statuses included, no warnings, all 30 days shown"
 
+
+def t_readback_catches_names():
+    """The Create schedule screen reads its sheet back first: a name the upload would misread is caught.
+
+    A comma reads as two students, a number drops the name, and a name
+    starting Online / Rec / Cancel reads as a status. A clean month passes.
+    """
+    import schedule_writer as sw
+
+    T, D = dt.time, (lambda day: dt.date(2026, 11, day))
+    clean = [{"date": D(2), "start": T(16), "end": T(18), "subject": "G10 Eng", "students": ["Nam Jihoon", "Ryu Dami"]}]
+    assert sw.readback_problems(clean, sw.write_month(clean, 2026, 11), 2026, 11) == []
+    awkward = [
+        {"date": D(3), "start": T(16), "end": T(18), "subject": "G10 Eng", "students": ["Gil, Nara"]},
+        {"date": D(4), "start": T(16), "end": T(18), "subject": "G10 Eng", "students": ["Bang Sooah 2"]},
+        {"date": D(5), "start": T(16), "end": T(18), "subject": "G10 Eng", "students": ["Online Seong"]},
+    ]
+    problems = sw.readback_problems(awkward, sw.write_month(awkward, 2026, 11), 2026, 11)
+    assert len(problems) == 3, problems
+    assert "“Gil”" in problems[0] and "“Nara”" in problems[0], problems[0]
+    assert "nobody" in problems[1], problems[1]
+    assert "“Seong”" in problems[2], problems[2]
+    return "clean month passes; comma, number and leading Online each caught before download"
+
 for name, fn in [
     ("time ranges parse", t_time_ranges),
     ("status vocabulary incl. Korean", t_status_vocabulary),
@@ -998,6 +1022,7 @@ for name, fn in [
     ("standard rate by grade", t_standard_rate_by_grade),
     ("status stays with its student", t_status_stays_with_student),
     ("a written sheet reads back", t_written_sheet_reads_back),
+    ("misread names caught before download", t_readback_catches_names),
 ]:
     check(name, fn)
 

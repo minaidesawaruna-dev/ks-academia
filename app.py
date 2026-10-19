@@ -4758,7 +4758,7 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
     for row in rows:
         when, start, end = _as_date(row.get("Date")), _as_clock(row.get("Start")), _as_clock(row.get("End"))
         subjects = _subjects_in(row.get("Subject"))
-        subject = subjects[0] if subjects else ""
+        subject = " ".join(subjects[0].split()) if subjects else ""
         doubled += len(subjects) > 1
         if not (when and start and end and subject):
             unfinished += any([when, start, end, subject, row.get("Students")])
@@ -4766,7 +4766,7 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
         if (when.year, when.month) != (year, month):
             elsewhere += 1
             continue
-        students = [name.strip() for name in row.get("Students") or [] if name and name.strip()]
+        students = [" ".join(name.split()) for name in row.get("Students") or [] if name and name.strip()]
         day = when
         while day <= last:
             lessons.append({"date": day, "start": start, "end": end, "subject": subject,
@@ -4796,21 +4796,36 @@ def _plan_problems(lessons: list) -> list[str]:
     return problems
 
 
-def _plan_clashes(lessons: list, teacher_name: str, lookup: dict, year: int, month: int) -> list[str]:
+def _student_finder(students: list):
+    """A name as the upload will find it: on file, a spelling on file for them, or the same once cleaned.
+
+    So "Dami Ryu", the way one teacher writes Ryu Dami, isn't called new --
+    the upload knows her by it -- and her other classes are still checked
+    for clashes.
+    """
+    exact = {item["Name"]: item["ID"] for item in students}
+    known = db.get_student_aliases()
+    cleaned = {schedule_parser.normalise_name(name): sid for name, sid in exact.items()}
+    return lambda name: (exact.get(name) or known.get(name.casefold())
+                         or cleaned.get(schedule_parser.normalise_name(name)))
+
+
+def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int) -> list[str]:
     """Students booked into another teacher's class at the same time, from what is in the app.
 
     One query for the month. The teacher's own classes in the app are left
     out: their sheet, once uploaded, replaces them.
     """
-    ids = {lookup[name] for lesson in lessons for name in lesson["students"] if name in lookup}
+    ids = {find(name) for lesson in lessons for name in lesson["students"]} - {None}
     first = dt.date(year, month, 1)
     booked = [item for item in db.get_student_bookings(ids, first, dt.date(year, month,
                                                        calendar.monthrange(year, month)[1]))
               if item["Teacher"].casefold() != teacher_name.casefold()]
     lines = []
     for lesson in lessons:
+        here = {find(name) for name in lesson["students"]}
         for item in booked:
-            if (item["Student"] in lesson["students"] and db.as_date(item["Date"]) == lesson["date"]
+            if (item["Student ID"] in here and db.as_date(item["Date"]) == lesson["date"]
                     and db.as_time(item["Start"]) < lesson["end"] and db.as_time(item["End"]) > lesson["start"]):
                 lines.append(f"**{item['Student']}** · {lesson['date']:%a %d %b} {lesson['subject']} — also in "
                              f"{item['Class']} ({item['Teacher']}), "
@@ -4959,7 +4974,8 @@ def create_schedule_tab() -> None:
         problems.insert(0, f"{doubled} lesson(s) have more than one subject — one per lesson.")
     for problem in problems:
         st.error(problem)
-    new_names = sorted({name for lesson in lessons for name in lesson["students"] if name not in lookup},
+    find = _student_finder(students)
+    new_names = sorted({name for lesson in lessons for name in lesson["students"] if find(name) is None},
                        key=str.casefold)
     if new_names:
         st.info("New students, created when the sheet is uploaded: " + ", ".join(new_names))
@@ -4974,18 +4990,25 @@ def create_schedule_tab() -> None:
             name + (f" (close to {close[0]})" if (close := difflib.get_close_matches(name, on_file, n=1,
                                                                                      cutoff=0.7)) else "")
             for name in new_subjects))
-    clashes = _plan_clashes(lessons, teacher_name, lookup, year, month) if lessons and teacher_name else []
+    clashes = _plan_clashes(lessons, teacher_name, find, year, month) if lessons and teacher_name else []
     if clashes:
         st.warning("Booked into another class at the same time:  \n" + "  \n".join(clashes[:12])
                    + (f"  \n…and {len(clashes) - 12} more" if len(clashes) > 12 else ""))
 
+    # The sheet is read back the way the upload will read it, so whatever
+    # wouldn't survive is fixed here, not discovered at upload.
+    data = schedule_writer.write_month(lessons, year, month) if lessons and teacher_name and not problems else b""
+    if data:
+        for line in schedule_writer.readback_problems(lessons, data, year, month):
+            problems.append(line)
+            st.error(line)
     if lessons:
         st.caption(f"{len(lessons)} lessons on {len({lesson['date'] for lesson in lessons})} days, "
                    f"{len({name for lesson in lessons for name in lesson['students']})} students.")
-    ready = bool(lessons and teacher_name and not problems)
+    ready = bool(data) and not problems
     st.download_button(
         f"Download {teacher_name or 'the'} sheet for {period} (.xlsx)",
-        data=schedule_writer.write_month(lessons, year, month) if ready else b"",
+        data=data if ready else b"",
         file_name=f"{teacher_name} Schedule {calendar.month_abbr[month]} {year}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary", disabled=not ready, key="plan_download",
