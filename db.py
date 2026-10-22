@@ -446,7 +446,7 @@ class LessonHistory(Base):
     year already billed elsewhere into the schedule would put every one of
     those lessons on a student's open invoice, a click away from being sent
     to a parent a second time. Nothing that bills, schedules or reminds ever
-    reads this table; only the retention analysis does.
+    reads this table; only the Data tab's Teaching view does.
     """
 
     __tablename__ = "lesson_history"
@@ -2360,7 +2360,7 @@ def merge_students(keep_id, drop_id, dry_run=False):
     Teachers spell a child two ways -- "Kim Hayun" and "Hayun Kim", "Kwak" and
     "Gwak" -- and a workbook read before anyone caught it leaves the child
     on file twice: their months split across two records, two invoices where
-    there should be one, and two students in the retention figures.
+    there should be one, and two students in the Data tab's counts.
 
     Everything on the dropped record moves in one go: lessons, subjects,
     invoices (issued ones keep their numbers and figures, only whose they
@@ -5661,11 +5661,11 @@ def _lesson_condition(is_online, has_recording, is_cancelled):
 
 
 def get_analysis_lessons(today=None):
-    """Every past lesson for the retention analysis, one row per student per lesson.
+    """Every past lesson for the Data tab, one row per student per lesson.
 
     ``app`` is what the Schedule screen holds; ``history`` is past schedules kept for
     analysis. Cancelled classes and anything still in the future are left
-    out. Overlap between the two is resolved by ``retention.combine``.
+    out. Overlap between the two is resolved by ``teaching.combine``.
     """
     today = today or date.today()
     with SessionLocal() as session:
@@ -5724,7 +5724,7 @@ def get_analysis_lessons(today=None):
 
 def get_analysis_data_version():
     """A cheap fingerprint that changes whenever the lessons behind the analysis do."""
-    # One round trip: this runs on every visit to the retention view.
+    # One round trip: this runs on every visit to the Teaching view.
     with SessionLocal() as session:
         row = session.execute(
             select(

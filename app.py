@@ -10,8 +10,8 @@ Eight tabs:
 * **Invoices** — bill students for a month's unbilled classes.
 * **Payments** — record what parents have actually paid, in full or in part.
 * **Credits** — classes invoiced and then missed, owed back off the next invoice.
-* **Data** — earnings per teacher by month; student retention, with who is at
-  risk of not coming back; and past schedules kept for analysis only.
+* **Data** — what was taught and invoiced, per teacher by month; and past
+  schedules kept for analysis only.
 * **Reminders** — students overdue on payment.
 
 A *subject* is what a teacher teaches — its rate and colour. A *class* is one
@@ -49,10 +49,10 @@ import streamlit as st
 
 import auth
 import db
-import retention
 import schedule_backfill
 import schedule_parser
 import schedule_writer
+import teaching
 from schedule_parser import UNNAMED_CLASS
 from schedule_grid import render_month_grid
 from invoice_render import (
@@ -3915,329 +3915,13 @@ def payments_tab() -> None:
     _paid_list(paid, year, month)
 
 
-@st.cache_data(show_spinner="Reading every lesson…", max_entries=4)
-def _retention_report(version: tuple, today: dt.date) -> dict:
-    """The retention report for one state of the data.
-
-    ``version`` changes whenever lessons are added, edited or removed, and
-    ``today`` once a day, so the model refits when there is something new to
-    learn from rather than on every click in the tab.
-    """
-    sources = db.get_analysis_lessons(today)
-    lessons, counts = retention.combine(sources["app"], sources["history"])
-    report = retention.retention_report(lessons, today)
-    report["sources"] = counts
-    return report
-
-
-def _level_axis(first: str | None = None) -> alt.Axis:
+def _level_axis() -> alt.Axis:
     """An axis of months, or other short labels, written level.
 
     Vega-Lite stands a category axis's labels on end, so "Jan" to "Sep" read
-    sideways. Labels like "Aug 2025" keep the year for the first month and
-    each January only, on a second line, so fourteen months fit side by side.
+    sideways.
     """
-    if first is None:
-        return alt.Axis(labelAngle=0)
-    return alt.Axis(labelAngle=0, labelExpr=(
-        f"datum.label == '{first}' || slice(datum.label, 0, 3) == 'Jan'"
-        " ? split(datum.label, ' ') : slice(datum.label, 0, 3)"))
-
-
-_EFFECTS = ["Raises the chance of leaving", "Lowers it", "No clear effect"]
-# How much wider than its own bottom a factor's range may run before it is
-# telling nobody anything: a hundredfold. "No clear effect" is a finding and
-# stays; "somewhere between a twenty-thousandth and thirty" is not.
-_UNCLEAR_SPREAD = 100.0
-
-
-def _drivers_chart(report: dict) -> None:
-    """The model's own reading of what goes with leaving.
-
-    Kept off the page and in here because its strongest factor is nearly
-    circular -- a month with one lesson is usually a student's last -- and
-    because a factor held level against eleven others is easy to misread.
-    The counted version above says the useful part without the caveats.
-    """
-    st.markdown("**What goes with leaving**")
-    # A factor the data cannot pin down at all — a range running from a
-    # twenty-thousandth to thirty — is not a finding, and on a log scale one
-    # of them stretches the axis across seven decades and squashes every
-    # factor that does say something into a thumbnail. Left out until there
-    # are enough leavers to place it, and named below so it is not hidden.
-    telling = [item for item in report["drivers"]
-               if item["high"] <= item["low"] * _UNCLEAR_SPREAD]
-    unplaced = [item["label"] for item in report["drivers"] if item not in telling]
-    if not telling:
-        st.markdown(
-            "No factor can be placed yet — every one of them has a range too "
-            "wide to mean anything. Add past schedules and this fills in."
-        )
-        return
-    drivers = pd.DataFrame(telling)
-    drivers["effect"] = [
-        _EFFECTS[0] if low > 1 else _EFFECTS[1] if high < 1 else _EFFECTS[2]
-        for low, high in zip(drivers["low"], drivers["high"])
-    ]
-    colours = alt.Scale(domain=_EFFECTS, range=["#eb6834", "#2a78d6", "#8a8985"])
-    # Vega-Lite clips labels at 180px by default, which on a narrow window left
-    # every factor reading "Months with the …" and the key "Raises the chance
-    # of leav…". A chart nobody can read is worse than a narrower plot.
-    legend = alt.Legend(title=None, orient="top", labelLimit=0)
-    factor = alt.Y("label:N", title=None, axis=alt.Axis(labelLimit=0),
-                   sort=alt.EncodingSortField("odds_ratio", order="descending"))
-    ranges = alt.Chart(drivers).mark_rule(strokeWidth=2).encode(
-        y=factor,
-        x=alt.X("low:Q", scale=alt.Scale(type="log"),
-                title="Odds of not coming back (1 = no effect, log scale)"),
-        x2="high:Q",
-        color=alt.Color("effect:N", scale=colours, legend=legend),
-    )
-    points = alt.Chart(drivers).mark_circle(size=80, opacity=1).encode(
-        y=factor,
-        x="odds_ratio:Q",
-        color=alt.Color("effect:N", scale=colours, legend=legend),
-        tooltip=[
-            alt.Tooltip("label:N", title="Factor"),
-            alt.Tooltip("per:N", title="Per"),
-            alt.Tooltip("odds_ratio:Q", title="Odds ratio", format=".2f"),
-            alt.Tooltip("low:Q", title="Range from", format=".2f"),
-            alt.Tooltip("high:Q", title="Range to", format=".2f"),
-        ],
-    )
-    no_effect = alt.Chart(pd.DataFrame({"x": [1.0]})).mark_rule(color="#52514e").encode(x="x:Q")
-    st.altair_chart(
-        (ranges + points + no_effect).properties(height=34 * len(drivers)), width="stretch"
-    )
-    st.caption(
-        "Dot: how much a factor changes the odds of leaving, the others held level. "
-        "Line: a rough 95% range. Hover for units."
-        + (f" Too few leavers yet to place: {', '.join(unplaced).lower()}." if unplaced else "")
-    )
-
-
-# A month's share of leavers is drawn only once this many students are on
-# record in it: out of three students, one leaving reads as 33%.
-_CHART_FLOOR = 30
-
-
-def _chartable_months(months: list[dict]) -> tuple[pd.DataFrame, int]:
-    """The months worth charting, with any month missing from the records shown empty.
-
-    Starts from the month after which every month has ``_CHART_FLOOR``
-    students, so a few teachers' older sheets don't fill half the axis with a
-    line swinging between 0% and 50%. Returns the biggest month left out (0
-    when none was). A month with no lessons on record at all is put back as
-    an empty bar rather than skipped, so a gap in the schedules shows as one.
-    """
-    start = next((i for i in range(len(months))
-                  if all(m["active"] >= _CHART_FLOOR for m in months[i:])), 0)
-    thin = max((m["active"] for m in months[:start]), default=0)
-    kept = {m["month"]: m for m in months[start:]}
-    filled = []
-    for index in range(min(kept), max(kept) + 1):
-        filled.append(kept.get(index) or {
-            "month": index, "label": retention.month_label(index), "active": 0,
-            "joined": 0, "left": 0, "unknown": 0, "settled": False, "left_share": 0.0,
-        })
-    return pd.DataFrame(filled), thin
-
-
-def _days_ago(day: dt.date | None) -> str:
-    if not day:
-        return "—"
-    days = (dt.date.today() - day).days
-    return f"{day:%d %b} ({days} day{'' if days == 1 else 's'} ago)"
-
-
-def _retention_view() -> None:
-    today = dt.date.today()
-    report = _retention_report(db.get_analysis_data_version(), today)
-    if not report["enough"]:
-        st.info(report["message"])
-        return
-    # Said up front because an upload changes nothing visible until its month
-    # is over, which otherwise reads as a page that never updates.
-    st.caption(
-        f"Lessons up to the end of {report['last_month']}, recalculated after every "
-        f"upload. {calendar.month_name[today.month]} counts once it's over."
-    )
-
-    validation = report["validation"]
-    columns = st.columns(4)
-    columns[0].metric(
-        "Students observed", f"{report['students']:,}",
-        help=f"{report['first_month']} to {report['last_month']}.",
-    )
-    columns[1].metric(
-        "Current students", f"{report['current']:,}",
-        help=f"Came in {report['last_month']} or the month before.",
-    )
-    columns[2].metric(
-        "Expected not to return", f"{report['expected_leavers']:.0f}",
-        help="Summed over current students who haven't been back this month.",
-    )
-    columns[3].metric(
-        "Model check", f"{validation['auc']:.2f}" if validation else "—",
-        help="On months it hadn't seen, how often it ranked a student who left "
-        "above one who stayed. 0.50 is guessing, 1.00 perfect.",
-    )
-
-    st.markdown("#### Month by month")
-    # The curve below counts months since a student's first lesson, which
-    # answers "how long do they stay" and cannot answer "is it getting
-    # worse". This is the academy's own calendar: who was taught, and what
-    # share of them never came back.
-    months, thin = _chartable_months(report["months"])
-    order = list(months["label"])
-    shared = alt.X("label:N", sort=order, title=None, axis=_level_axis(order[0]))
-    tips = [alt.Tooltip("label:N", title="Month"),
-            alt.Tooltip("active:Q", title="Students taught"),
-            alt.Tooltip("joined:Q", title="First on record"),
-            alt.Tooltip("left:Q", title="Never came back")]
-    taught = alt.Chart(months).mark_bar(color="#cfe2f3").encode(
-        x=shared,
-        y=alt.Y("active:Q", title="Students taught"),
-        tooltip=tips,
-    )
-    # Only the settled months carry a share: until two months have passed, a
-    # quiet student cannot be told from one who has gone, and a line dropping
-    # to zero at the right-hand edge would read as good news.
-    share = alt.Chart(months[months["settled"]]).mark_line(
-        point=alt.OverlayMarkDef(color="#eb6834"), color="#eb6834", strokeWidth=2).encode(
-        x=shared,
-        y=alt.Y("left_share:Q", title="Share who never came back",
-                axis=alt.Axis(format="%")),
-        tooltip=tips + [alt.Tooltip("left_share:Q", title="Share", format=".1%")],
-    )
-    st.altair_chart(
-        alt.layer(taught, share).resolve_scale(y="independent"), width="stretch"
-    )
-    unsettled = [row["label"] for row in report["months"] if not row["settled"]]
-    st.caption(
-        "Bars: students taught. Line: share who never came back."
-        + (f" {' and '.join(unsettled)}: too soon to tell." if unsettled else "")
-        + (f" Starts {order[0]}; earlier months have {thin} students or fewer." if thin else "")
-    )
-
-    st.markdown("#### How long students stay")
-    # Stop the curve where fewer than ten students are still followed: past
-    # that, one student more or less swings it, and a long flat tail invites
-    # reading more into it than a handful of students can carry.
-    line = (
-        alt.Chart(pd.DataFrame([point for point in report["km"] if point["at_risk"] >= 10]))
-        .mark_line(interpolate="step-after", strokeWidth=2, color="#2a78d6")
-        .encode(
-            x=alt.X("month:Q", title="Months since first lesson on record", axis=alt.Axis(tickMinStep=1)),
-            y=alt.Y("retained:Q", title="Still enrolled", axis=alt.Axis(format="%"),
-                    scale=alt.Scale(domain=[0, 1])),
-            tooltip=[
-                alt.Tooltip("month:Q", title="Months"),
-                alt.Tooltip("retained:Q", title="Still enrolled", format=".0%"),
-                alt.Tooltip("at_risk:Q", title="Students still observed"),
-            ],
-        )
-    )
-    half = (
-        alt.Chart(pd.DataFrame({"y": [0.5]}))
-        .mark_rule(strokeDash=[4, 4], color="#8a8985")
-        .encode(y="y:Q")
-    )
-    st.altair_chart((line + half).properties(height=280), width="stretch")
-    median = report["median_months"]
-    followed = next((point["at_risk"] for point in report["km"]
-                     if point["month"] == median), 0)
-    st.caption(
-        (f"Half have left by month {median}"
-         + (f" — but only {followed} students are followed that far." if followed < 50 else ".")
-         if median else "More than half are still here at the longest stay seen.")
-        + " Counted from each student's first lesson on record."
-    )
-
-    st.markdown("#### When a student is drifting")
-    drift = pd.DataFrame(report["by_lessons"])
-    st.altair_chart(
-        alt.Chart(drift)
-        .mark_bar(color="#eb6834")
-        .encode(
-            x=alt.X("label:N", sort=list(drift["label"]), title="Lessons that month", axis=_level_axis()),
-            y=alt.Y("share:Q", title="Was their last month", axis=alt.Axis(format="%")),
-            tooltip=[alt.Tooltip("label:N", title="Lessons that month"),
-                     alt.Tooltip("months:Q", title="Student-months"),
-                     alt.Tooltip("last:Q", title="Never came back"),
-                     alt.Tooltip("share:Q", title="Share", format=".1%")],
-        )
-        .properties(height=220),
-        width="stretch",
-    )
-    thin, thick = report["by_lessons"][0], report["by_lessons"][-1]
-    st.caption(
-        f"A month with {thin['label']} lesson{'' if thin['label'] == '1' else 's'} was "
-        f"a student's last {thin['share']:.0%} of the time ({thin['last']:,} of "
-        f"{thin['months']:,}), against {thick['share']:.0%} with {thick['label']}. "
-        "Call the ones whose lessons thin out."
-    )
-
-    st.markdown("#### Most at risk of not coming back")
-    if report["at_risk"]:
-        st.dataframe(
-            [
-                {
-                    "Student": row["student"],
-                    "Teacher": ", ".join(row["teachers"]),
-                    "Months with us": row["months"],
-                    "Last lessons": f"{row['lessons']} in {row['last_month']}",
-                    "Usual per month": row["usual"],
-                    "Last seen": _days_ago(row["last_seen"]),
-                    "Chance of not returning": f"{row['risk']:.0%}",
-                    "Why": ", ".join(row["reasons"]) or "—",
-                }
-                for row in report["at_risk"]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-        st.caption(
-            "A chance, not a verdict."
-            + (f" Leaves out the {report['came_back']} already back this month."
-               if report["came_back"] else "")
-            + (f" And {report['graduating']} Grade 12s finishing school."
-               if report["graduating"] else "")
-        )
-    else:
-        st.caption(
-            "Every current student has already been in this month."
-            if report["came_back"] else "No current students to score."
-        )
-
-    with st.expander("How this works"):
-        _drivers_chart(report)
-        sources = report["sources"]
-        check = (
-            f"- **Checked** on months it hadn't seen: trained to "
-            f"{validation['trained_through']}, tested {validation['tested_from']}–"
-            f"{validation['tested_to']}. The riskiest fifth held "
-            f"{validation['captured_top_fifth']:.0%} of the {validation['test_leavers']} "
-            "who left.\n" if validation else
-            "- **Not yet checked** on months it hadn't seen: too little later data.\n"
-        )
-        st.markdown(
-            f"- **Data:** {sources['app']:,} student-lessons from the app and "
-            f"{sources['history']:,} more from past schedules (never billed), "
-            f"{report['first_month']} to {report['last_month']}. A month the app holds "
-            "is taken from the app; a child the past schedules write another way counts "
-            "as the app's student.\n"
-            f"- **Leaving** is no lesson for {report['grace_months']} months and never "
-            "coming back. Grade 12s ending in May or June have finished school, not left.\n"
-            "- **The model** is logistic regression on student-months — one row per "
-            "student per month, using only what was known then — fitted on months "
-            f"{report['grace_months']} or more back, once every student's outcome is known.\n"
-            + check +
-            "- **A gap in a teacher's records** is not students leaving: a month is "
-            "judged only when that teacher's schedule carries on after it.\n"
-            "- **Students are matched across teachers by name**; grade comes from "
-            "class names (G11, Y5)."
-        )
+    return alt.Axis(labelAngle=0)
 
 
 def _history_view() -> None:
@@ -4254,7 +3938,6 @@ def _history_view() -> None:
             )
             if st.button("Remove", disabled=not sure, key="history_remove"):
                 removed = db.delete_lesson_history(teacher)
-                _retention_report.clear()
                 _flash(f"Removed {removed:,} past student-lessons for {teacher}.")
                 st.rerun()
 
@@ -4325,7 +4008,6 @@ def _history_view() -> None:
         result = db.save_lesson_history(
             teacher, sessions, source=upload.name, dates=preview.get("dates_shown")
         )
-        _retention_report.clear()
         st.session_state.pop("history_preview", None)
         _flash(
             f"Past schedules for {result['teacher']}: {result['added']:,} student-lessons "
@@ -4375,8 +4057,8 @@ def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
 def _teaching_activity(version: tuple, today: dt.date) -> dict:
     """Students, lessons and hours by month, for one state of the lessons on record."""
     sources = db.get_analysis_lessons(today)
-    lessons, _ = retention.combine(sources["app"], sources["history"])
-    return retention.monthly_activity(lessons)
+    lessons, _ = teaching.combine(sources["app"], sources["history"])
+    return teaching.monthly_activity(lessons)
 
 
 _TEACHING_MEASURES = {"Students": "Students taught", "Hours": "Teaching hours", "Lessons": "Lessons"}
@@ -4523,16 +4205,13 @@ def _lessons(count: int) -> str:
 def data_tab() -> None:
     view = st.radio(
         "View",
-        ["Teaching", "Invoiced", "Student retention", "Past schedules"],
+        ["Teaching", "Invoiced", "Past schedules"],
         horizontal=True,
         key="data_view",
         label_visibility="collapsed",
     )
     if view == "Teaching":
         _teaching_view()
-        return
-    if view == "Student retention":
-        _retention_view()
         return
     if view == "Past schedules":
         _history_view()
