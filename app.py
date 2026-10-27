@@ -28,6 +28,7 @@ import difflib
 import datetime as dt
 import io
 import os
+import re
 import time
 import zipfile
 from pathlib import Path
@@ -130,6 +131,62 @@ def _rerun() -> None:
 def _md(text: str) -> str:
     """Money for markdown: two "$" on one line are read as a formula, so escape them."""
     return text.replace("$", r"\$")
+
+
+# What a sentence is read for -- who, which subject, when, how much -- each
+# kind in one colour wherever it appears, so a message is taken in at a
+# glance. Streamlit draws ``:color-badge[...]`` in any of its Markdown:
+# alerts, captions, toasts.
+CHIP_COLOURS = {"student": "blue", "teacher": "violet", "subject": "orange",
+                "when": "gray", "money": "green"}
+_CHIP_KEY = {"student": "Student", "teacher": "Teacher", "subject": "Subject",
+             "when": "Date / time", "money": "Amount"}
+_MARKDOWN_SYNTAX = re.compile(r"([\\`*_{}\[\]<>()#+\-.!|$:~])")
+
+
+def _chip(kind: str, text) -> str:
+    """``text`` as a badge in its kind's colour.
+
+    Everything Markdown or the badge would read as syntax is escaped, so a
+    name with a bracket in it, or two amounts on one line (otherwise read as
+    a formula), shows exactly as written.
+    """
+    safe = _MARKDOWN_SYNTAX.sub(r"\\\1", str(text))
+    return f":{CHIP_COLOURS[kind]}-badge[{safe}]"
+
+
+def _student(name) -> str:
+    return _chip("student", name)
+
+
+def _teacher(name) -> str:
+    return _chip("teacher", name)
+
+
+def _subject(name) -> str:
+    return _chip("subject", name)
+
+
+def _when(text) -> str:
+    return _chip("when", text)
+
+
+def _money(amount) -> str:
+    """An amount as a badge: a number is written $1,234.50, text as given."""
+    return _chip("money", amount if isinstance(amount, str) else f"${float(amount):,.2f}")
+
+
+def _chips(kind: str, names, most: int = 6) -> str:
+    """Several of one kind, "A, B and C", or "A, B, C and 4 more" past ``most``."""
+    chips = [_chip(kind, name) for name in names]
+    if len(chips) > most:
+        return ", ".join(chips[:most]) + f" and {len(chips) - most} more"
+    return ", ".join(chips[:-1]) + " and " + chips[-1] if len(chips) > 1 else "".join(chips)
+
+
+def _chip_key() -> None:
+    """What the colours mean, once, beside Sign out."""
+    st.sidebar.markdown(" ".join(_chip(kind, label) for kind, label in _CHIP_KEY.items()))
 
 
 def _flash(message: str, kind: str = "success") -> None:
@@ -401,9 +458,11 @@ def _import_detail(preview: dict) -> None:
         )
         for item in sorted(unnamed, key=lambda x: (x["date"], x["start_time"])):
             st.caption(
-                f"\u2022 **{item['cell']}** \u2014 {item['date']:%d %b %Y} "
-                f"{item['start_time']:%H:%M}\u2013{item['end_time']:%H:%M} \u2014 "
-                + (", ".join(a["student_name"] for a in item["attendance"]) or "nobody listed")
+                f"\u2022 **{item['cell']}** \u2014 "
+                + _when(f"{item['date']:%d %b %Y} {item['start_time']:%H:%M}\u2013{item['end_time']:%H:%M}")
+                + " \u2014 "
+                + (_chips("student", [a["student_name"] for a in item["attendance"]], most=99)
+                   or "nobody listed")
             )
 
     if not st.checkbox(
@@ -510,7 +569,7 @@ def _warning_panel(preview: dict) -> None:
                 else:
                     where = f"\U0001f4c4 Worksheet `{sheet}`"
                 if date:
-                    where += f" \u00b7 {date:%a %d %b %Y}"
+                    where += " \u00b7 " + _when(f"{date:%a %d %b %Y}")
                 st.markdown(where)
 
                 text = next(
@@ -689,7 +748,7 @@ def _import_upload_panel() -> None:
     if teacher_id and any(item["own"] and key < min(suggested or ["9999"]) for key, item in found.items()):
         first = found[suggested[0]]["month"] if suggested else None
         st.caption(
-            (f"Months before {calendar.month_name[first[1]]} {first[0]} are not ticked"
+            (f"Months before {_when(f'{calendar.month_name[first[1]]} {first[0]}')} are not ticked"
              if first else "None is ticked: every month here comes before this teacher's months in the app")
             + " — billed outside the app, so importing one puts its classes up for billing again."
         )
@@ -791,11 +850,11 @@ def _import_upload_panel() -> None:
                 items.sort(key=lambda x: (x["date"], x["start_time"]))
                 students = sorted({a["student_name"] for x in items for a in x["attendance"]})
                 cells = ", ".join(x["cell"] for x in items[:4])
+                span = f"{items[0]['date']:%d %b %Y} to {items[-1]['date']:%d %b %Y}"
                 st.caption(
-                    f"**{placeholder}** — {len(items)} lesson(s), "
-                    f"{items[0]['date']:%d %b %Y} to {items[-1]['date']:%d %b %Y}, "
+                    f"{_subject(placeholder)} — {len(items)} lesson(s), {_when(span)}, "
                     f"{cells}{' …' if len(items) > 4 else ''} — "
-                    + (", ".join(students) or "nobody listed")
+                    + (_chips("student", students, most=99) or "nobody listed")
                 )
                 typed = st.text_input(
                     f"Subject for {placeholder}",
@@ -931,7 +990,7 @@ def _import_upload_panel() -> None:
             _flash(message)
             # Also kept where the preview was, which is where anyone who just
             # clicked the button is looking, until the next workbook is read.
-            st.session_state["import_done"] = f"{teacher_name} — {message}"
+            st.session_state["import_done"] = f"{_teacher(teacher_name)} — {message}"
             # The month just imported is almost always the one about to be
             # billed, so offer the jump instead of making anyone re-pick it.
             months = sorted(
@@ -997,7 +1056,7 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
             if class_id not in refused:
                 st.session_state.pop(f"name_subject_{key}_{class_id}", None)
         _flash(
-            f"Named {len(named)} subject(s): {', '.join(named)}."
+            f"Named {len(named)} subject(s): {_chips('subject', named, most=99)}."
             + (f" {result['relabelled']} line(s) already sent now show the name." if result["relabelled"] else "")
             + (f" {len(refused)} couldn't be named — that name is taken twice over." if refused else "")
         )
@@ -1199,7 +1258,7 @@ def _bulk_rate_section(
         if done:
             st.session_state[f"bulk_rate_gen_{base}"] = generation + 1
             _flash(f"Priced {done} subject(s) by grade, from "
-                   f"{calendar.month_name[month]} {year} onward.")
+                   f"{_when(f'{calendar.month_name[month]} {year}')} onward.")
             _rerun()
     if columns[1].button(
         f"Apply to {len(selected_ids)} selected",
@@ -1230,8 +1289,8 @@ def _bulk_rate_section(
                 # the last subject is priced this whole section stops being
                 # rendered, and a confirmation inside it would never appear.
                 _flash(
-                    f"Set ${bulk_rate:,.2f}/h for {ok} subject(s), "
-                    f"from {calendar.month_name[month]} {year} onward."
+                    f"Set {_money(f'${bulk_rate:,.2f}/h')} for {ok} subject(s), "
+                    f"from {_when(f'{calendar.month_name[month]} {year}')} onward."
                 )
                 _rerun()
 
@@ -1316,7 +1375,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
                 if outcome.get("status") == "deleted":
                     gone += 1
                     credits += outcome.get("credits_raised", 0)
-            message = f"Deleted {gone} subject(s) and {lessons} class(es) from {teacher_name}."
+            message = f"Deleted {gone} subject(s) and {lessons} class(es) from {_teacher(teacher_name)}."
             if credits:
                 message += (
                     f" {credits} charge(s) were already invoiced and have been "
@@ -1352,7 +1411,7 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     year, month = _month_picker("teacher_drill")
     lessons = db.get_month_schedule(teacher_id, year, month)
     if not lessons:
-        st.caption(f"No classes for {chosen} in {calendar.month_name[month]} {year}.")
+        st.caption(f"No classes for {_teacher(chosen)} in {_when(f'{calendar.month_name[month]} {year}')}.")
         return
 
     by_class: dict[int, list[dict]] = {}
@@ -1395,13 +1454,13 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
         for row in rosters.get(lesson["ID"], []):
             condition = _condition_of(row)
             tagged.append(
-                row["student_name"]
+                _student(row["student_name"])
                 if condition == IN_CLASS
-                else f"{row['student_name']} ({condition})"
+                else f"{_student(row['student_name'])} ({condition})"
             )
+        slot = f"{lesson['Date']:%d %b} · {lesson['Start']:%H:%M}–{lesson['End']:%H:%M}"
         st.caption(
-            f"{lesson['Date']:%d %b} · {lesson['Start']:%H:%M}–{lesson['End']:%H:%M} "
-            f"({_hours(lesson['Start'], lesson['End']):g}h) — "
+            f"{_when(slot)} ({_hours(lesson['Start'], lesson['End']):g}h) — "
             f"{', '.join(tagged) or 'no students'}"
         )
 
@@ -1423,7 +1482,7 @@ def teachers_tab() -> None:
                                          placeholder="Name", label_visibility="collapsed")
             if columns[1].form_submit_button("Add teacher", width="stretch"):
                 if db.create_teacher(name):
-                    _flash(f"Added {name.strip()}.")
+                    _flash(f"Added {_teacher(name.strip())}.")
                     _rerun()
                 else:
                     st.warning("Enter a name that is not already on the list.")
@@ -1482,7 +1541,7 @@ def teachers_tab() -> None:
 def _two_children(dates: list[dt.date]) -> None:
     st.warning(
         "They sat the same class on "
-        + ", ".join(f"{day:%d %b %Y}" for day in dates[:3])
+        + ", ".join(_when(f"{day:%d %b %Y}") for day in dates[:3])
         + " — one child can't be in a class twice, so these are two children."
     )
 
@@ -1506,9 +1565,9 @@ def _merge_students_section(all_students: list[dict]) -> None:
             for key in ("merge_keep", "merge_drop"):
                 st.session_state.pop(key, None)
             _flash(
-                f"Merged {result['dropped']} into {result['kept']}: {result['lessons']} class(es), "
+                f"Merged {_student(result['dropped'])} into {_student(result['kept'])}: {result['lessons']} class(es), "
                 f"{result['invoices']} invoice(s) sent and {result['credits']} credit(s) moved."
-                + (f" “{result['dropped']}” in a workbook now means {result['kept']}."
+                + (f" “{result['dropped']}” in a workbook now means {_student(result['kept'])}."
                    if result["spellings"] else "")
             )
             _rerun()
@@ -1526,7 +1585,7 @@ def _merge_students_section(all_students: list[dict]) -> None:
     def about(index: int, pair: dict) -> str:
         grade = pair["grades"][index]
         return (f"{pair['lessons'][index]} class(es)"
-                + (f", {', '.join(pair['teachers'][index])}" if pair["teachers"][index] else "")
+                + (f", {_chips('teacher', pair['teachers'][index], most=99)}" if pair["teachers"][index] else "")
                 + (f", G{grade}" if grade else ""))
 
     for pair in pairs[:30]:
@@ -1537,14 +1596,15 @@ def _merge_students_section(all_students: list[dict]) -> None:
                else "a letter or two apart")
         columns = st.columns([6, 2.2, 1.8])
         columns[0].markdown(
-            f"**{pair['names'][0]}** ({about(0, pair)}) · **{pair['names'][1]}** "
+            f"{_student(pair['names'][0])} ({about(0, pair)}) · {_student(pair['names'][1])} "
             f"({about(1, pair)}) — {why}"
         )
         if columns[1].button(f"Merge into {names.get(keep, '')}", key=f"dupe_merge_{first}_{second}"):
             merge(keep, drop)
         if columns[2].button("Different children", key=f"dupe_apart_{first}_{second}"):
             db.mark_students_distinct(first, second)
-            _flash(f"{pair['names'][0]} and {pair['names'][1]} kept apart; they won't be suggested again.")
+            _flash(f"{_student(pair['names'][0])} and {_student(pair['names'][1])} kept apart; "
+                   "they won't be suggested again.")
             _rerun()
 
     st.markdown("###### Merge any two")
@@ -1560,8 +1620,9 @@ def _merge_students_section(all_students: list[dict]) -> None:
             _two_children(preview["dates"])
         elif preview["status"] == "would_merge":
             st.caption(
-                f"{names[drop]}'s {preview['lessons']} class(es), {preview['invoices']} invoice(s) sent "
-                f"and {preview['credits']} credit(s) move to {names[keep]}, and {names[drop]} is removed."
+                f"{_student(names[drop])}'s {preview['lessons']} class(es), {preview['invoices']} invoice(s) "
+                f"sent and {preview['credits']} credit(s) move to {_student(names[keep])}, and "
+                f"{_student(names[drop])} is removed."
             )
             if st.button(f"Merge {names[drop]} into {names[keep]}", type="primary", key="merge_go"):
                 merge(keep, drop)
@@ -1576,9 +1637,10 @@ def students_tab() -> None:
     statuses = db.get_import_status(year, month)
     missing = [item["Teacher"] for item in statuses if not item["Imported"]]
     if missing:
-        st.warning(f"⏳ No {calendar.month_name[month]} schedule yet from {_name_list(missing, most=10)}.")
+        st.warning(f"⏳ No {_when(calendar.month_name[month])} schedule yet from "
+                   f"{_chips('teacher', missing, most=10)}.")
     elif statuses:
-        st.caption(f"✅ Every teacher's {calendar.month_name[month]} schedule is in.")
+        st.caption(f"✅ Every teacher's {_when(calendar.month_name[month])} schedule is in.")
 
     all_students = db.get_all_students()
     search = st.text_input(
@@ -1597,7 +1659,7 @@ def students_tab() -> None:
                 # is a slip to point out rather than quietly drop on the floor.
                 outcome = db.create_student(name[:120], parent[:120], phone[:40])
                 if outcome == "created":
-                    _flash(f"Added {name.strip()}.")
+                    _flash(f"Added {_student(name.strip())}.")
                     _rerun()
                 elif outcome == "duplicate":
                     st.warning("That student is already on the list.")
@@ -1640,7 +1702,8 @@ def students_tab() -> None:
     if len(shown) > len(page):
         st.caption(f"Showing {len(page)} of {len(shown)} — search to find anyone else.")
     elif not shown:
-        st.caption("Nobody matches." if search.strip() else f"Nobody had a class in {calendar.month_name[month]}.")
+        st.caption("Nobody matches." if search.strip()
+                   else f"Nobody had a class in {_when(calendar.month_name[month])}.")
 
     for item in page:
         marker = " 📝" if student_notes.get(item["ID"]) else ""
@@ -1687,7 +1750,7 @@ def students_tab() -> None:
                              "their next invoice automatically.",
                     )
             else:
-                st.caption(f"No classes in {calendar.month_name[month]} {year}.")
+                st.caption(f"No classes in {_when(f'{calendar.month_name[month]} {year}')}.")
 
             st.markdown("###### Details")
             columns = st.columns([2, 2, 2])
@@ -1731,10 +1794,10 @@ def students_tab() -> None:
                 item["ID"], {"subjects": 0, "classes": 0, "invoices": 0}
             )
             with buttons[1].popover("Delete"):
-                st.write(f"**Delete {item['Name']}?**")
+                st.write(f"**Delete** {_student(item['Name'])}?")
                 if usage["invoices"]:
                     st.warning(
-                        f"{item['Name']} has {usage['invoices']} invoice(s) sent, so can't be "
+                        f"{_student(item['Name'])} has {usage['invoices']} invoice(s) sent, so can't be "
                         "deleted — sent invoices keep their student."
                     )
                 elif usage["classes"] or usage["subjects"]:
@@ -1753,7 +1816,7 @@ def students_tab() -> None:
                 ):
                     outcome = db.remove_student(item["ID"])
                     if outcome == "deleted":
-                        _flash(f"{item['Name']} removed.")
+                        _flash(f"{_student(item['Name'])} removed.")
                         _rerun()
                     elif outcome == "has_invoices":
                         st.warning(
@@ -1864,8 +1927,9 @@ def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) 
             continue
         if db.as_time(item["Start"]) < end and db.as_time(item["End"]) > start:
             return (
-                f"{item['Class']} already runs {db.as_time(item['Start']):%H:%M}"
-                f"–{db.as_time(item['End']):%H:%M} that day."
+                f"{_subject(item['Class'])} already runs "
+                + _when(f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}")
+                + " that day."
             )
     return ""
 
@@ -1873,10 +1937,10 @@ def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) 
 def _clash_lines(clashes: list, dated: bool = False) -> str:
     """Students booked into another class at the same time, a line each."""
     lines = [
-        f"**{item['Student']}** is also in {item['Class']}"
-        + (f" ({item['Teacher']})" if item["Teacher"] else "")
-        + (f", {db.as_date(item['Date']):%a %d %b}" if dated else "")
-        + f", {db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}"
+        f"{_student(item['Student'])} is also in {_subject(item['Class'])}"
+        + (f" with {_teacher(item['Teacher'])}" if item["Teacher"] else "")
+        + ", " + _when((f"{db.as_date(item['Date']):%a %d %b} " if dated else "")
+                       + f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}")
         for item in clashes[:8]
     ]
     if len(clashes) > 8:
@@ -1921,10 +1985,10 @@ def _month_clashes(year: int, month: int) -> None:
         for item in clashes:
             first, second = item["First"], item["Second"]
             st.markdown(
-                f"**{item['Student']}** · {db.as_date(item['Date']):%a %d %b} · "
+                f"{_student(item['Student'])} · {_when(db.as_date(item['Date']).strftime('%a %d %b'))} · "
                 + " and ".join(
-                    f"{side['Class']} ({side['Teacher']}) "
-                    f"{db.as_time(side['Start']):%H:%M}–{db.as_time(side['End']):%H:%M}"
+                    f"{_subject(side['Class'])} with {_teacher(side['Teacher'])} "
+                    + _when(f"{db.as_time(side['Start']):%H:%M}–{db.as_time(side['End']):%H:%M}")
                     for side in (first, second)
                 )
             )
@@ -1993,8 +2057,8 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
             last = when + dt.timedelta(weeks=extra)
             st.info(
                 f"**{months} month{'s' if months > 1 else ''}** — "
-                f"{extra + 1} classes in total, every {when:%A} at "
-                f"{start:%H:%M}, from {when:%d %b} through {last:%d %b}."
+                f"{extra + 1} classes in total, {_when(f'every {when:%A} at {start:%H:%M}')}, "
+                f"from {_when(f'{when:%d %b}')} through {_when(f'{last:%d %b}')}."
             )
         elif extra:
             st.info(
@@ -2284,7 +2348,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
         if flagged:
             st.caption("Notes on students in this class")
             for name, text in flagged:
-                st.markdown(f"📝 **{name}** — {text}")
+                st.markdown(f"📝 {_student(name)} — {text}")
 
         buttons = st.columns([1, 1.3, 1, 3])
         if buttons[0].button("Save class", key=f"save_{lesson_id}", type="primary",
@@ -2314,7 +2378,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             if duplicates:
                 st.warning(
                     "Listed more than once, so only the first row was kept: "
-                    + ", ".join(sorted(set(duplicates)))
+                    + _chips("student", sorted(set(duplicates)), most=99)
                 )
             outcome = db.update_schedule_session(
                 session_id=lesson_id,
@@ -2371,8 +2435,9 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             through = db.as_date(detail["Date"]) + dt.timedelta(weeks=extra)
             st.info(
                 f"**+{months} month{'s' if months > 1 else ''}** — adds {extra} "
-                f"weekly classes, every {db.as_date(detail['Date']):%A} at "
-                f"{db.as_time(detail['Start']):%H:%M}, through {through:%d %b}. "
+                f"weekly classes, "
+                f"{_when(db.as_date(detail['Date']).strftime('every %A at ') + db.as_time(detail['Start']).strftime('%H:%M'))}, "
+                f"through {_when(through.strftime('%d %b'))}. "
                 "Same students, everyone in class and unpaid."
             )
             confirm = st.columns([1, 4])[0]
@@ -2386,7 +2451,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 )
                 st.session_state[months_key] = 0
                 if made:
-                    message = f"Added {made} class(es), through {last:%d %b}."
+                    message = f"Added {made} class(es), through {_when(last.strftime('%d %b'))}."
                     if blocked:
                         message += f" {blocked} skipped — the teacher was busy."
                     st.success(message)
@@ -2521,7 +2586,7 @@ def schedule_tab() -> None:
             st.session_state["jump_to_editor"] = True
             _rerun()
     else:
-        st.info(f"Nothing scheduled for {calendar.month_name[month]} {year} yet.")
+        st.info(f"Nothing scheduled for {_when(f'{calendar.month_name[month]} {year}')} yet.")
 
     _add_lesson(teacher_id, year, month, lessons)
 
@@ -2808,7 +2873,7 @@ def _credits_pointer() -> None:
     waiting = db.get_credits(status="Open")
     if waiting:
         st.caption(
-            f"{len(waiting)} credit(s) for missed classes, ${sum(c['Amount'] for c in waiting):,.2f}, "
+            f"{len(waiting)} credit(s) for missed classes, {_money(sum(c['Amount'] for c in waiting))}, "
             "come off next invoices by themselves — see Credits."
         )
 
@@ -2892,7 +2957,7 @@ def credits_tab() -> None:
         by_student.setdefault(credit["Student ID"], []).append(credit)
     st.markdown(f"#### Waiting for the next invoice ({len(by_student)} student(s))")
     if not waiting:
-        st.caption(f"None waiting for classes in {period}.")
+        st.caption(f"None waiting for classes in {_when(period)}.")
     for owed in sorted(by_student.values(), key=lambda cs: cs[0]["Student"].casefold()):
         student_id = owed[0]["Student ID"]
         with st.expander(
@@ -2912,8 +2977,8 @@ def credits_tab() -> None:
                 done = db.refund_credits([c["ID"] for c in ticked])
                 for c in ticked:
                     st.session_state.pop(f"credit_refund_{c['ID']}", None)
-                _flash(f"Marked {done} credit(s) refunded to {owed[0]['Student']} — "
-                       f"${sum(c['Amount'] for c in ticked):,.2f}. They won't come off an invoice.")
+                _flash(f"Marked {done} credit(s) refunded to {_student(owed[0]['Student'])} — "
+                       f"{_money(sum(c['Amount'] for c in ticked))}. They won't come off an invoice.")
                 _rerun()
 
     settled_by: dict[int, list[dict]] = {}
@@ -2921,7 +2986,7 @@ def credits_tab() -> None:
         settled_by.setdefault(credit["Student ID"], []).append(credit)
     st.markdown(f"#### Settled ({len(settled_by)} student(s))")
     if not settled_by:
-        st.caption(f"None settled for classes in {period}.")
+        st.caption(f"None settled for classes in {_when(period)}.")
         return
     # The most recently settled first, and no more than a screenful of names;
     # the month and the search narrow it to anyone further back.
@@ -3015,7 +3080,7 @@ def _issued_lookup_section(counts: dict) -> None:
         if detail["Status"] == "Void":
             st.warning(
                 f"Void — replaced by invoice #{detail['Replaced by']} on "
-                f"{detail['Replaced on']:%d %b %Y}. This is what #{detail['Number']} said."
+                f"{_when(detail['Replaced on'].strftime('%d %b %Y'))}. This is what #{detail['Number']} said."
                 + (f" Why: {detail['Note']}" if detail.get("Note") else "")
             )
             _invoice_table(detail)
@@ -3068,7 +3133,7 @@ def _number_changer(detail: dict) -> None:
     wanted, holder = clash["wanted"], clash["holder"]
     issued = f", issued {db.as_date(holder['Issued']):%d %b %Y}" if holder.get("Issued") else ""
     st.warning(
-        f"**#{wanted} is already used** by {holder['Student']}'s invoice"
+        f"**#{wanted} is already used** by {_student(holder['Student'])}'s invoice"
         f"{' (void)' if holder['Status'] == 'Void' else ''}{issued}."
     )
     with st.form(f"{key}_clash_form", border=False):
@@ -3086,7 +3151,7 @@ def _number_changer(detail: dict) -> None:
     if move:
         outcome, info = db.renumber_invoice(detail["ID"], wanted, move_holder_to=move_to)
         if outcome == "move_taken":
-            st.error(f"#{int(move_to)} is used too, by {info['Student']}'s invoice. Try another.")
+            st.error(f"#{int(move_to)} is used too, by {_student(info['Student'])}'s invoice. Try another.")
             return
         st.session_state.pop(f"{key}_clash", None)
         _renumbered(detail, outcome, info)
@@ -3098,8 +3163,8 @@ def _renumbered(detail: dict, outcome: str, info) -> None:
         _forget_made_files()
         moved = info["Moved"]
         _flash(
-            f"{info['Student']}'s invoice #{info['From']} is now #{info['To']}."
-            + (f" {moved['Student']}'s #{moved['From']} is now #{moved['To']}." if moved else "")
+            f"{_student(info['Student'])}'s invoice #{info['From']} is now #{info['To']}."
+            + (f" {_student(moved['Student'])}'s #{moved['From']} is now #{moved['To']}." if moved else "")
             + " If a parent already has the old number, send them the re-made one."
             + f" The next new invoice will be #{db.get_next_invoice_number()['next']}."
         )
@@ -3210,7 +3275,7 @@ def _invoice_editor(detail: dict) -> None:
     add_ids = []
     if data["Waiting"]:
         st.caption(
-            f"Not billed yet — {data['Student']}'s classes these months still waiting for "
+            f"Not billed yet — {_student(data['Student'])}'s classes these months still waiting for "
             "their next invoice. Tick one to put it on this invoice instead."
         )
         waiting = st.data_editor(
@@ -3265,18 +3330,18 @@ def _invoice_editor(detail: dict) -> None:
                   + sum(row["Amount"] for row in extra_rows), 2)
     credit = min(data["Credit taken off"], max(gross, 0.0))
     net = round(gross - credit, 2)
-    summary = f"New total **${net:,.2f}** (was ${detail['Total']:,.2f})"
+    summary = f"New total {_money(net)}, was {_money(detail['Total'])}"
     if credit:
-        summary += f", after ${credit:,.2f} credit already taken off"
-    st.markdown(_md(summary + "."))
+        summary += f", after {_money(credit)} credit already taken off"
+    st.markdown(summary + ".")
     paid = data["Paid"]
     if paid is not None and abs(paid - net) > 0.005:
-        st.caption(_md(
-            f"${paid:,.2f} has been paid: ${net - paid:,.2f} more will be owed."
+        st.caption(
+            f"{_money(paid)} has been paid: {_money(net - paid)} more will be owed."
             if net > paid else
-            f"${paid:,.2f} has been paid: the ${paid - net:,.2f} paid over becomes a credit "
+            f"{_money(paid)} has been paid: the {_money(paid - net)} paid over becomes a credit "
             "on their next invoice."
-        ))
+        )
     note = st.text_input("What changed (kept with the old invoice)", key=f"edit_note_{invoice_id}")
     if unpriced:
         st.warning("A class ticked to add has no price yet — price its subject first.")
@@ -3302,8 +3367,8 @@ def _invoice_editor(detail: dict) -> None:
         for key in [k for k in st.session_state if k.startswith(("edit_", "invoice_edit_"))]:
             st.session_state.pop(key, None)
         st.session_state["issued_search_next"] = str(number)
-        _flash(_md(f"#{data['Number']} is void; replaced by #{number} for ${net:,.2f}. "
-                   "Download the new one below and send it."))
+        _flash(f"#{data['Number']} is void; replaced by #{number} for {_money(net)}. "
+               "Download the new one below and send it.")
         _rerun()
 
 
@@ -3367,8 +3432,8 @@ def _out_of_step_warning() -> None:
             changes = "; ".join(f"{change['Date']:%d %b} {change['Subject']}: {change['What']}"
                                 for change in entry["Changes"][:3])
             more = len(entry["Changes"]) - 3
-            columns[0].markdown(_md(f"**#{entry['Number']}** · {entry['Student']} — {changes}"
-                                    + (f" and {more} more" if more > 0 else "")))
+            columns[0].markdown(f"**#{entry['Number']}** · {_student(entry['Student'])} — {_md(changes)}"
+                                + (f" and {more} more" if more > 0 else ""))
             if columns[1].button("Edit", key=f"oos_edit_{entry['ID']}", width="stretch"):
                 st.session_state["invoice_reference_open"] = True
                 st.session_state["issued_search_next"] = str(entry["Number"])
@@ -3427,7 +3492,7 @@ def _month_download(year: int, month: int) -> None:
     issued = db.get_issued_invoices_for_month(year, month)
     st.markdown(f"###### Download {period}'s invoices ({len(issued)})")
     if not issued:
-        st.caption(f"None issued for {period} yet.")
+        st.caption(f"None issued for {_when(period)} yet.")
         return
     days: dict = {}
     for item in issued:
@@ -3637,7 +3702,7 @@ def _number_clash(numbering: dict) -> None:
     wanted, holder = clash["wanted"], clash["holder"]
     issued = f", issued {db.as_date(holder['Issued']):%d %b %Y}" if holder.get("Issued") else ""
     st.warning(
-        f"**#{wanted} is already used** by {holder['Student']}'s invoice"
+        f"**#{wanted} is already used** by {_student(holder['Student'])}'s invoice"
         f"{' (void)' if holder['Status'] == 'Void' else ''}{issued}."
     )
     with st.form("number_clash_form", border=False):
@@ -3649,7 +3714,7 @@ def _number_clash(numbering: dict) -> None:
                                      width="stretch")
         cancel = st.form_submit_button("Keep it, choose another number", width="stretch")
     st.caption(
-        f"If {holder['Student']} already has it as #{wanted}, send them the re-made one: "
+        f"If {_student(holder['Student'])} already has it as #{wanted}, send them the re-made one: "
         "Past invoices → Look one up. It shows the new number."
     )
     if cancel:
@@ -3658,7 +3723,7 @@ def _number_clash(numbering: dict) -> None:
     if move:
         outcome, detail = db.move_invoice_number(wanted, move_to)
         if outcome == "taken":
-            st.error(f"#{int(move_to)} is used too, by {detail['Student']}'s invoice. Try another.")
+            st.error(f"#{int(move_to)} is used too, by {_student(detail['Student'])}'s invoice. Try another.")
             return
         if outcome == "low":
             st.error(f"Numbers below #{detail} are the academy's invoices from before the app.")
@@ -3666,7 +3731,7 @@ def _number_clash(numbering: dict) -> None:
         st.session_state.pop("number_clash", None)
         if outcome == "moved":
             _forget_made_files()
-            _flash(f"{detail['Student']}'s invoice is now #{detail['To']}. "
+            _flash(f"{_student(detail['Student'])}'s invoice is now #{detail['To']}. "
                    f"The next invoice will be #{wanted}.")
         else:
             _flash(f"The next invoice will be #{wanted}.")
@@ -3693,13 +3758,13 @@ def invoices_tab() -> None:
         f"#### {period} — {summary['to_bill_count']} to bill, "
         f"${summary['to_bill_value']:,.2f}"
     )
-    trail = f"{summary['billed_count']} already sent (${summary['billed_value']:,.2f})"
+    trail = f"{summary['billed_count']} already sent, {_money(summary['billed_value'])}"
     if summary.get("credit_outstanding"):
         trail += (
-            f" · ${summary['credit_outstanding']:,.2f} credit for cancelled "
+            f" · {_money(summary['credit_outstanding'])} credit for cancelled "
             "classes comes off automatically"
         )
-    st.caption(_md(trail))
+    st.caption(trail)
     _next_number_control()
     _out_of_step_warning()
 
@@ -3712,7 +3777,7 @@ def invoices_tab() -> None:
         _unnamed_subjects("invoices", year, month)
 
     if not month_items:
-        st.info(f"Nothing left to bill for {period}.")
+        st.info(f"Nothing left to bill for {_when(period)}.")
     else:
         # A form, as on Payments: ticking is instant, and the button is above
         # the list rather than below every student in it.
@@ -3777,13 +3842,13 @@ def _part_payment_form(unpaid: list[dict], year: int, month: int) -> None:
         outcome = db.mark_invoice_paid(row["ID"], paid_on=when, amount=amount, note=note)
         if outcome in ("paid", "part paid"):
             short = row["Owing"] - amount
-            message = f"Recorded ${amount:,.2f} from {row['Student']}."
+            message = f"Recorded {_money(amount)} from {_student(row['Student'])}."
             if short > 0.005:
                 message += (
-                    f" ${short:,.2f} still owing — they stay on the list until "
+                    f" {_money(short)} still owing — they stay on the list until "
                     "it comes in."
                 )
-            _flash(_md(message))
+            _flash(message)
             _rerun()
         else:
             st.warning(f"Could not record that ({outcome}).")
@@ -3811,20 +3876,20 @@ def _paid_list(paid: list[dict], year: int, month: int) -> None:
             # Nothing was ever owed: credit for missed classes took the
             # invoice to $0. There is no payment to show, or to undo.
             columns[0].markdown(
-                f"**{row['Student']}** — nothing to pay: credit for missed classes covered it"
+                f"{_student(row['Student'])} — nothing to pay: credit for missed classes covered it"
             )
             continue
         amount = row["Paid amount"] if row["Paid amount"] is not None else row["Total"]
         line = (
-            f"**{row['Student']}** — ${amount:,.2f} on "
-            f"{row['Paid on']:%d %b %Y}"
+            f"{_student(row['Student'])} — {_money(amount)} on "
+            f"{_when(row['Paid on'].strftime('%d %b %Y'))}"
         )
         if row["Note"]:
             line += f" · _{row['Note']}_"
         columns[0].markdown(line)
         if columns[1].button("Undo", key=f"unpay_{row['ID']}", width="stretch"):
             db.unmark_invoice_paid(row["ID"])
-            _flash(f"{row['Student']} put back to unpaid.", "warning")
+            _flash(f"{_student(row['Student'])} put back to unpaid.", "warning")
             _rerun()
     if len(shown) > PAID_ROWS:
         st.caption(f"Showing {PAID_ROWS} of {len(shown)} — search above to narrow it down.")
@@ -3838,7 +3903,7 @@ def payments_tab() -> None:
 
     if not unpaid and not paid:
         st.info(
-            f"No invoices covering {period} yet. They appear here once "
+            f"No invoices covering {_when(period)} yet. They appear here once "
             "you have sent them from the Invoices screen."
         )
         return
@@ -3848,14 +3913,14 @@ def payments_tab() -> None:
         sum(r["Paid amount"] if r["Paid amount"] is not None else r["Total"] for r in paid), 2
     )
     st.markdown(f"#### {period} — {len(unpaid)} to collect, ${outstanding:,.2f}")
-    trail = f"{len(paid)} paid (${collected:,.2f}) · due {data['due']:%d %b %Y}"
+    trail = f"{len(paid)} paid, {_money(collected)} · due {_when(data['due'].strftime('%d %b %Y'))}"
     late = [row for row in unpaid if row["Overdue"] > 0]
     if late:
         trail += f" · **{len(late)} overdue**"
     st.caption(trail)
 
     if not unpaid:
-        st.success(f"Everyone has paid for {period}.")
+        st.success(f"Everyone has paid for {_when(period)}.")
     else:
         # A form, so ticking is instant: outside one every tick reran the whole
         # screen, two seconds each on the live app, with the button waiting
@@ -3906,7 +3971,7 @@ def payments_tab() -> None:
                 if done:
                     total_picked = round(sum(row["Owing"] for row in picked), 2)
                     st.session_state.pop(f"pay_find_{year}_{month}", None)
-                    _flash(f"Recorded {done} payment(s) — ${total_picked:,.2f} for {period}.")
+                    _flash(f"Recorded {done} payment(s) — {_money(total_picked)} for {_when(period)}.")
                     _rerun()
 
         _part_payment_form(unpaid, year, month)
@@ -3938,7 +4003,7 @@ def _history_view() -> None:
             )
             if st.button("Remove", disabled=not sure, key="history_remove"):
                 removed = db.delete_lesson_history(teacher)
-                _flash(f"Removed {removed:,} past student-lessons for {teacher}.")
+                _flash(f"Removed {removed:,} past student-lessons for {_teacher(teacher)}.")
                 st.rerun()
 
     st.markdown("#### Add a teacher's workbook")
@@ -3991,7 +4056,7 @@ def _history_view() -> None:
         f"**{len(sessions):,} lessons**, "
         f"{sum(len(item['attendance']) for item in sessions):,} student-lessons, "
         f"{preview['unique_student_count']} students, "
-        f"{dates[0]:%b %Y} to {dates[-1]:%b %Y}."
+        f"{_when(dates[0].strftime('%b %Y'))} to {_when(dates[-1].strftime('%b %Y'))}."
     )
     if preview["sheet_summaries"]:
         st.dataframe(preview["sheet_summaries"], width="stretch", hide_index=True)
@@ -4010,7 +4075,7 @@ def _history_view() -> None:
         )
         st.session_state.pop("history_preview", None)
         _flash(
-            f"Past schedules for {result['teacher']}: {result['added']:,} student-lessons "
+            f"Past schedules for {_teacher(result['teacher'])}: {result['added']:,} student-lessons "
             f"added, {result['updated']:,} updated, {result['unchanged']:,} already on file"
             + (f", {result['removed']:,} no longer in the workbook removed" if result["removed"] else "")
             + ". Nothing was billed."
@@ -4080,7 +4145,7 @@ def _teaching_view() -> None:
     activity = _teaching_activity(db.get_analysis_data_version(), today)
     months = [row for row in activity["by_month"] if row["Year"] == year and row["Month"] <= month]
     if not months:
-        st.info(f"No lessons on record in {year} up to the end of {label}.")
+        st.info(f"No lessons on record in {year} up to the end of {_when(label)}.")
         return
 
     # The month picked, against the one before it -- unless the month isn't
@@ -4100,7 +4165,7 @@ def _teaching_view() -> None:
     beginning = sorted(t for t, first in first_on_record.items() if first == (year, month))
     st.markdown(f"#### {label}" + (f" — up to {today:%d %b}" if so_far else ""))
     if current is None:
-        st.caption(f"No lessons on record in {label}.")
+        st.caption(f"No lessons on record in {_when(label)}.")
     else:
         columns = st.columns(4)
         for column, key, text in zip(columns, ["Students", "Lessons", "Hours", "Teachers"],
@@ -4113,8 +4178,8 @@ def _teaching_view() -> None:
             column.metric(text, f"{value:,.0f}", delta=delta)
         if beginning and previous and not so_far:
             st.caption(
-                f"Not compared with {calendar.month_abbr[before[1]]}: records for "
-                + _name_list(beginning) + f" begin in {calendar.month_abbr[month]}."
+                f"Not compared with {_when(calendar.month_abbr[before[1]])}: records for "
+                + _chips("teacher", beginning) + f" begin in {_when(calendar.month_abbr[month])}."
             )
 
     order = [calendar.month_abbr[m] for m in range(1, month + 1)]
@@ -4141,9 +4206,9 @@ def _teaching_view() -> None:
     st.caption(
         "Absences aren't counted; a child with two teachers counts once. "
         + ("Records start later for "
-           + _name_list([f"{t} ({calendar.month_abbr[m]})" for m, t in starts])
+           + _name_list([f"{_teacher(t)} ({calendar.month_abbr[m]})" for m, t in starts])
            + ". " if starts else "")
-        + (f"Not on record yet: {_name_list(later)}." if later else "")
+        + (f"Not on record yet: {_chips('teacher', later)}." if later else "")
     )
 
     teachers = pd.DataFrame(
@@ -4223,7 +4288,7 @@ def data_tab() -> None:
 
     trend = db.get_teacher_year_trend(year, month)
     if not trend:
-        st.info(f"No classes recorded in {year} up to the end of {label}.")
+        st.info(f"No classes recorded in {year} up to the end of {_when(label)}.")
         return
 
     frame = pd.DataFrame(trend)
@@ -4263,9 +4328,9 @@ def data_tab() -> None:
         first_full = int(per_month[per_month == full].index.min())
         earlier = sorted(set(active.loc[active["Month"] < first_full, "Teacher"]), key=str.casefold)
         if earlier and len(earlier) * 2 <= full:
-            who = f"{len(earlier)} teachers" if len(earlier) > 3 else _name_list(earlier)
+            who = f"{len(earlier)} teachers" if len(earlier) > 3 else _chips("teacher", earlier)
             st.caption(
-                f"Before {calendar.month_name[first_full]} only {who} "
+                f"Before {_when(calendar.month_name[first_full])} only {who} "
                 f"{'was' if len(earlier) == 1 else 'were'} billed through the app — see Teaching "
                 "for every teacher's months."
             )
@@ -4309,7 +4374,7 @@ def data_tab() -> None:
     # the figures below always match the last point on the line above.
     stats = db.get_teacher_month_stats(year, month)
     if not stats:
-        st.info(f"Nobody taught in {label}.")
+        st.info(f"Nobody taught in {_when(label)}.")
         return
 
     snapshot = pd.DataFrame(stats)
@@ -4339,7 +4404,8 @@ def data_tab() -> None:
     behind = sorted((row for row in stats if row["Not invoiced lessons"]),
                     key=lambda r: -r["Not invoiced value"])
     if behind:
-        shown = ", ".join(f"{row['Teacher']} ${row['Not invoiced value']:,.0f}" for row in behind[:6])
+        shown = ", ".join(_teacher(row["Teacher"]) + " " + _money("$" + format(row["Not invoiced value"], ",.0f"))
+                          for row in behind[:6])
         st.caption(
             f"Still to invoice: {shown}"
             + (f", and {len(behind) - 6} more" if len(behind) > 6 else "") + "."
@@ -4506,9 +4572,10 @@ def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int)
         for item in booked:
             if (item["Student ID"] in here and db.as_date(item["Date"]) == lesson["date"]
                     and db.as_time(item["Start"]) < lesson["end"] and db.as_time(item["End"]) > lesson["start"]):
-                lines.append(f"**{item['Student']}** · {lesson['date']:%a %d %b} {lesson['subject']} — also in "
-                             f"{item['Class']} ({item['Teacher']}), "
-                             f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}")
+                lines.append(f"{_student(item['Student'])} · {_when(lesson['date'].strftime('%a %d %b'))} "
+                             f"{_subject(lesson['subject'])} — also in "
+                             f"{_subject(item['Class'])} with {_teacher(item['Teacher'])}, "
+                             + _when(f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}"))
     return lines
 
 
@@ -4598,7 +4665,7 @@ def create_schedule_tab() -> None:
         if upload is not None and st.button("Put its lessons in the table", key="plan_load"):
             rows, marks = _rows_from_sheet(upload, year, month)
             if rows is None:
-                st.warning(f"No lessons for {period} found in that sheet.")
+                st.warning(f"No lessons for {_when(period)} found in that sheet.")
             else:
                 st.session_state["plan_rows"] = rows
                 st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
@@ -4647,7 +4714,7 @@ def create_schedule_tab() -> None:
     if unfinished:
         st.caption(f"{unfinished} row(s) not filled in yet (date, times and subject) — left out.")
     if elsewhere:
-        st.warning(f"{elsewhere} row(s) fall outside {period} — left out.")
+        st.warning(f"{elsewhere} row(s) fall outside {_when(period)} — left out.")
     problems = _plan_problems(lessons)
     if doubled:
         problems.insert(0, f"{doubled} lesson(s) have more than one subject — one per lesson.")
@@ -4657,7 +4724,7 @@ def create_schedule_tab() -> None:
     new_names = sorted({name for lesson in lessons for name in lesson["students"] if find(name) is None},
                        key=str.casefold)
     if new_names:
-        st.info("New students, created when the sheet is uploaded: " + ", ".join(new_names))
+        st.info("New students, created when the sheet is uploaded: " + _chips("student", new_names, most=99))
     # A subject typed rather than picked is a new one -- said so, as for
     # students, with the one on file it is close to: "G12 Bio" picked by
     # Enter half-typed would otherwise quietly become a second subject.
@@ -4666,7 +4733,7 @@ def create_schedule_tab() -> None:
                           key=str.casefold)
     if new_subjects:
         st.info("New subjects, created when the sheet is uploaded: " + ", ".join(
-            name + (f" (close to {close[0]})" if (close := difflib.get_close_matches(name, on_file, n=1,
+            _subject(name) + (f" (close to {_subject(close[0])})" if (close := difflib.get_close_matches(name, on_file, n=1,
                                                                                      cutoff=0.7)) else "")
             for name in new_subjects))
     clashes = _plan_clashes(lessons, teacher_name, find, year, month) if lessons and teacher_name else []
@@ -4721,7 +4788,7 @@ def reminders_tab() -> None:
     older = [item for item in all_reminders if not _due_this_month(item)]
     if older:
         owed = sum(item["Amount"] for item in older)
-        st.warning(f"Also unpaid from earlier months: {len(older)} invoice(s), ${owed:,.2f}.")
+        st.warning(f"Also unpaid from earlier months: {len(older)} invoice(s), {_money(owed)}.")
     if not reminders:
         st.success("Nothing newly overdue this month.")
         show = older
@@ -4764,6 +4831,7 @@ st.markdown(
 # Above the tabs, so a confirmation from any tab's last action is visible
 # wherever the rerun lands.
 _show_flash()
+_chip_key()
 _offer_billing()
 _floating_back_to_top()
 # A segmented control rather than st.tabs, for two reasons that both bit
