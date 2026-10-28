@@ -1,7 +1,7 @@
-"""End-to-end verification of the KS Academia deployment work.
+"""End-to-end checks of the whole app: database, imports, billing, invoices and sign-in.
 
-Exercises every piece that was changed, against the real database where it
-can. Prints PASS/FAIL per check and exits non-zero if anything failed.
+Runs each check against the real database where it can. Prints PASS or
+FAIL for each one and exits non-zero if anything failed.
 """
 from __future__ import annotations
 
@@ -25,10 +25,9 @@ sys.path.insert(0, str(PROJECT))
 
 results: list[tuple[str, bool, str]] = []
 
-# Importing app.py runs the sign-in gate, which refuses to proceed without
-# credentials -- correctly. So the suite needs some, and must not depend on
-# whatever happens to be on this machine: a fresh clone has no secrets file.
-# A throwaway one is written here and removed afterwards, unless the developer
+# Importing app.py runs the sign-in check, which stops without credentials, as it
+# should. So the tests need some, and a fresh clone has no secrets file. A
+# throwaway one is written here and removed afterwards, unless the developer
 # already has a real one, which is left alone.
 _SECRETS = PROJECT / ".streamlit" / "secrets.toml"
 _SECRETS_WAS_OURS = not _SECRETS.exists()
@@ -45,9 +44,9 @@ if _SECRETS_WAS_OURS:
         "[auth.credentials.usernames.verify]\n"
         'name = "Verification Run"\n'
         f'password = "{_stauth.Hasher.hash("not-a-real-password")}"\n\n'
-        # The letterhead and bank details also come from secrets now, and
-        # rendering an invoice refuses without them -- deliberately, since an
-        # invoice with no way to pay it is worse than none at all.
+        # The letterhead and bank details come from secrets too, and an invoice won't
+        # render without them, on purpose: an invoice with no way to pay it is worse
+        # than none.
         "[academy]\n"
         'name = "Verification Academy"\n'
         'address = "1 Example Street, Singapore 000000"\n'
@@ -61,6 +60,7 @@ if _SECRETS_WAS_OURS:
 
 
 def check(name, fn):
+    """Run one check and record whether it passed, with its message."""
     try:
         detail = fn()
         results.append((name, True, detail or ""))
@@ -69,6 +69,7 @@ def check(name, fn):
 
 
 def run(args, env=None):
+    """Run Python with `args` in the project folder, without DATABASE_URL unless `env` sets it."""
     e = dict(os.environ)
     e.pop("DATABASE_URL", None)
     if env:
@@ -79,6 +80,7 @@ def run(args, env=None):
 
 # ---------------------------------------------------------------- 1. imports
 def t_imports():
+    """Every module imports without errors."""
     for m in ["db", "app", "invoice_render", "schedule_parser",
               "schedule_backfill", "schedule_grid", "migrate_to_postgres"]:
         importlib.import_module(m)
@@ -87,6 +89,7 @@ def t_imports():
 
 # ------------------------------------------------------------ 2. requirements
 def t_requirements():
+    """Every package pinned in requirements.txt is installed at that version."""
     pins = {}
     for line in (PROJECT / "requirements.txt").read_text().splitlines():
         line = line.strip()
@@ -108,12 +111,14 @@ def t_requirements():
 
 
 def t_no_packages_txt():
+    """There's no packages.txt, since the app needs no system packages."""
     assert not (PROJECT / "packages.txt").exists(), "packages.txt still present"
     return "absent, as intended (no system deps)"
 
 
 # -------------------------------------------------------------- 3. gitignore
 def t_gitignore():
+    """The database files, secrets, venv and caches are all in .gitignore."""
     body = (PROJECT / ".gitignore").read_text()
     for pat in ["ks_academia.db", "ks_academia.db-wal", "ks_academia.db-shm",
                 "secrets.toml", ".venv/", "__pycache__/"]:
@@ -123,6 +128,7 @@ def t_gitignore():
 
 # ------------------------------------------------------------- 4. db config
 def t_db_sqlite_default():
+    """With no DATABASE_URL the app uses the local SQLite file."""
     r = run(["-c", "import db;print(db.engine.dialect.name);print(db.DATABASE_URL)"])
     assert r.returncode == 0, r.stderr[-400:]
     dialect = r.stdout.strip().splitlines()[0]
@@ -131,6 +137,7 @@ def t_db_sqlite_default():
 
 
 def t_db_postgres_rewrite():
+    """A postgres:// URL is changed to postgresql://, with pre-ping turned on."""
     r = run(["-c", "import db;print(db.DATABASE_URL);print(db.engine.dialect.name);"
                    "print(db.engine.pool._pre_ping)"],
             {"DATABASE_URL": "postgres://u:p@ep-x.neon.tech/ks?sslmode=require"})
@@ -143,7 +150,7 @@ def t_db_postgres_rewrite():
 
 
 def t_db_no_wal_on_postgres():
-    """WAL pragmas must not be attached to a non-SQLite engine."""
+    """The WAL settings are never added to a non-SQLite engine."""
     r = run(["-c",
              "import db;from sqlalchemy import event;"
              "print(event.contains(db.engine,'connect',"
@@ -154,6 +161,7 @@ def t_db_no_wal_on_postgres():
 
 
 def t_real_data():
+    """The database can be reached, and how many invoices it has."""
     import db
     s = db.SessionLocal()
     try:
@@ -165,6 +173,7 @@ def t_real_data():
 
 # ------------------------------------------------------- 5. migration script
 def t_migrate_guards():
+    """The migration script refuses a non-Postgres target and a non-SQLite source."""
     r1 = run(["migrate_to_postgres.py", "mysql://x/y"])
     assert "Refusing to run" in r1.stdout, r1.stdout[-300:]
     r2 = run(["migrate_to_postgres.py", "postgresql://u:p@h/db"],
@@ -174,7 +183,7 @@ def t_migrate_guards():
 
 
 def t_migrate_copy():
-    """Full copy into a fresh target with foreign keys enforced."""
+    """Copy everything into a fresh database with foreign keys switched on."""
     import db
     from sqlalchemy import create_engine, event, func, select
     target_path = SCRATCH / "verify_copy.db"
@@ -183,6 +192,7 @@ def t_migrate_copy():
 
     @event.listens_for(target, "connect")
     def _fk(conn, rec):
+        """Switch foreign keys on for each new connection."""
         conn.execute("PRAGMA foreign_keys=ON")
 
     db.Base.metadata.create_all(target)
@@ -204,6 +214,7 @@ def t_migrate_copy():
 
 # ------------------------------------------------------------ 6. invoice render
 def _real_invoices(limit=3):
+    """Return up to `limit` real invoices in full."""
     import db
     rows = db.get_invoices()
     out = []
@@ -215,6 +226,7 @@ def _real_invoices(limit=3):
 
 
 def t_render_html_real():
+    """Real invoices render as full HTML pages, singly and as a batch."""
     import invoice_render as ir
     invs = _real_invoices()
     assert invs, "no invoices in the database to test with"
@@ -228,6 +240,7 @@ def t_render_html_real():
 
 
 def t_render_pdf_real():
+    """Real invoices render as valid one-page A4 PDFs, with progress reported."""
     import invoice_render as ir
     import pymupdf
     invs = _real_invoices()
@@ -246,7 +259,7 @@ def t_render_pdf_real():
 
 
 def t_pdf_text_correct():
-    """The rendered PDF must actually contain the invoice's numbers."""
+    """The PDF really contains the invoice's numbers."""
     import invoice_render as ir
     import pymupdf
     inv = _real_invoices(1)[0]
@@ -261,6 +274,7 @@ def t_pdf_text_correct():
 
 
 def t_render_png_real():
+    """Real invoices render as valid PNG images."""
     import invoice_render as ir
     invs = _real_invoices(2)
     shots = ir.render_invoices_png(invs)
@@ -271,6 +285,7 @@ def t_render_png_real():
 
 
 def t_render_edge_cases():
+    """An invoice with no lines, a draft with no number, and a name with HTML in it all render."""
     import invoice_render as ir
     import datetime as dt
     cases = {
@@ -293,6 +308,7 @@ def t_render_edge_cases():
 
 # ------------------------------------------------------------- 7. dispatch
 def t_dispatch():
+    """The app picks PNG, then PDF, then HTML, depending on what this machine can make."""
     import invoice_render as ir
     import app
     combos = {(True, True): "png", (False, True): "pdf", (False, False): "html"}
@@ -309,6 +325,7 @@ def t_dispatch():
 
 
 def t_zip_all_formats():
+    """The zip holds one file per invoice in each format."""
     import invoice_render as ir
     import app
     invs = _real_invoices(2)
@@ -322,7 +339,7 @@ def t_zip_all_formats():
         assert all(n.endswith(f".{fmt}") for n in names), f"{fmt}: {names}"
         assert len(names) == len(invs), f"{fmt}: {len(names)} files"
         made[fmt] = len(names)
-    # html-only path, independent of availability
+    # The HTML-only zip, whatever this machine can make.
     blob = app._invoices_zip(invs, as_images=False)
     names = zipfile.ZipFile(io.BytesIO(blob)).namelist()
     assert all(n.endswith(".html") for n in names)
@@ -332,6 +349,7 @@ def t_zip_all_formats():
 
 
 def t_zip_unique_names():
+    """Two invoices for students with the same name get different file names in the zip."""
     import app
     dup = [{"ID": 1, "Number": 1, "Student": "Same Name", "Status": "Issued",
             "Total": 0, "Lines": []},
@@ -344,17 +362,17 @@ def t_zip_unique_names():
 
 
 def t_login_gate_runs_first():
-    """The gate must come before anything reads or draws student data.
+    """The sign-in check runs before anything reads or shows student data.
 
-    A structural check on the source rather than a behavioural one: the order
-    of these two calls is the whole security property, and it would be easy
-    to move the login below some innocent-looking setup and never notice.
+    It checks the source code rather than the behaviour: the order of these
+    two calls is the whole point, and moving the sign-in below some
+    harmless-looking setup would be easy to miss.
     """
     source = (PROJECT / "app.py").read_text(encoding="utf-8")
     gate = source.index("auth.require_login()")
     init = source.index("db.initialise_database()")
     assert gate < init, "login gate runs after the database is opened"
-    # Nothing may be rendered above it either.
+    # Nothing may be drawn above it either.
     above = source[:gate]
     for drawn in ["st.dataframe", "st.table", "st.write(", "st.tabs", "st.radio"]:
         assert drawn not in above, f"{drawn} renders before the login gate"
@@ -362,16 +380,15 @@ def t_login_gate_runs_first():
 
 
 def t_login_fails_closed():
-    """Missing or empty credentials must refuse everyone, not admit everyone."""
+    """Missing or empty credentials keep everyone out, not let everyone in."""
     import auth
     import inspect
     src = inspect.getsource(auth.require_login)
     assert "_configuration_error" in src, "no configuration guard at all"
     for guard in ["st.secrets", "cookie_key", "usernames"]:
         assert guard in src, f"missing guard: {guard}"
-    # Reading secrets must not be able to throw a traceback at a visitor:
-    # st.secrets raises rather than behaving like an empty mapping when a
-    # deployment has no secrets at all.
+    # Reading secrets must never show a visitor a traceback: st.secrets raises an
+    # error when a deployment has no secrets at all, instead of acting empty.
     assert "except Exception" in src, "secrets access is not guarded against raising"
     assert "auto_hash=False" in src, (
         "auto_hash must be off or the stored bcrypt hash gets hashed again "
@@ -381,14 +398,14 @@ def t_login_fails_closed():
 
 
 def t_login_cookie_read_from_browser():
-    """The stay-signed-in cookie must be read even when the host hides it.
+    """The stay-signed-in cookie is read even when the host hides it.
 
-    Streamlit Community Cloud strips cookies before a request reaches the
-    app, so the library's header-based lookup finds nothing there and every
-    visit starts at the sign-in form. The gate falls back to the browser-side
-    component. Here the headers are empty (bare mode) and a stub stands in
-    for the component, so this exercises exactly the deployed path -- and
-    checks that the fallback still rejects a forged or expired cookie.
+    Streamlit Community Cloud removes cookies before a request reaches the
+    app, so the library's header lookup finds nothing and every visit starts
+    at the sign-in form. The app falls back to reading the cookie in the
+    browser. Here the headers are empty (bare mode) and a stub stands in for
+    the browser part, so this runs the same path as the hosted app, and
+    checks a forged or expired cookie is still rejected.
     """
     import time
     import types
@@ -399,7 +416,7 @@ def t_login_cookie_read_from_browser():
     src = inspect.getsource(auth.require_login)
     assert "_read_cookie_from_browser" in src, "cookie fallback is not wired in"
 
-    # 32+ bytes, or PyJWT warns about a short HMAC key on every run.
+    # 32 or more bytes, or PyJWT warns about a short key on every run.
     key = "verification-only-key-" + "x" * 32
     other = "some-other-key-" + "y" * 32
     good = jwt.encode({"username": "ada", "exp_date": time.time() + 3600},
@@ -410,6 +427,7 @@ def t_login_cookie_read_from_browser():
                         other, algorithm="HS256")
 
     def model_with(value):
+        """Return a stand-in for the sign-in object whose cookie holds `value`."""
         manager = types.SimpleNamespace(get=lambda name: value if name == "c" else None)
         return types.SimpleNamespace(cookie_name="c", cookie_key=key,
                                      cookie_manager=manager)
@@ -424,15 +442,15 @@ def t_login_cookie_read_from_browser():
 
 
 def t_no_credentials_in_repo():
-    """No password or hash may be committed."""
+    """No password or password hash is committed."""
     import subprocess
     tracked = subprocess.run(["git", "ls-files"], capture_output=True, text=True,
                              cwd=str(PROJECT)).stdout.split()
     assert "\\.streamlit/secrets.toml" not in tracked, "secrets.toml is tracked"
     assert ".streamlit/secrets.toml" not in tracked, "secrets.toml is tracked"
-    # A real bcrypt hash, not merely the "$2b$" prefix: the documentation and
-    # this file both contain placeholders like "$2b$12$....." on purpose, and
-    # matching the prefix alone would fail on its own examples forever.
+    # A real bcrypt hash, not just the "$2b$" prefix: the docs and this file both have
+    # placeholders like "$2b$12$....." on purpose, and matching the prefix alone would
+    # always fail on them.
     real_hash = re.compile(r"\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}")
     bad = []
     for rel in tracked:
@@ -450,15 +468,15 @@ def t_no_credentials_in_repo():
 
 
 def t_read_functions_all_run():
-    """Every read-only query must actually execute on the live backend.
+    """Every read-only query actually runs on the database in use.
 
-    This exists because get_payment_reminders grouped by the invoice's id
-    while selecting the student's name. SQLite allows that and quietly picks
-    a row; Postgres refuses the query outright, so the Reminders tab worked
-    perfectly in development and would have failed on the deployed app.
+    Added because get_payment_reminders grouped by the invoice's id while
+    selecting the student's name. SQLite allows that and picks a row;
+    Postgres refuses the query, so the Reminders screen worked in development
+    and would have failed on the hosted app.
 
-    Run with DATABASE_URL pointing at Postgres, this catches that whole class
-    of difference. Run without, it still checks nothing raises.
+    With DATABASE_URL pointing at Postgres this catches that kind of
+    difference. Without it, it still checks nothing raises an error.
     """
     import datetime as dt
 
@@ -516,11 +534,10 @@ def t_read_functions_all_run():
 
 
 def t_batch_matches_single():
-    """get_invoices_detailed must agree with get_invoice, invoice for invoice.
+    """get_invoices_detailed agrees with get_invoice, invoice by invoice.
 
-    The batched version exists only for speed. The moment it disagrees with
-    the one-at-a-time path it is a billing bug, so this compares them rather
-    than trusting them.
+    The batch version only exists for speed. If it ever disagrees with the
+    one-at-a-time version, that's a billing bug, so they're compared here.
     """
     import db
 
@@ -537,12 +554,12 @@ def t_batch_matches_single():
 
 
 def t_long_names_fit_their_columns():
-    """A name out of a spreadsheet must fit the column it is stored in.
+    """A name from a spreadsheet is cut to fit the column it's saved in.
 
-    Postgres rejects an over-long value outright; SQLite keeps it. A teacher
-    who writes a paragraph where the subject goes would therefore import
-    fine in testing and break the deployed app, so the trimming is checked
-    against the columns themselves, in a throwaway database.
+    Postgres refuses a value that's too long; SQLite keeps it. A teacher who
+    writes a paragraph where the subject goes would import fine in testing
+    and break the hosted app, so the cutting is checked against the columns
+    themselves, in a throwaway database.
     """
     import tempfile
 
@@ -578,12 +595,12 @@ def t_long_names_fit_their_columns():
 
 
 def t_import_prices_by_grade():
-    """An imported subject arrives priced; none is left on the placeholder.
+    """An imported subject comes in priced; none is left on the placeholder.
 
-    Grade 10 and below is $60/h, above it $65/h. The grade is read from the
-    subject's name, else from its students' grades in their other subjects,
-    else the $60 default the academy asked for -- a placeholder only ever
-    meant an invoice nobody could send.
+    Grade 10 and below is $60/h, above that $65/h. The grade comes from the
+    subject's name, else its students' grades in their other subjects, else
+    the $60 default the academy asked for. A placeholder only ever meant an
+    invoice nobody could send.
     """
     import tempfile
 
@@ -655,13 +672,13 @@ print(json.dumps({"results": results, "errors": errors, "on_file": on_file, "les
 
 
 def t_double_import():
-    """Two imports at the same instant put each student on file once.
+    """Two imports at the same moment put each student on file once.
 
-    A second run of the app can start while the first is still importing -- a
-    second click on "Commit import", or the app open in another tab. Side by
-    side, each checked that a new student wasn't on file yet and each added
-    them; eleven students were put on file twice that way, and one of the two
-    imports failed half way. Now the second waits for the first, and finds
+    A second run of the app can start while the first is still importing (a
+    second click on the import button, or the app open in another tab). Side
+    by side, each checked that a new student wasn't on file yet and each
+    added them; eleven students were put on file twice that way, and one
+    import failed half way. Now the second waits for the first and finds
     everything already there.
     """
     import json
@@ -754,12 +771,12 @@ print(json.dumps(result))
 
 
 def t_two_invoices_one_month():
-    """Credits come off right when a month went out as two invoices, and after a merge.
+    """Credits come off correctly when a month went out as two invoices, and after a merge.
 
-    A teacher brought on part-way through a month gives the same children a
-    second invoice for it. A class on either one missed afterwards is still
-    owed back once, off the next invoice -- including for a child whose two
-    records were merged, and whose teacher still spells them the old way.
+    A teacher who joins part-way through a month gives the same children a
+    second invoice for it. A lesson on either invoice that's missed later is
+    still owed back once, on the next invoice, including for a child whose
+    two records were merged and whose teacher still uses the old spelling.
     """
     import json
     import tempfile
@@ -833,15 +850,15 @@ print(json.dumps(result))
 
 
 def t_merge_and_name():
-    """One child on file twice is merged whole; a subject with no name gets one.
+    """One child on file twice is merged completely; a subject with no name gets one.
 
-    The search offers "Hayun Kim" and "Kim Hayun" but never two children who sat
-    a class together, which the merge refuses too. A dry run changes nothing;
-    the merged-away spelling is remembered, so next month's workbook neither
-    brings the second record back nor asks about it. An unnamed subject,
-    issued as "(unnamed class) · Sun 13:30", is named -- after its teacher
-    when another teacher already has the name -- and its issued lines take
-    the name without a cent changing.
+    The search offers "Hayun Kim" and "Kim Hayun", but never two children who
+    were in a lesson together, which the merge refuses too. A dry run changes
+    nothing. The removed spelling is remembered, so next month's workbook
+    neither brings the second record back nor asks about it. An unnamed
+    subject, invoiced as "(unnamed class) · Sun 13:30", gets a name (with its
+    teacher's name added if another teacher already uses it), and its sent
+    lines take the name without any amount changing.
     """
     import json
     import tempfile
@@ -955,7 +972,7 @@ print(json.dumps({"first": first, "second": second, "before": before, "after": a
 
 
 def t_same_name_students():
-    """Two students of one name stay in their own classes; a merge keeps the name on file."""
+    """Two students with the same name stay in their own classes; a merge keeps the name on file."""
     import json
     import tempfile
 
@@ -1145,15 +1162,16 @@ print(json.dumps(result, default=list))
 
 
 def t_reupload_same_month():
-    """Uploading an updated workbook for a month already imported touches only what changed.
+    """Uploading an updated workbook for a month already imported changes only what changed.
 
     The calendar is made to match the workbook on the days it shows, and
-    nowhere else: a class moved or dropped goes (credited if invoiced), even
-    when its subject has vanished from the upload; a class the upload writes
-    another way at the same time is left for a person; a day with no column,
-    and the rest of a month a sheet only spills into, are untouched. A child
-    written twice in a class is one place, not a crash. What the screen says
-    beforehand (plan_import) is exactly what the import does.
+    nowhere else. A lesson moved or dropped goes (credited if invoiced), even
+    when its subject has disappeared from the upload. A lesson the upload
+    writes another way at the same time is left for a person to decide. A
+    day with no column, and the rest of a month a sheet only spills into,
+    aren't touched. A child written twice in a class gets one place, not a
+    crash. What the screen says beforehand (plan_import) is exactly what the
+    import does.
     """
     import json
     import tempfile
@@ -1245,9 +1263,10 @@ def t_reupload_keeps_students_apart():
     """Two spellings on file as two students start on "keep separate" when a workbook comes back.
 
     On live, re-uploading an unchanged January started one pair on "merge":
-    two children one letter apart, one written beside the class ("Recording"),
-    so the parser didn't count them as sitting together. The default merge
-    took one child off a class they'd been billed for and credited it back.
+    two children one letter apart, one written next to the class
+    ("Recording"), so the parser didn't count them as in the lesson
+    together. The default merge took one child off a lesson they'd been
+    billed for and credited it back.
     """
     import json
     import tempfile
@@ -1293,11 +1312,12 @@ print(json.dumps({"plan": {k: plan[k] for k in ("new", "clash")}, "created": don
 
 
 def t_forecast_clash_in_one_upload():
-    """Two new lessons at one time in one upload: the screen says so before the import.
+    """Two new lessons at the same time in one upload: the screen says so before the import.
 
-    The forecast only checked lessons already on the calendar, so a class the
-    same upload had just placed never counted, and "What this changes" said
-    new where the import then refused a clash (live, a teacher's October).
+    The forecast only checked lessons already on the calendar, so a lesson
+    the same upload had just placed never counted, and "What this changes"
+    said new where the import then refused a clash (on live, a teacher's
+    October).
     """
     import json
     import tempfile
@@ -1336,10 +1356,10 @@ print(json.dumps({"september": sorted(september), "october": sorted(october), "v
 
 
 def t_month_invoices_again():
-    """A month's issued invoices can be listed again for one download, whichever browser asks.
+    """A month's sent invoices can be downloaded again in one go, from any browser.
 
-    The download after issuing lived only until the next batch: issuing
-    October took September's away. Void ones are left out -- their
+    The download after issuing only lasted until the next batch: issuing
+    October removed September's. Void invoices are left out; their
     replacement is what a parent should have.
     """
     import json
@@ -1434,13 +1454,13 @@ print(json.dumps(result, default=str))
 
 
 def t_edit_sent_invoice():
-    """A sent invoice changes only when somebody edits it, and then under a new number.
+    """A sent invoice only changes when someone edits it, and then under a new number.
 
-    Editing voids the old invoice -- what it said kept -- and issues a
-    replacement saying which one it replaces. A class not charged stays on it
-    at $0, so it is never billed again and a later absence raises no credit.
-    Nothing is refunded twice: a credit waiting for a class taken off is
-    dropped, and a payment over the new total becomes a credit instead. A
+    Editing voids the old invoice (keeping what it said) and issues a
+    replacement that says which one it replaces. A lesson not charged stays
+    on it at $0, so it's never billed again and a later absence raises no
+    credit. Nothing is refunded twice: a credit waiting for a lesson taken
+    off is dropped, and a payment over the new total becomes a credit. A
     price changed after sending is flagged until the invoice is replaced or
     kept as sent.
     """
@@ -1463,9 +1483,9 @@ def t_edit_sent_invoice():
     assert got["flagged_before"] == [], got["flagged_before"]
     assert got["flagged_after"] == sorted([nam_new, oh_new]), got["flagged_after"]
     assert got["flagged_kept"] == [oh_new], got["flagged_kept"]
-    # The class left off goes on at today's $70 and is no longer waiting to be billed.
+    # The lesson left off goes on at today's $70 and is no longer waiting to be billed.
     assert got["forgotten"] == [1, "replaced", 400.0, [], 0], got["forgotten"]
-    # Only the classes that changed move to $70; the one not charged stays at $0.
+    # Only the lessons that changed move to $70; the one not charged stays at $0.
     assert got["bulk"] == [1, 280.0, [], 20.0], got["bulk"]
     return ("replaced under a new number, old one void and kept; $0 class never credited; "
             "no double refund; overpayment a credit; a forgotten class added once; later price "
@@ -1535,13 +1555,13 @@ print(json.dumps(result, default=str))
 
 
 def t_next_invoice_number():
-    """The admin chooses the next invoice's number; one already used can be freed, never shared.
+    """The admin chooses the next invoice's number; a used one can be freed, never shared.
 
     For invoices written outside the app. A number below the app's first is
     refused, since those are the academy's earlier invoices it can't check.
-    A number in use is reported with whose it is; renumbering that invoice
-    frees it, and the credits naming it by number follow it. A free number
-    below the top is used once, then numbering returns to the top.
+    A number in use is reported with who has it; renumbering that invoice
+    frees it, and credits that mention it by number follow. A free number
+    below the top is used once, then numbering goes back to the top.
     """
     import json
     import tempfile
@@ -1662,14 +1682,14 @@ print(json.dumps(result, default=str))
 
 
 def t_class_edits():
-    """Deleting a class works where links are enforced; students keep the order added; double bookings show.
+    """Deleting a class works on Postgres; students keep their order; double bookings show.
 
     "Delete for good" deleted the class before its invoice lines, which
-    Postgres refuses -- so on the live app nothing was ever deleted. A
-    student invoiced for a deleted class is owed it back; an open charge just
-    goes. A save keeps students in the order they were added, however the
-    rows arrive. A student in two classes at once is found, whoever teaches
-    them, until one of the two is cancelled for them.
+    Postgres refuses, so on the live app nothing was ever deleted. A student
+    invoiced for a deleted class is owed it back; an open charge just goes.
+    A save keeps students in the order they were added, however the rows
+    arrive. A student in two classes at once is found, whoever teaches them,
+    until one of the two is cancelled for them.
     """
     import json
     import tempfile
@@ -1698,10 +1718,10 @@ def t_class_edits():
 def t_swapped_class_same_slot():
     """A class the workbook replaces with another at the same time is swapped, not lost.
 
-    The new class used to be refused -- the teacher already had a class at
-    that time -- and the old one was then removed as missing, so the slot
-    ended up empty: billed students credited, the class that did run never
-    charged. A true double booking is still refused and reported.
+    The new class used to be refused (the teacher already had a class at
+    that time), and the old one was then removed as missing, so the slot
+    ended up empty: billed students credited, and the class that did run
+    never charged. A real double booking is still refused and reported.
     """
     import json
     import tempfile
@@ -1721,15 +1741,15 @@ def t_swapped_class_same_slot():
 
 
 def t_cancelled_classes_credited():
-    """A class invoiced and then missed comes off the student's next invoice.
+    """A lesson invoiced and then missed comes off the student's next invoice.
 
-    The academy's rule: a cancelled class is carried forward and deducted from
-    the next invoice. Teachers record an absence either by marking the student
-    cancelled or by taking them off the lesson; both, arriving by re-upload
-    after the month was invoiced, must raise a credit for what was paid --
-    once, however often the schedule is re-uploaded -- that the next invoice
-    settles. Putting the student back takes the credit away. A cancellation
-    known before an invoice goes out is simply never charged.
+    The academy's rule: a cancelled lesson is carried forward and taken off
+    the next invoice. Teachers record an absence either by marking the
+    student cancelled or by taking them off the lesson. Either one, arriving
+    by re-upload after the month was invoiced, must raise a credit for what
+    was paid (once, however often the schedule is uploaded), which the next
+    invoice settles. Putting the student back removes the credit. A
+    cancellation known before the invoice goes out is just never charged.
     """
     import json
     import tempfile
@@ -1750,12 +1770,12 @@ def t_cancelled_classes_credited():
 
 
 def t_student_batch_matches_single():
-    """The Students screen's figures, fetched for a screen at once, match the records.
+    """The Students screen's figures, loaded for a whole screen at once, match the records.
 
-    One row's worth of figures used to cost four queries, so a screen of 25
-    students cost a hundred round trips. They are collected in one pass now,
-    which is only worth doing if it says exactly what the records do --
-    counted here straight from the tables, student by student.
+    Each row's figures used to cost four queries, so a screen of 25 students
+    was a hundred round trips. They're loaded in one pass now, which is only
+    worth it if the result is exactly right, so here they're counted
+    straight from the tables, student by student.
     """
     import db
     from sqlalchemy import func, select
@@ -1767,6 +1787,7 @@ def t_student_batch_matches_single():
     credits = db.get_student_credit_totals(ids)
     with db.SessionLocal() as session:
         def count(model, *where):
+            """Return how many rows of `model` match `where`."""
             return session.scalar(select(func.count()).select_from(model).where(*where)) or 0
         for student_id in ids:
             expected = {
@@ -1788,7 +1809,7 @@ def t_student_batch_matches_single():
 
 
 def t_korean_pdf():
-    """Korean names must survive into the PDF, not become vertical bars."""
+    """Korean names come out in the PDF as Korean, not as bars."""
     import invoice_render as ir
     import datetime as dt
     import pymupdf
@@ -1802,15 +1823,15 @@ def t_korean_pdf():
                         filetype="pdf")[0].get_text()
     for needed in ["수민", "독서반", "어머니"]:
         assert needed in text, f"{needed!r} lost in the PDF"
-    # Checked on the line, not the letterhead: the letterhead now comes
-    # from secrets and differs between a developer's machine and a test run.
+    # Checked on the invoice line, not the letterhead: the letterhead comes from
+    # secrets and differs between a developer's machine and a test run.
     assert "Upper-Sec Science" in text, "Latin broken by the CJK font"
     assert "Upper-Sec Science" in text, "mixed-script line broken"
     return "Hangul and Latin both intact in one document"
 
 
 def t_korean_real_student():
-    """The actual Korean-named student in the database."""
+    """The first student in the database with a non-English name comes out correctly in the PDF."""
     import sqlite3
     import invoice_render as ir
     import db
@@ -1836,7 +1857,7 @@ def t_korean_real_student():
 
 
 def t_png_unchanged():
-    """The CJK work must not have disturbed the image path."""
+    """Adding the Korean font didn't change the PNG output."""
     from PIL import Image, ImageChops
     import invoice_render as ir
     import datetime as dt
@@ -1845,9 +1866,9 @@ def t_png_unchanged():
     ref = SCRATCH / "before.png"
     if not ref.exists():
         return "no stored reference to compare against"
-    # The reference was rendered with the academy's real letterhead, which now
-    # comes from secrets. Against any other letterhead the images differ for a
-    # reason that has nothing to do with what this test is checking.
+    # The reference image was made with the academy's real letterhead, which comes
+    # from secrets. With any other letterhead the images differ for reasons that have
+    # nothing to do with this check.
     if ir.ACADEMY["name"] != "KS ACADEMIA PREP":
         return "skipped: reference was rendered with a different letterhead"
     SAMPLE = {

@@ -23,6 +23,7 @@ results: list[tuple[str, bool, str]] = []
 
 
 def check(name, fn):
+    """Run one check and record whether it passed, with its message."""
     try:
         results.append((name, True, fn() or ""))
     except Exception as exc:  # noqa: BLE001
@@ -30,12 +31,14 @@ def check(name, fn):
 
 
 def lesson(student, day, teacher="Teacher A", cls="G10 Math", status="Attending", hour=16):
+    """Return one past lesson row, the shape teaching.py works with."""
     return {"teacher": teacher, "class_name": cls, "date": day, "start": dt.time(hour),
             "end": dt.time(hour + 1), "student": student, "status": status}
 
 
 # ----------------------------------------------------------------- the store
 def _preview(status="Attending"):
+    """Return a small parser preview: two G10 Math lessons in May 2025."""
     return [
         {"date": dt.date(2025, 5, 3), "start_time": dt.time(16), "end_time": dt.time(18),
          "class_name": "G10 Math", "attendance": [
@@ -48,6 +51,7 @@ def _preview(status="Attending"):
 
 
 def t_history_store():
+    """Past schedules are saved once, updated in place, never billed, and can be removed."""
     db.initialise_database()
     before = db.get_analysis_data_version()
     first = db.save_lesson_history("Teacher A", _preview(), source="a.xlsx")
@@ -100,6 +104,7 @@ def t_combine_prefers_app():
 
 
 def t_monthly_activity():
+    """Each child and lesson counts once a month, and cancelled ones don't count."""
     day = dt.date(2026, 3, 2)
     app = dict(source="app")
     rows = [
