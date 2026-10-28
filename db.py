@@ -3227,20 +3227,6 @@ def sync_invoice_items(session_id):
         return "synced"
 
 
-def remove_invoice_items(session_id):
-    """Drop a deleted class from any invoice that has not been issued."""
-
-    with SessionLocal() as session:
-        for item in session.scalars(
-            select(InvoiceItem).where(InvoiceItem.session_id == session_id)
-        ).all():
-            invoice = session.get(Invoice, item.invoice_id)
-            if invoice is not None and invoice.status == "Open":
-                session.delete(item)
-        session.commit()
-        return "removed"
-
-
 def _group_invoice_items(invoice, items, lessons, classes, teachers, rate_index):
     """Group one invoice's items into billing lines, one per subject and rate.
 

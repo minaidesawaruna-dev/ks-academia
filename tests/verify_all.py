@@ -1452,7 +1452,7 @@ def t_edit_sent_invoice():
         result = run(["-c", _REPLACE_SCRIPT], {"DATABASE_URL": url})
         assert result.returncode == 0, result.stderr[-900:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
-    nam, oh, nam_new, oh_new = got["ids"]
+    _, _, nam_new, oh_new = got["ids"]
     assert got["flagged_at_first"] == [], got["flagged_at_first"]
     assert got["nam"] == ["replaced", True, 260.0, True, "Void", 390.0, True,
                           ["Discount", "G11 Test Math", "G11 Test Math", "Materials"]], got["nam"]
@@ -1822,7 +1822,7 @@ def t_korean_real_student():
     c.close()
     if not row:
         return "no non-ASCII student in the database (nothing to check)"
-    student_id, full_name = row
+    _, full_name = row
     invs = [i for i in db.get_invoices() if i.get("Student") == full_name]
     if not invs:
         inv = {"ID": 0, "Number": 0, "Student": full_name, "Status": "Issued",
