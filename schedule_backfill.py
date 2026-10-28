@@ -1,22 +1,18 @@
-"""Writes a parsed Excel schedule into the database.
+"""Saves a parsed Excel schedule into the database, and prices the subjects it brings in.
 
-``schedule_parser`` reads a workbook into sessions; this writes those sessions
-in through the same functions the Schedule tab uses, so imported data is
-indistinguishable from data typed by hand -- and admins can keep re-uploading
-the same month's workbook as they keep editing it in Excel:
+schedule_parser reads a workbook into lessons; this writes them using the
+same functions as the Schedule screen, so imported lessons are no different
+from ones added by hand. The same month can be uploaded again and again as
+the teacher keeps editing it:
 
-* A class never seen before is created, same as always.
-* A class already on the calendar (same class, date, start time) is
-  *updated* from the new parse -- roster, hours, Online/Recording/Cancelled --
-  so edits made in the spreadsheet after the first import actually land.
-* Anything only ever settable inside the app -- a class's ``Paid`` flags, its
-  free-text note -- is carried over untouched. Excel has no opinion on those.
+* A class not seen before is created.
+* A class already on the calendar (same subject, date and start time) is
+  updated from the workbook: students, times, Online/Recording/Cancelled.
+* Things only set in the app, such as Paid ticks and class notes, are kept.
 
-``AcademyClass.name`` is unique across the whole academy (not per teacher), so
-two teachers can't both have a class literally called "G11 Chem HL B" --
-``suggest_class_renames`` flags that before anything is written, and classes
-are only ever matched against the *importing* teacher's own, so a stale
-collision can never quietly attach a class to the wrong teacher.
+Subject names must be unique across the academy, so suggest_class_renames
+flags a name another teacher already uses before anything is saved, and
+classes are only ever matched against the importing teacher's own.
 """
 
 from __future__ import annotations
@@ -48,9 +44,8 @@ __all__ = [
     "plan_import",
 ]
 
-# db.py rejects a rate of zero, so an import seeds this placeholder and the
-# Invoices tab treats anything still on it as unpriced. Defined there so the
-# two can never drift apart.
+# The price an imported subject gets until someone sets a real one (db rejects $0).
+# Billing treats it as "no price".
 DEFAULT_RATE = db.UNSET_RATE
 PALETTE = [
     "#FFF2CC", "#E0F7FA", "#FCE5CD", "#F4CCCC", "#D9D2E9",
@@ -61,18 +56,16 @@ PALETTE = [
 def apply_review_decisions(
     preview: dict[str, Any], decisions: dict[int, str]
 ) -> list[dict[str, Any]]:
-    """Rewrite ambiguous-spelling pairs per the admin's merge/keep-separate choices.
+    """Apply the admin's answers to "are these two spellings the same child?".
 
-    ``decisions`` maps an index into ``preview["name_reviews"]`` to
-    ``"merge"`` or anything else (kept separate, the safe default). A merge
-    rewrites the less-used spelling onto the more-used one across every
-    session's attendance. Mutates and returns ``preview["sessions"]``.
+    `decisions` maps a question's index to "merge" or anything else (keep
+    separate). A merge changes the less used spelling to the more used one
+    in every lesson. Changes and returns preview["sessions"].
     """
     renames: dict[str, str] = {}
     reviews = preview.get("name_reviews") or []
-    # The spelling already on file wins, so the child stays the child on file:
-    # a teacher writing "Bae soojin" most weeks and "Bae Sujin" (on file)
-    # once made the merge land on the new spelling -- a second student.
+    # If one spelling is a student already on file, that one wins, so the lessons
+    # stay with the existing student instead of creating a second one.
     known = (
         {item["Name"].casefold() for item in db.get_all_students()} | set(db.get_student_aliases())
         if any(decisions.get(index) == "merge" for index in range(len(reviews))) else set()
@@ -88,8 +81,7 @@ def apply_review_decisions(
         else:
             winner, loser = (names[0], names[1]) if counts[0] >= counts[1] else (names[1], names[0])
         renames[loser.casefold()] = winner
-        # Kept for the import to remember: next month's workbook will spell
-        # the child both ways again, and shouldn't need asking.
+        # Remember the merge, so next month's workbook with both spellings isn't asked again.
         preview.setdefault("merged_spellings", {})[loser] = winner
 
     sessions = preview.get("sessions") or []
@@ -103,44 +95,30 @@ def apply_review_decisions(
 
 
 def _subject_key(name: str) -> str:
-    """A subject name reduced to what actually distinguishes it.
+    """Reduce a subject name to the letters and digits that tell it apart.
 
-    Case, spacing and punctuation all vary between one typing of a subject and
-    the next -- "G11 Math AA SL" / "G11 Math AASL", "Pre Cal 1:1" /
-    "Pre-Cal 1:1". What is left after stripping them is the thing a human
-    would call the same class.
-
-    Deliberately keeps digits and letters, so "G10 Add Math_A" and
-    "G10 Add Math_B" stay different, as do "G11" and "G12".
+    Case, spaces and punctuation are dropped, so "G11 Math AA SL" and
+    "G11 Math AASL" match. Letters and digits stay, so "G10 Add Math_A" and
+    "G10 Add Math_B" (or G11 and G12) remain different.
     """
     return re.sub(r"[^0-9a-z\uac00-\ud7a3]", "", name.casefold())
 
 
 def teacher_subjects(teacher_id: int | None) -> set[str]:
-    """A teacher's subjects on file, by name casefolded (none for a new teacher)."""
+    """Return the teacher's subjects on file, keyed by lower-case name (empty for a new teacher)."""
     teacher = next((t for t in db.get_all_teachers() if t["ID"] == teacher_id), None)
     return set(_teacher_classes(teacher)) if teacher else set()
 
 
 def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[dict[str, Any]]:
-    """Subject names in one workbook that are the same class typed two ways.
+    """Find subjects in one workbook that are the same class typed two ways.
 
-    Only names that are *identical* once case, spacing and punctuation are
-    ignored are offered -- that is a typo, not a judgement call. Anything
-    merely similar ("G9 Add math_A" vs "_B") is left alone, because those are
-    genuinely different classes and guessing would merge two teachers' worth
-    of billing into one.
-
-    ``on_file`` is the teacher's subjects already in the app (casefolded). A
-    spelling on file wins, so the upload lands on the class that has the
-    lessons. Two spellings that are both subjects on file are not offered:
-    they are two classes in the app, and merging them in an upload filed one
-    class's lessons under the other, where they clashed with themselves and
-    their changes were never applied. Names that differ only in case are
-    already one subject and are not asked about.
-
-    Nothing is merged here. Each pair is returned for a human to confirm, in
-    the same spirit as the student name reviews.
+    Only names that are identical once case, spaces and punctuation are ignored
+    count; merely similar names ("G9 Add math_A" and "_B") are different classes.
+    `on_file` is the teacher's subjects already in the app: a spelling on file
+    wins, and two spellings that are both on file are never offered (they are
+    two real classes). Nothing is merged here; each pair goes to the admin to
+    confirm.
     """
     on_file = {name.casefold() for name in on_file}
     counts: dict[str, int] = defaultdict(int)
@@ -155,8 +133,8 @@ def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[d
     for variants in grouped.values():
         if len(variants) < 2:
             continue
-        # A spelling on file first, then the one used most often; a tie falls
-        # to the longer one, which is usually the one with the spaces typed properly.
+        # Prefer a spelling on file, then the most used one; on a tie, the longer one
+        # (usually the one with proper spaces).
         variants.sort(key=lambda name: (name.casefold() not in on_file, -counts[name], -len(name), name))
         keep, *drop = variants
         for other in drop:
@@ -176,11 +154,10 @@ def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[d
 def suggest_class_renames(
     sessions: list[dict[str, Any]], teacher_name: str
 ) -> dict[str, str]:
-    """Class names already used by a *different* teacher, with a suggested fix.
+    """Find subject names another teacher already uses, and suggest a new name for each.
 
-    The academy's real invoices already suffix a subject with the teacher's
-    name for exactly this reason (e.g. "Math (Ara TR)"), so that's the
-    suggestion offered here -- the admin can still type something else.
+    The suggestion adds the teacher's name, e.g. "Math (Ms Lee)", which is how
+    the academy's own invoices tell them apart. The admin can type another name.
     """
     existing = {item["Class"].casefold(): item["Teacher"] for item in db.get_all_classes()}
     names = {session["class_name"] for session in sessions}
@@ -193,7 +170,7 @@ def suggest_class_renames(
 
 
 def grades_text(grades: list[int]) -> str:
-    """[9, 10] -> "Grades 9–10"; [9, 11] -> "Grades 9 and 11"; [12] -> "Grade 12"."""
+    """Write a list of grades for display: [9, 10] -> "Grades 9–10", [12] -> "Grade 12"."""
     if len(grades) == 1:
         return f"Grade {grades[0]}"
     if grades == list(range(grades[0], grades[-1] + 1)):
@@ -202,16 +179,15 @@ def grades_text(grades: list[int]) -> str:
 
 
 def price_rule(subjects: list[dict], rates: list[dict] | None = None) -> dict[int, tuple[float, str, bool]]:
-    """What the academy's price rule makes each subject: ``{class_id: (rate, why, certain)}``.
+    """Work out each subject's price under the academy's rule: {class_id: (rate, reason, certain)}.
 
     Grade 11 and above is $65/h, everything else $60/h. The grade comes from
-    the subject's name; failing that the subject's own price from another
-    month stands ("Basic Eng", $65 from August); failing that its students'
-    grades elsewhere decide. ``certain`` is False where it is the $60
-    default -- a group either side of the line, or nobody's grade known --
-    which only ever fills a subject that has no price, never replaces one
-    somebody chose. ``rates`` is ``db.get_all_class_rates()`` when the caller
-    already has it.
+    the subject's name; if the name has none, the subject's own price in
+    another month is used; failing that, its students' grades decide.
+    `certain` is False when it falls back to the $60 default (students on both
+    sides of the line, or no grade known); that default only fills a missing
+    price and never replaces one someone chose. Pass `rates` if you already
+    have db.get_all_class_rates().
     """
     ungraded = [item["Class ID"] for item in subjects if not standard_rate(item["Class"])]
     student_grades = db.get_subject_student_grades(ungraded) if ungraded else {}
@@ -240,13 +216,10 @@ def price_rule(subjects: list[dict], rates: list[dict] | None = None) -> dict[in
 
 
 def price_by_rule(unpriced: list[dict]) -> tuple[int, list[dict]]:
-    """Price every subject listed (from ``db.get_unpriced_subjects``) by the rule.
+    """Price every listed subject (from db.get_unpriced_subjects) by the rule, in one save.
 
-    Each from the first month it has no price, all in one commit, so nothing
-    clicked meanwhile can leave half of them priced. A subject priced again
-    part-way through -- placeholder in spring, a real price in summer,
-    placeholder again since -- still has a gap after one pass; another closes
-    it. Returns how many were priced and any still without a price.
+    Each is priced from the first month it has no price. Returns how many
+    were priced and any still left without a price.
     """
     if not unpriced:
         return 0, []
@@ -265,29 +238,26 @@ def price_by_rule(unpriced: list[dict]) -> tuple[int, list[dict]]:
 
 
 def _without_grade(name: str) -> str:
-    """A name with any grade written in front of it removed: "G5 Sohee" -> "Sohee".
+    """Remove a grade written in front of a name: "G5 Minji" -> "Minji".
 
-    A name that is nothing but a grade is left whole; reduced to "" it would
-    match every other such name.
+    A name that is only a grade is kept whole, since "" would match every
+    other such name.
     """
     stripped = re.sub(r"^(?:g|y|gr\.?|grade)\s?\d{1,2}\b[\s.:\-]*", "", name.strip(), flags=re.I)
     return stripped or name.strip()
 
 
 def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | None = None) -> list[dict[str, Any]]:
-    """Parsed names that might already be an existing student under a
-    different spelling, tag, or capitalisation -- flagged for a human
-    decision rather than either silently merging into the existing record
-    or silently creating a second one.
+    """Find names in the upload that might be a student already on file, spelled another way.
 
-    A name that already matches an existing student exactly
-    (case-insensitive) is left alone here -- there's no ambiguity to
-    resolve, same as always.
+    Each one becomes a question for the admin, instead of quietly merging or
+    quietly creating a second student. A name that matches a student exactly
+    (ignoring case) isn't asked about.
     """
     existing = db.get_all_students()
     exact = {item["Name"].casefold() for item in existing} | set(db.get_student_aliases())
-    # The teacher's own students, for names they shorten: "Hana" means
-    # their Park Hana Leong, not every Hana in the academy.
+    # The teacher's own students, for names they shorten: their "Hana" means their
+    # Park Hana, not every Hana in the academy.
     rosters = db.get_teacher_rosters(teacher_id) if teacher_id else {}
     theirs = set().union(*rosters.values()) if rosters else set()
     sounds = {item["ID"]: name_sound(item["Name"]) for item in existing}
@@ -314,8 +284,7 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
             if bare_existing == bare_new:
                 reason, ratio = "tag", 1.0
             elif _without_grade(bare_existing) == _without_grade(bare_new):
-                # A student imported as "G5 Sohee" before the parser learned
-                # to take a grade off the front of a name, now read as "Sohee".
+                # A student saved as "G5 Minji" before the parser took grades off names.
                 reason, ratio = "grade", 1.0
                 grade_matches += 1
             else:
@@ -333,11 +302,9 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
                     "tag": _suffix(name) or None,
                     "existing_tag": _suffix(existing_name) or None,
                 }
-        # Said the same way, however far apart the letters: the other order
-        # ("Kim Hayun", "Hayun Kim"), another romanisation ("Sohn Taemin",
-        # "Tae Min Sohn"), a nickname in brackets. Compared letter by letter
-        # these were never close enough to ask about, so each came in as a
-        # new student and the child's bills split in two.
+        # The same name said the same way: other word order ("Lee Minjun" / "Minjun Lee"),
+        # another romanisation, or a nickname in brackets. Letter by letter these look
+        # too different, so they used to come in as new students.
         sound = name_sound(name)
         alike = [student for student, said in sounds.items() if sound and said == sound]
         if alike and (best is None or best["reason"] == "spelling"):
@@ -353,10 +320,8 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
                     "tag": _suffix(name) or None,
                     "existing_tag": _suffix(said_same["Name"]) or None,
                 }
-        # Cut short, with an English name added, or typed a letter or two
-        # wrong, by the teacher who teaches them: taken for that student when
-        # only one of theirs fits. Said with the academy's other students in
-        # mind it would be a guess; among one teacher's, it is their student.
+        # Shortened, with an English name added, or a letter or two off, for one of this
+        # teacher's own students: taken as that student when only one fits.
         if theirs and (best is None or best["reason"] == "spelling"):
             short = [item for item in existing
                      if item["ID"] in theirs and _shortened(name, item["Name"])]
@@ -371,9 +336,8 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
                 }
                 candidates.append(best)
                 continue
-            # One letter off one of theirs, in a name too short for the check
-            # above: asked, but not assumed -- one letter is also how two
-            # siblings' names differ.
+            # One letter off a short name: asked about, but not assumed, because siblings'
+            # names can differ by one letter too.
             letter = [item for item in existing
                       if item["ID"] in theirs and _one_letter_apart(name, item["Name"])]
             if letter:
@@ -384,8 +348,8 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
                 }
                 candidates.append(best)
                 continue
-        # Written in Hangul -- "다혜" for the "Dahye" on file. Taken for her when
-        # she is the only student it fits; asked about when several do.
+        # Written in Hangul (e.g. "다혜" for "Dahye"): taken as that student if only one fits,
+        # asked about if several do.
         fits = [item for item in existing if best is None and hangul_fit(name, item["Name"])]
         if fits:
             top = max(fits, key=lambda item: hangul_fit(name, item["Name"]))
@@ -397,25 +361,18 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
             candidates.append(best)
             continue
         if best:
-            # Spelled differently but said the same -- Jaaemin and Jaemin, Kyubin
-            # and Gyubin -- and by nobody else on file: the same child, so
-            # "new person" by default would split their bills in two. Said
-            # the same as two students, it's still asked, but not assumed.
+            # Spelled differently but said the same ("Jaaemin" / "Jaemin"), and like no one
+            # else on file: start the question on "same child".
             if best["reason"] in ("spelling", "sound") and best["existing_id"] in alike:
                 best["reason"] = "sound"
-            # Only a grade apart, and from one student only: that student
-            # already has this name's invoices, so saying "new person" by
-            # default would bill every one of those classes again.
-            # A nickname added in brackets -- "Park Jisoo(Emma)" for the
-            # "Park Jisoo" on file -- is the same child, when only one
-            # student on file has that name and theirs carries no tag of its
-            # own (two tagged "Park Hana(A)" and "(B)" are two children).
-            # Not a grade in brackets, though: "Nam Jihoon(G9)" is how a
-            # teacher tells a ninth-grader from the Nam Jihoon in grade 12.
+            # Only a grade apart from one student: start on "same child", or every one of
+            # that student's billed classes would be billed again. Same for a nickname added
+            # in brackets ("Park Jisoo(Emma)"), unless the student on file has a tag of their
+            # own ("Park Hana(A)" and "(B)" are two children). A grade in brackets doesn't
+            # count as a nickname.
             nickname = (best["reason"] == "tag" and best["tag"] and not best["existing_tag"]
                         and not GRADE_TAG.match(best["tag"]) and bare_names[bare_new] == 1)
-            # A given name alone -- "Yuna" in one workbook, "Yoona" on file
-            # -- is too common a name to settle it without asking.
+            # A given name on its own ("Yuna" / "Yoona") is too common to assume.
             full_names = all(len(re.findall(r"[A-Za-z]+", without_brackets(n))) >= 2
                              for n in (name, best["existing_name"]))
             best["likely_same"] = (
@@ -435,12 +392,10 @@ def _matches_stored(
     attendance_rows: list[dict],
     current: dict[str, Any],
 ) -> bool:
-    """True when the spreadsheet says exactly what the database already holds.
+    """Return True if the workbook says exactly what the database already has for a class.
 
-    Compares only the fields an import is allowed to change -- times, status
-    and each student's condition. ``is_paid`` and the class note are
-    deliberately excluded: those belong to the app, are carried over
-    untouched by the caller, and must never make a class look "changed".
+    Only compares what an import may change: times, status and each student's
+    flags. Paid ticks and the class note belong to the app and are ignored.
     """
     if not current:
         return False
@@ -452,6 +407,7 @@ def _matches_stored(
         return False
 
     def signature(rows):
+        """Return the class's students and their flags in a form that can be compared."""
         return sorted(
             (
                 row["student_id"],
@@ -467,11 +423,10 @@ def _matches_stored(
 
 
 def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> list[dict]:
-    """Turn the parser's single status into the database's condition flags.
+    """Turn the parser's status for each student into the database's flags.
 
-    One row per student, the first written: a child listed twice in one
-    class cell -- the same name again, or two spellings of one child on
-    file -- has one place in the class, not two.
+    One row per student: if a child is listed twice in one class (same name
+    or two spellings of one child), the first entry is kept.
     """
     rows = []
     seen: set[int] = set()
@@ -494,22 +449,19 @@ def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> lis
 
 
 def _listed_twice(session: dict[str, Any], name_to_id: dict[str, int]) -> bool:
+    """Return True if the same student appears twice in one lesson."""
     ids = [name_to_id.get(entry["student_name"].casefold()) for entry in session["attendance"]]
     ids = [student_id for student_id in ids if student_id is not None]
     return len(ids) != len(set(ids))
 
 
 def _final_sessions(sessions: list[dict], name_overrides: dict[str, str]) -> tuple[list[dict], int]:
-    """The workbook's lessons under the subject names they are filed as, each once.
+    """Return the workbook's lessons under their final subject names, each once.
 
-    A month sheet usually repeats the first day or two of the next month,
-    so the same class can be parsed twice from two worksheets. Writing
-    both is pure waste, and where the two copies disagree -- typically one
-    sheet spelling a student's name differently -- they would overwrite
-    each other on every single import, forever. The parser already warns
-    that the class appears twice; here the first copy wins, so an import
-    settles instead of oscillating. Returns the lessons and how many
-    repeats were dropped.
+    A month's worksheet often repeats the first days of the next month, so
+    a lesson can be read twice from two sheets. The first copy is kept, so
+    re-imports don't keep flipping between two versions. Returns the
+    lessons and how many repeats were dropped.
     """
     final: list[dict] = []
     seen_slots: set[tuple[str, Any, Any]] = set()
@@ -524,10 +476,9 @@ def _final_sessions(sessions: list[dict], name_overrides: dict[str, str]) -> tup
 
 
 def _covered_dates(sessions: list[dict], dates) -> set[dt.date]:
-    """The days an import speaks for: the days its worksheets show, when known.
+    """Return the days this import covers: the days its worksheets show.
 
-    Without them -- a caller that picked its own lessons out of a workbook --
-    every day of each month the lessons fall in, as imports always did.
+    If those aren't known, every day of each month the lessons fall in.
     """
     if dates is not None:
         return set(dates)
@@ -540,7 +491,7 @@ def _covered_dates(sessions: list[dict], dates) -> set[dt.date]:
 
 
 def _teacher_classes(teacher: dict) -> dict[str, int]:
-    """This teacher's subjects by name, casefolded -- never another teacher's."""
+    """Return this teacher's subjects by lower-case name (never another teacher's)."""
     return {
         item["Class"].casefold(): item["ID"]
         for item in db.get_all_classes()
@@ -549,7 +500,8 @@ def _teacher_classes(teacher: dict) -> dict[str, int]:
 
 
 def _same_name_rules(teacher_id: int, students_on_file: list[dict]):
-    """Students sharing exactly one name, and where this teacher teaches each."""
+    """Return students who share exactly one name, and which of this teacher's classes each is in.
+    """
     same_name: dict[str, list[int]] = defaultdict(list)
     for item in students_on_file:
         same_name[item["Name"].casefold()].append(item["ID"])
@@ -560,12 +512,11 @@ def _same_name_rules(teacher_id: int, students_on_file: list[dict]):
 
 
 def _names_for_class(class_id, name_to_id, same_name, rosters, taught) -> dict[str, int]:
-    """Names to students for one class.
+    """Return the name-to-student map to use for one class.
 
-    Two students with exactly one name -- two girls called Hana -- can't
-    be told apart by the name, so which class they're in decides: the one
-    already in that class, else the one this teacher teaches. Picking one
-    for every class moved a child's month onto the other girl.
+    Two students with the same single name (two girls called Hana) can't be
+    told apart by name, so the class decides: the one already in that class,
+    otherwise the one this teacher teaches.
     """
     if not same_name:
         return name_to_id
@@ -580,12 +531,11 @@ def _names_for_class(class_id, name_to_id, same_name, rosters, taught) -> dict[s
 
 
 def _workbook_slots(sessions, by_class, existing):
-    """What the workbook still has, for db.workbook_drops.
+    """Return what the workbook still has, for db.workbook_drops.
 
-    Returns the subjects it contains that are already on file, each of those
-    subjects' (id, date, start), and every (date, start) it writes anything
-    at -- the last including classes whose name the import could not match,
-    so their time is never read as empty.
+    That is: the subjects in it that are already on file, each of their
+    lessons as (id, date, start), and every (date, start) it writes anything
+    at, including classes whose name couldn't be matched.
     """
     class_ids = {existing[name.casefold()] for name in by_class if name.casefold() in existing}
     keep_slots = {
@@ -597,12 +547,8 @@ def _workbook_slots(sessions, by_class, existing):
     return class_ids, keep_slots, filled_slots
 
 
-# One import at a time. A second run of the app can start while the first is
-# still busy -- a second click on "Commit import", or the app open in another
-# tab -- and two imports side by side each check that a new student isn't on
-# file yet, then each add them: eleven students were put on file
-# twice that way, a fraction of a second apart. Waiting here, the second
-# import finds everything the first one did already in place.
+# Only one import runs at a time. Two at once (a double click, or two tabs) could
+# each add the same new student, which once put eleven students on file twice.
 _ONE_IMPORT_AT_A_TIME = threading.Lock()
 
 
@@ -614,25 +560,22 @@ def backfill(
     student_matches: dict[str, int] | None = None,
     dates=None,
 ) -> dict[str, Any]:
-    """Write a parsed workbook into the database for one teacher.
+    """Save a parsed workbook into the database for one teacher.
 
-    ``dates`` are the days the uploaded worksheets show (the preview's
-    ``dates_shown``, cut to the months being imported). On those days the
+    `dates` are the days the uploaded worksheets show. On those days the
     teacher's calendar is made to match the workbook; other days are left
-    alone. Without it, every day of each month the lessons fall in.
+    alone. Without `dates`, every day of each month the lessons fall in.
 
-    ``student_matches`` maps a parsed name (casefolded) to an *existing*
-    student id -- the admin's confirmed answer to "is this really
-    so-and-so, just spelled differently", from ``suggest_student_matches``.
-    A name with no exact match and no confirmed match still gets its own
-    new student, same as always -- this only short-circuits that for names
-    the admin actually looked at and said yes to.
+    `student_matches` maps a name in the workbook (lower case) to an existing
+    student id, from the admin's answers to suggest_student_matches. Any other
+    new name becomes a new student.
     """
     with _ONE_IMPORT_AT_A_TIME:
         return _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches, dates)
 
 
 def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches, dates):
+    """Do the import for backfill(), which holds the lock. Returns what was created and changed."""
     sessions = preview.get("sessions") or []
     if not sessions:
         return {"status": "empty"}
@@ -654,15 +597,12 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             key = (session["date"].year, session["date"].month)
             warnings_by_month[key] += len(session["warnings"])
 
-    # 1. Students, so every name has an id before any class is written.
-    # Learning a just-created student's id is one indexed lookup, not a
-    # refetch of the whole students table -- with years of history that
-    # table only grows, and refetching it once per *new* student in every
-    # import is what made later imports slower than earlier ones, even
-    # though each import's own workload never changed size.
+    # 1. Students first, so every name has an id before any class is saved.
+    # A new student's id is looked up by name, not by reloading the whole students
+    # table, which grows every year.
     student_matches = student_matches or {}
-    # A spelling already known to be a student on file -- merged into them,
-    # or confirmed at an earlier import -- is them; their own name wins.
+    # A spelling already linked to a student (merged before, or confirmed at an
+    # earlier import) is that student.
     students_on_file = db.get_all_students()
     name_to_id = {**db.get_student_aliases(),
                   **{item["Name"].casefold(): item["ID"] for item in students_on_file}}
@@ -674,9 +614,8 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             if key in name_to_id:
                 continue
             if key in student_matches:
-                # The admin confirmed this spelling is an existing student --
-                # not a new one, even though it doesn't match exactly. Kept,
-                # so next month's workbook saying it again needs no asking.
+                # The admin confirmed this spelling is an existing student. Remember it, so the
+                # next workbook with the same spelling doesn't ask again.
                 name_to_id[key] = student_matches[key]
                 confirmed.append((student_matches[key], entry["student_name"]))
                 continue
@@ -691,26 +630,19 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
     if confirmed:
         db.remember_student_aliases(confirmed)
 
-    # 2. Classes, each with its own colour, created with their first class.
-    # Scoped to this teacher's own classes only, so a name that collides with
-    # a *different* teacher's class (flagged by suggest_class_renames before
-    # this ran) can never be mistaken for a match here -- it falls through to
-    # create_class_and_first_session, which rejects it as a duplicate rather
-    # than silently attaching a class to someone else's class.
+    # 2. Subjects, each with its own colour, created along with their first class.
+    # Only this teacher's subjects are matched, so a name another teacher uses never
+    # attaches a class to them; create_class_and_first_session refuses it instead.
     by_class: dict[str, list[dict]] = defaultdict(list)
     for session in sessions:
         by_class[session["class_name"]].append(session)
 
     existing = _teacher_classes(teacher)
 
-    # The workbook is the record for the days it shows, so a class that has
-    # disappeared from it -- moved to another day, or dropped -- is removed.
-    # Without this a rescheduled class would leave its old slot behind and
-    # the student would be billed for both. It is done first, before anything
-    # is added: a workbook that swaps one subject for another at the same
-    # time needs the old one gone, or the new one is refused as a clash with
-    # it and the slot ends up empty -- the old class credited, the one that
-    # ran never charged. Which lessons go is db.workbook_drops.
+    # Remove classes the workbook no longer shows on its days (moved or dropped), or
+    # the student would be billed for the old slot as well. Done before adding
+    # anything, so a subject swapped for another at the same time isn't refused as a
+    # clash. db.workbook_drops decides which lessons go.
     imported_class_ids, keep_slots, filled_slots = _workbook_slots(sessions, by_class, existing)
     reconciled = db.remove_lessons_not_in(
         teacher_id, _covered_dates(sessions, dates), keep_slots, imported_class_ids, filled_slots
@@ -742,11 +674,8 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
         start_at = 0
         if class_id is None:
             first = class_sessions[0]
-            # The academy's price follows the grade in the subject's name, so
-            # a class that says what grade it teaches arrives priced. One that
-            # does not -- "Basic Eng", a class the sheet never named -- stays
-            # on the placeholder, which billing refuses to issue at, so
-            # somebody has to choose the figure rather than inherit one.
+            # Price a new subject from the grade in its name. One with no grade (e.g. "Basic Eng")
+            # keeps the placeholder for now and is priced at the end, once its students are in.
             standard = standard_rate(class_name)
             outcome = db.create_class_and_first_session(
                 name=class_name,
@@ -762,21 +691,16 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
                 attendance_rows=_attendance_rows(first, names_here),
             )
             if outcome != "created":
-                # "teacher_conflict" means the teacher already has a class at
-                # that time -- the workbook's duplicated month-boundary
-                # columns land here, and skipping is the right answer.
-                # "duplicate" means the name still collides with another
-                # teacher's class -- an unresolved rename, so this class is
-                # skipped rather than risk attaching it to the wrong teacher.
+                # "teacher_conflict": the teacher already has a class at that time (usually a day
+                # repeated across two month sheets), so skip it. "duplicate": another teacher's
+                # subject has this name and it wasn't renamed, so skip it rather than file it
+                # under the wrong teacher.
                 created[f"class_{outcome}"] += 1
                 continue
             created["classes"] += 1
             created["sessions_created"] += 1
             period_stats[(first["date"].year, first["date"].month)]["created"] += 1
-            # One indexed lookup for the new class's id -- not a refetch of
-            # every class in the academy, which also re-runs a per-class
-            # enrolment count each time (get_all_classes' own cost grows
-            # with the *academy's* total class count, not this import's).
+            # Look up the new subject's id by name, instead of reloading every class.
             class_id = db.get_class_id_by_name(class_name)
             existing[class_name.casefold()] = class_id
             start_at = 1
@@ -807,8 +731,8 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
                     created[f"lessons_{outcome}"] += 1
                 continue
 
-            # Already on the calendar -- carry each student's Paid flag and
-            # the class's note across, since Excel has no opinion on either.
+            # Already on the calendar: keep each student's Paid tick and the class note,
+            # which the workbook doesn't have.
             current = db.get_schedule_session(existing_session_id) or {}
             paid_by_student = {
                 row["student_id"]: row["is_paid"] for row in current.get("Attendance", [])
@@ -816,11 +740,8 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             for row in attendance_rows:
                 row["is_paid"] = paid_by_student.get(row["student_id"], False)
 
-            # Re-uploading a workbook to add one class otherwise rewrites
-            # every class in it -- each one deleting and reinserting its
-            # attendance and re-syncing invoices, for no change at all.
-            # Skip the ones the spreadsheet still describes exactly as
-            # stored, comparing only what Excel actually owns.
+            # Skip a class the workbook still describes exactly as saved, so re-uploading a
+            # month to add one class doesn't rewrite all the others.
             if _matches_stored(session, status, attendance_rows, current):
                 created["sessions_unchanged"] += 1
                 continue
@@ -840,11 +761,8 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             else:
                 created[f"lessons_{outcome}"] += 1
 
-    # No subject is left on the placeholder. A name with a grade was priced
-    # as it was created; the rest are priced here, once their lessons are in
-    # and their students' grades can be read -- else the $60 default. A
-    # placeholder only ever meant an invoice nobody could send. Every class
-    # this workbook contains now, the ones just created included.
+    # Price every subject in this workbook that still has the placeholder: by its
+    # students' grades, or $60 by default. Done now that the lessons and students are in.
     imported_class_ids = {
         existing[name.casefold()] for name in by_class if name.casefold() in existing
     }
@@ -873,14 +791,15 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
 
 
 def _month_of(day: dt.date) -> tuple[int, int]:
+    """Return a date's (year, month)."""
     return day.year, day.month
 
 
 def months_found(preview: dict[str, Any]) -> list[dict[str, Any]]:
-    """Each month a parsed upload reaches, in order: its classes and days shown.
+    """List each month an upload covers, in order, with its classes and the days shown.
 
-    ``own`` is False for a month the worksheets only spill into -- the day
-    or two of the next month at the end of a month sheet.
+    `own` is False for a month the worksheets only spill into (the first day or
+    two of the next month at the end of a month sheet).
     """
     classes = Counter(_month_of(session["date"]) for session in preview.get("sessions") or [])
     days = Counter(_month_of(day) for day in preview.get("dates_shown") or [])
@@ -893,13 +812,12 @@ def months_found(preview: dict[str, Any]) -> list[dict[str, Any]]:
 
 def default_months(preview: dict[str, Any], teacher_id: int | None,
                    today: dt.date | None = None) -> list[tuple[int, int]]:
-    """The months an upload imports unless somebody says otherwise.
+    """Return the months an upload imports unless the admin picks others.
 
-    The months the app already holds for the teacher, and any after them:
-    an update, and what is coming. Not the months before -- billed outside
-    the app, so importing them would put them up for billing again -- and
-    not a month the worksheets only spill into, which is the next sheet's to
-    say. A teacher new to the app starts from this month.
+    That is the months the app already has for this teacher, and any later ones.
+    Earlier months are left out because they were billed outside the app, and
+    importing them would put them up for billing again. A month the sheets only
+    spill into is left to its own sheet. A new teacher starts from this month.
     """
     today = today or dt.date.today()
     held = db.get_teacher_months(teacher_id) if teacher_id else []
@@ -911,7 +829,7 @@ def default_months(preview: dict[str, Any], teacher_id: int | None,
 
 
 def restrict_to_months(preview: dict[str, Any], months) -> dict[str, Any]:
-    """The upload with only the chosen months' lessons, days and name questions."""
+    """Return the upload cut down to the chosen months' lessons, days and name questions."""
     months = set(map(tuple, months))
     sessions = [s for s in preview.get("sessions") or [] if _month_of(s["date"]) in months]
     names = {a["student_name"] for s in sessions for a in s["attendance"]}
@@ -932,13 +850,10 @@ def restrict_to_months(preview: dict[str, Any], months) -> dict[str, Any]:
 
 
 def mark_names_on_file(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The name questions, a pair that is two different students on file starting on "keep separate".
+    """Start the name question on "keep separate" when both spellings are already two students.
 
-    Two spellings already on file as two students were told apart before --
-    at an earlier import, or by hand. Starting that question on "merge" undid
-    it: a re-uploaded January moved a child's class onto a sibling spelled one
-    letter differently, took them off a class they had been billed for, and
-    credited it back.
+    They were told apart before (at an earlier import or by hand), so
+    defaulting to "merge" would undo that and move classes between siblings.
     """
     if not reviews:
         return reviews
@@ -958,16 +873,13 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 name_overrides: dict[str, str] | None = None,
                 student_matches: dict[str, int] | None = None,
                 dates=None, today: dt.date | None = None) -> dict[tuple[int, int], Counter]:
-    """What committing an upload would change, month by month, changing nothing.
+    """Work out what an upload would change, month by month, without saving anything.
 
-    Follows ``backfill`` step by step -- the same subject names, the same
-    students, the same lessons dropped (db.workbook_drops), the same
-    clashes -- so the screen can say before the import what the import then
-    does. Per month: "new", "changed", "unchanged", "removed", and of those
-    already invoiced "changed_invoiced" and "removed_invoiced"; "held" (only
-    its date has passed, so it is marked held -- the import counts these as
-    updated too); "clash" (the teacher already has a class at that time, so
-    it is not added) and "skipped" (another teacher's subject has that name).
+    Follows backfill step by step (same names, same students, same lessons
+    removed, same clashes) so the screen can show the result before the import.
+    For each month it counts: new, changed, unchanged, removed, changed_invoiced,
+    removed_invoiced, held (only its date has passed), clash (the teacher already
+    has a class then) and skipped (another teacher's subject has that name).
     """
     today = today or dt.date.today()
     sessions, _ = _final_sessions(preview.get("sessions") or [], name_overrides or {})
@@ -981,7 +893,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     students_on_file = db.get_all_students()
     name_to_id = {**(student_matches or {}), **db.get_student_aliases(),
                   **{item["Name"].casefold(): item["ID"] for item in students_on_file}}
-    # A name not on file becomes a new student; nobody stored can match it.
+    # A name not on file becomes a new student, so it can't match anyone saved.
     for session in sessions:
         for entry in session["attendance"]:
             name_to_id.setdefault(entry["student_name"].casefold(), -len(name_to_id) - 1)
@@ -1006,7 +918,8 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             on_calendar[day].append((lesson["Start"], lesson["End"], lesson["ID"]))
 
     def clashes(session, excluded=None):
-        # A lesson this upload adds has no id yet (None), and still takes its time.
+        # A lesson this upload adds has no id yet (None), but still takes up its time.
+        """Return True if a lesson would overlap one already on the calendar that day."""
         return any(start < session["end_time"] and end > session["start_time"]
                    and (excluded is None or lesson_id != excluded)
                    for start, end, lesson_id in on_calendar[session["date"]])
@@ -1037,7 +950,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 month["unchanged"] += 1
             elif (current["Status"], status) == ("Scheduled", "Completed") and _matches_stored(
                     session, "Scheduled", rows, current):
-                # Nothing in the workbook changed: the class's date has passed.
+                # Nothing in the workbook changed; only the class's date has passed.
                 month["held"] += 1
             elif clashes(session, excluded=current["ID"]):
                 month["clash"] += 1
