@@ -1,19 +1,14 @@
-"""Check the sign-in details before blaming the app.
+"""Check the sign-in settings on this computer, before blaming the app.
 
     python check_sign_in.py
 
-Reads the secrets you pasted into Streamlit -- from secrets-to-paste.txt if
-it is still here, otherwise from .streamlit/secrets.toml -- and checks the
-shape of it: that it parses, that the pieces the app needs are present, and
-that each stored password is a bcrypt hash rather than a password typed in
-by mistake.
+Reads secrets-to-paste.txt if it's here, otherwise .streamlit/secrets.toml,
+and checks that it parses, that everything the app needs is there, and that
+each stored password is a bcrypt hash and not a plain password.
 
-It then offers to test a password against a user's hash, so "it will not let
-me in" can be answered here in a second instead of by editing the live app
-and waiting for it to redeploy.
-
-Everything happens on this computer. Nothing is sent anywhere, the password
-is not echoed as you type, and it is not written down.
+It can then test a password against a user's hash, so "it won't let me
+in" can be checked here instead of on the live app. Nothing is sent
+anywhere, and the password isn't shown or saved.
 """
 
 from __future__ import annotations
@@ -32,6 +27,7 @@ BAD = " PROBLEM "
 
 
 def main() -> int:
+    """Run the checks and print what's right and what's wrong. Returns the exit code."""
     source = next((p for p in CANDIDATES if p.exists()), None)
     if source is None:
         print("Could not find your settings to check. Looked for:")

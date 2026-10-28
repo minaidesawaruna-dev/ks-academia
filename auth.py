@@ -1,32 +1,27 @@
-"""Sign-in gate for KS Academia.
+"""Sign-in for KS Academia: nobody sees the app without a username and password.
 
-The app holds real students' names, attendance and payment records, so it
-cannot simply be put on a URL and left there.
+The app holds students' names, attendance and payments, so it can't be
+left open on a public link. Streamlit Cloud's "private app" setting is
+not enough on its own: in testing, the running app was still reachable
+on its internal /~/+/ address with no account. So the check is done here,
+inside the app.
 
-The host's own "private app" setting is not enough on its own. Set on
-Streamlit Community Cloud, it redirects the app's front door to a sign-in
-page but still serves the running app on its internal ``/~/+/`` path, which
-was reachable from a phone on mobile data with no account at all. Access
-control therefore lives here, in the app, where it does not depend on how the
-host happens to route a request.
+require_login() runs before the database is touched or any name is
+shown, and stops the page for anyone not signed in.
 
-``require_login()`` is called before anything reads the database or draws a
-student's name, and stops the script outright for anyone not signed in.
-
-Credentials come from Streamlit's secrets, never from the repository::
+The details come from Streamlit's secrets, never from the code:
 
     [auth]
     cookie_name = "ks_academia_auth"
     cookie_key = "a-long-random-string"
     cookie_expiry_days = 30
 
-    [auth.credentials.usernames.junxi]
-    name = "Junxi"
+    [auth.credentials.usernames.admin]
+    name = "Admin"
     password = "$2b$12$....."   # bcrypt hash, never the password itself
 
-Generate the hash with ``python make_password_hash.py``, which asks for a
-password without echoing it and prints only the hash. Passwords themselves
-should never be typed into a settings page, a file, or a chat window.
+Make the hash with `python make_password_hash.py`, which asks for the
+password without showing it and prints only the hash.
 """
 
 from __future__ import annotations
@@ -45,30 +40,23 @@ COOKIE_EXPIRY_DAYS_DEFAULT = 30.0
 
 
 def _read_cookie_from_browser(model: Any) -> Callable[[], Any]:
-    """Build a replacement for the library's cookie lookup that asks the browser.
+    """Return a cookie reader for streamlit-authenticator that also asks the browser.
 
-    streamlit-authenticator 0.4 reads the "stay signed in" cookie out of
-    ``st.context.cookies`` -- the headers of the request that opened the
-    page. That works on a laptop. It does not work on Streamlit Community
-    Cloud, whose proxy strips cookies before the request reaches the app, so
-    the cookie the library set the day before is never seen again and every
-    admin is asked to sign in on every visit. The library's *setting* of the
-    cookie still works, because that goes through a small JavaScript
-    component in the page; only the reading was moved to the headers.
+    The library reads the "stay signed in" cookie from the request headers.
+    That works locally, but Streamlit Cloud strips cookies from the headers,
+    so everyone had to sign in again on every visit. This reader tries the
+    headers first, and if the cookie isn't there it asks the library's own
+    cookie component, which reads it in the browser.
 
-    So: read the headers first, which is free and correct locally, and when
-    they carry nothing ask that same component, which reads the cookie in the
-    browser and sends it back. The validation that follows is the library's
-    own -- signature checked with the secret key, expiry compared to now --
-    so a forged or stale cookie still fails.
-
-    The component answers on the run *after* it is drawn, which is why the
-    library sleeps briefly before deciding nobody is signed in; nothing here
-    changes that. ``model`` is the library's CookieModel; only its cookie
-    name, secret key and component are used.
+    The cookie is still checked the library's way (signed with the secret
+    key, not past its expiry date), so a fake or old cookie is rejected.
+    `model` is the library's CookieModel; only its cookie name, key and
+    component are used.
     """
 
     def get_cookie() -> Any:
+        """Return the signed-in user's details from the cookie, or None if there is no valid cookie.
+        """
         if st.session_state.get("logout"):
             return False
         token = None
@@ -99,7 +87,7 @@ def _read_cookie_from_browser(model: Any) -> Callable[[], Any]:
 
 
 def _plain(value: Any) -> Any:
-    """Streamlit's secrets come back as AttrDict; the library wants dicts."""
+    """Turn Streamlit's secrets (AttrDict) into plain dicts, which the library expects."""
     if hasattr(value, "items"):
         return {key: _plain(inner) for key, inner in value.items()}
     if isinstance(value, list):
@@ -108,40 +96,27 @@ def _plain(value: Any) -> Any:
 
 
 def _configuration_error(detail: str) -> None:
-    """Fail closed, telling the visitor nothing about why.
+    """Stop the app with a plain "unavailable" message when sign-in isn't set up.
 
-    Whoever hits this may well be a stranger who found the URL, so the page
-    says only that the app is unavailable. Which key is missing is a fact
-    about how the deployment is put together, and it goes to the server log,
-    where the person who can actually fix it will look.
+    The visitor might be a stranger, so the page says nothing about what is
+    missing. The details go to the server log for whoever runs the app.
     """
     print(f"[auth] refusing to start: {detail}", file=sys.stderr)
     st.error("KS Academia is unavailable.")
     st.write("Please contact the administrator.")
     st.stop()
-    # Unreachable inside a real Streamlit run, where st.stop() raises. Outside
-    # one -- a test importing this module, a bare script -- st.stop() does not
-    # halt, and execution would carry on into code that assumes a valid
-    # configuration and fail later with something misleading. Stopping has to
-    # mean stopping in both.
+    # st.stop() ends a real Streamlit run, but not a test or a plain script.
+    # Raise as well, so nothing carries on with a broken setup.
     raise RuntimeError(f"sign-in is not configured: {detail}")
 
 
 def require_login() -> stauth.Authenticate:
-    """Stop the page unless the visitor has signed in.
+    """Stop the page unless the visitor is signed in, and return the authenticator.
 
-    Returns the authenticator so the caller can offer a logout button.
-
-    Deliberately fails closed: a missing or malformed ``[auth]`` block stops
-    the app rather than letting anyone through. The alternative -- carrying
-    on when the configuration looks wrong -- is how an app ends up quietly
-    serving 170 students' payment records to the internet.
+    Fails closed: if the [auth] settings are missing or wrong, nobody gets in.
     """
-    # Reading st.secrets raises StreamlitSecretNotFoundError when no secrets
-    # exist at all, rather than behaving like an empty mapping -- so a
-    # deployment with nothing configured would show a Python traceback to
-    # whoever opened it instead of the message below. Treat any failure to
-    # read as "not configured", which lands in the same safe place.
+    # Reading st.secrets raises an error when there are no secrets at all.
+    # Treat any error here the same as "not set up".
     try:
         section = st.secrets["auth"] if "auth" in st.secrets else None
     except Exception:  # noqa: BLE001 - absent, unreadable, malformed: all the same
@@ -168,16 +143,13 @@ def require_login() -> stauth.Authenticate:
         cookie_expiry_days=float(
             config.get("cookie_expiry_days", COOKIE_EXPIRY_DAYS_DEFAULT)
         ),
-        # The stored passwords are already bcrypt hashes. Leaving auto_hash on
-        # would hash the hash and nobody would ever be able to sign in.
+        # The stored passwords are already bcrypt hashes; auto_hash would hash them again
+        # and nobody could sign in.
         auto_hash=False,
     )
 
-    # Without this, the deployed app forgets everyone between visits: the
-    # host never lets the library see the cookie it set. See the helper.
-    # Reaching into the library's internals is the price of fixing it from
-    # out here, so a version that moves them costs only the convenience of
-    # staying signed in -- never the ability to sign in at all.
+    # Swap in the cookie reader above, so "stay signed in" works on Streamlit Cloud.
+    # If the library is laid out differently, sign-in still works; staying signed in doesn't.
     try:
         cookie_model = authenticator.cookie_controller.cookie_model
         cookie_model.get_cookie = _read_cookie_from_browser(cookie_model)
@@ -206,26 +178,12 @@ def require_login() -> stauth.Authenticate:
 
 
 def logout_button(authenticator: stauth.Authenticate) -> None:
-    """A way out, in the sidebar, plus who is currently signed in.
-
-    Worth having on a shared machine at the front desk: without it the cookie
-    keeps whoever logged in last signed in for a month.
-    """
-    # Two things here are deliberate and easy to "tidy" into breakage:
-    #
-    # There is no `with st.sidebar:` wrapper, because logout(location=
-    # "sidebar") already calls st.sidebar.button internally; wrapping it
-    # nests the sidebar inside itself and renders nothing at all.
-    #
-    # The library's logout is used rather than a hand-rolled button, because
-    # dropping the cookie is what actually signs someone out and its cookie
-    # controller does that properly. Clearing session state alone achieves
-    # nothing -- the cookie signs them straight back in on the next rerun.
-    #
-    # The try/except keeps a decorative button from being able to take the
-    # page down; logout raises if there is no session, which happens when a
-    # test imports this module outside a Streamlit run. The real gate is
-    # require_login, above.
+    """Show who is signed in and a Sign out button in the sidebar."""
+    # Use the library's logout (it deletes the cookie). Clearing session state alone
+    # doesn't sign anyone out: the cookie signs them back in on the next rerun.
+    # No `with st.sidebar:` here, because logout(location="sidebar") already puts
+    # the button in the sidebar. The try/except is for tests run outside Streamlit,
+    # where logout raises.
     name = st.session_state.get("name") or st.session_state.get("username")
     if name:
         st.sidebar.caption(f"Signed in as {name}")

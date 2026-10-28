@@ -1,14 +1,11 @@
-"""Clickable month grid.
+"""Draws the clickable month grid on the Schedule screen.
 
-Draws the schedule and returns the id of any class clicked, so the editor
-below the grid follows the pointer instead of making the user find the same
-class twice.
+Clicking a class sends its id back, so the class editor under the grid
+opens that class. The grid shows classes (one dated lesson each),
+coloured by subject.
 
-A *subject* is the recurring thing a teacher teaches; a *class* is one dated
-sitting of it. The grid shows classes, coloured by their subject.
-
-The frontend is ``grid_component/index.html`` -- plain HTML, CSS and
-JavaScript, no build step.
+The front end is grid_component/index.html: plain HTML, CSS and
+JavaScript, with no build step.
 """
 
 from __future__ import annotations
@@ -28,6 +25,7 @@ _component = None
 
 
 def _declare():
+    """Register the grid component the first time it is needed, and return it."""
     global _component
     if _component is None:
         if not COMPONENT_DIR.is_dir():
@@ -45,15 +43,16 @@ def lessons_to_payload(
     student_notes: dict[int, str] | None = None,
     unpaid: dict[int, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Shape classes for the frontend, naming only students with something set."""
+    """Turn classes into the data the grid draws: times, colour, notes and every student with their flags.
+    """
     class_notes = class_notes or {}
     student_notes = student_notes or {}
     unpaid = unpaid or {}
     payload = []
 
     for lesson in lessons:
-        # Every student on the card, not only the exceptions: the roster is
-        # what the card is for, and a plain name reads as "was in the room".
+        # List every student, not only those marked online, recording or cancelled.
+        # A plain name means the student was in class.
         marked = []
         for row in lesson.get("Attendance") or []:
             note = row.get("note") or student_notes.get(row.get("student_id"), "")
@@ -96,11 +95,10 @@ def render_month_grid(
     unpaid: dict[int, int] | None = None,
     key: str = "month_grid",
 ) -> dict | None:
-    """Draw the grid; return the click, if any.
+    """Draw the grid and return the class that was clicked, if any.
 
-    The return carries a nonce as well as the class id, so clicking the same
-    class twice is two distinct values.  Returning the id alone made a repeat
-    click look unchanged to Streamlit, which then did not rerun.
+    The value includes a random token as well as the class id, so clicking
+    the same class twice still counts as a new click and Streamlit reruns.
     """
     value = _declare()(
         lessons=lessons_to_payload(lessons, class_notes, student_notes, unpaid),

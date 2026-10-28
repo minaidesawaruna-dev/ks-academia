@@ -2,15 +2,13 @@
 
     python make_password_hash.py
 
-It asks for the password without echoing it, and prints only the hash. The
-password itself is never written to a file, never stored, and never appears
-on screen -- paste the hash into Streamlit's secrets and the password stays
-in the head of whoever chose it.
+Asks for the password without showing it and prints only the hash, so the
+password itself is never saved anywhere.
 
 The output looks like::
 
-    [auth.credentials.usernames.junxi]
-    name = "Junxi"
+    [auth.credentials.usernames.admin]
+    name = "Admin"
     password = "$2b$12$......"
 """
 
@@ -27,6 +25,8 @@ import streamlit_authenticator as stauth
 
 
 def main() -> int:
+    """Ask for a username and password, then print and save the secrets block. Returns the exit code.
+    """
     print(__doc__.split("The output looks like")[0].strip())
     print()
 
@@ -68,9 +68,8 @@ def main() -> int:
         lines.append("")
         lines.append("[auth]")
         lines.append('cookie_name = "ks_academia_auth"')
-        # Signs the "stay signed in" cookie. Anyone holding it could mint a
-        # cookie for any user, so it is generated here rather than being a
-        # memorable string, and it belongs only in the secrets page.
+        # The key that signs the "stay signed in" cookie. Anyone with it could fake a
+        # sign-in, so it is random and only ever goes in the secrets page.
         lines.append(f'cookie_key = "{secrets.token_urlsafe(32)}"')
         lines.append("cookie_expiry_days = 30")
         lines.append("")
@@ -79,9 +78,8 @@ def main() -> int:
     lines.append(f'password = "{hashed}"')
     block = "\n".join(lines) + "\n"
 
-    # Written to a file as well as printed: copying cleanly out of a console
-    # window is fiddly, and this has to arrive in the Secrets box byte for
-    # byte or the app will not start. Gitignored -- it holds the database URL
+    # Also save it to a file, since copying from a console window is fiddly and it has
+    # to be pasted exactly. The file is in .gitignore: it holds the database URL
     # and a password hash.
     out = Path(__file__).resolve().parent / "secrets-to-paste.txt"
     out.write_text(block, encoding="utf-8")
@@ -103,8 +101,7 @@ def main() -> int:
     print("The hash is safe to paste. Your password is not -- do not send it")
     print("to anyone, and do not put it in a chat window.")
 
-    # Only when a person is actually sitting there. Run from a script or a
-    # pipe, opening an editor would hang waiting for a window nobody sees.
+    # Only open the file in an editor when someone is at the keyboard.
     if sys.stdin.isatty():
         try:
             subprocess.run(["notepad.exe", str(out)], check=False)

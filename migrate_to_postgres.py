@@ -1,19 +1,11 @@
-"""Copy the local SQLite database into a fresh Postgres one, once.
-
-Run this after creating the Postgres database but before pointing the app at
-it:
+"""Copy the local SQLite database into a new, empty Postgres database (one time only).
 
     python migrate_to_postgres.py "postgresql://user:pass@host/db?sslmode=require"
 
-The copy goes through SQLAlchemy's table metadata rather than raw SQL, which
-matters more than it looks: SQLite keeps dates, times and booleans as text
-and integers, and only the typed metadata knows that ``session_attendance.
-present`` is a boolean rather than the number 1. Reading through the same
-Table objects the app uses gets every column converted on the way out and
-adapted again on the way in.
-
-Tables are copied in ``sorted_tables`` order, which SQLAlchemy sorts by
-foreign key dependency, so parents land before the rows that reference them.
+Rows are copied through the app's own SQLAlchemy tables, so dates, times
+and true/false values (stored as text and numbers in SQLite) come out as
+the right types in Postgres. Tables are copied parents first, so every
+row a record points to already exists.
 """
 
 from __future__ import annotations
@@ -30,20 +22,17 @@ CHUNK = 1000
 
 
 def normalise(url: str) -> str:
-    """Accept the ``postgres://`` scheme the hosts still hand out."""
+    """Change a postgres:// address (still given out by some hosts) to postgresql://."""
     if url.startswith("postgres://"):
         return url.replace("postgres://", "postgresql://", 1)
     return url
 
 
 def reset_sequences(connection) -> None:
-    """Point each identity sequence past the ids we just inserted.
+    """Move each id counter past the ids just copied in.
 
-    Copying rows with explicit primary keys does not advance Postgres'
-    sequences -- they still sit at 1. Without this the first invoice an admin
-    creates after the move collides with invoice number 1 and the insert
-    fails on a duplicate key, which is a baffling thing to hit a week later
-    with no idea it traces back to the migration.
+    Inserting rows with their ids doesn't move Postgres' counters, so without
+    this the first new record after the move would reuse id 1 and fail.
     """
     for table in db.Base.metadata.sorted_tables:
         for column in table.primary_key.columns:
@@ -53,8 +42,7 @@ def reset_sequences(connection) -> None:
             ).scalar()
             if sequence is None:
                 continue
-            # is_called=false on an empty table, so the next id is 1 rather
-            # than 2; true otherwise, so the next id is max+1.
+            # For an empty table the next id is 1; otherwise it is the highest id + 1.
             connection.execute(
                 text(
                     f"SELECT setval('{sequence}', "
@@ -66,6 +54,8 @@ def reset_sequences(connection) -> None:
 
 
 def main() -> int:
+    """Copy every table from the local SQLite file into the given Postgres database. Returns the exit code.
+    """
     if len(sys.argv) > 1:
         target_url = sys.argv[1]
     else:
@@ -79,9 +69,8 @@ def main() -> int:
         print(f"Refusing to run: target is not Postgres ({target_url[:30]}...)")
         return 2
 
-    # db was imported with DATABASE_URL unset, so db.engine is the local
-    # SQLite file. Guard rather than assume -- running this against a
-    # Postgres source would copy the deployed data over itself.
+    # The source must be the local SQLite file. Run against Postgres, this would copy
+    # the live data over itself.
     if db.engine.dialect.name != "sqlite":
         print("Refusing to run: DATABASE_URL is set, so the source is not SQLite.")
         print("Unset it so this reads the local file.")
@@ -97,8 +86,8 @@ def main() -> int:
     db.Base.metadata.create_all(target)
 
     with target.begin() as tconn:
-        # A non-empty target almost certainly means this ran already. Copying
-        # again would double every row rather than fail loudly.
+        # Refuse a target that already has rows: it means this has run before, and copying
+        # again would duplicate everything.
         for table in db.Base.metadata.sorted_tables:
             existing = tconn.execute(select(func.count()).select_from(table)).scalar()
             if existing:
