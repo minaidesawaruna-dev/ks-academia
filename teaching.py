@@ -1,10 +1,9 @@
-"""What the academy taught: every lesson on record, month by month.
+"""Counts what was taught each month, for the Teaching view on the Data tab.
 
-Pure functions over plain lesson rows -- no Streamlit, no database -- so the
-same code reads the app's own records, past schedules kept for analysis, or a
-hand-built table in a test. A lesson row is a dict with ``teacher``,
-``class_name``, ``date``, ``start``, ``end``, ``student`` and ``status`` (one
-of the parser's Attending / Online / Recording / Cancelled).
+The functions here only take plain lists of lesson rows, so they work the same
+on lessons from the app, on past schedules, or on test data. Each row is a dict
+with: teacher, class_name, date, start, end, student and status (Attending,
+Online, Recording or Cancelled).
 """
 
 from __future__ import annotations
@@ -18,18 +17,18 @@ from typing import Any
 import schedule_parser
 from schedule_parser import CANCELLED
 
-# The same few thousand names come round once per lesson; cleaning them up
-# again each time was most of the time this took.
+# Names repeat on every lesson, so cache the cleaned-up version of each one.
 normalise_name = lru_cache(maxsize=65536)(schedule_parser.normalise_name)
 
 
 def _said_alike(written: str, on_file: str) -> bool:
-    """Whether two spellings are one child: the upload screen's own tests -- the
-    same name said another way, cut short or with a name added, a letter or two
-    off, a bracketed tag apart, a Hangul name that fits the English one -- plus
-    the two ways teachers shorten a name within one class: the given name alone
-    with its syllables spaced ("Tae woo" for Jang Taewoo), or with a letter
-    off ("Dahey" for Kim Dahye)."""
+    """Return True if two spellings are probably the same child.
+
+    Uses the same checks as the upload screen (word order, romanisation, a
+    letter or two off, a Hangul name against an English one), plus two short
+    forms teachers use: the given name split in two ("Tae woo" for Jang
+    Taewoo), or the given name with a letter off ("Dahey" for Kim Dahye).
+    """
     sound = schedule_parser.name_sound(written)
     if ((sound and sound == schedule_parser.name_sound(on_file))
             or schedule_parser._bare(written) == schedule_parser._bare(on_file)
@@ -40,11 +39,11 @@ def _said_alike(written: str, on_file: str) -> bool:
             or schedule_parser.hangul_fit(on_file, written)):
         return True
     mine, theirs = schedule_parser._name_words(written), schedule_parser._name_words(on_file)
-    # Folded as one word, since "Tae woo" folds differently syllable by syllable.
+    # Join the letters into one word first, so "Tae woo" becomes "taewoo".
     joined = schedule_parser._fold("".join(re.findall(r"[A-Za-z]+", schedule_parser.without_brackets(written))))
     if len(mine) >= 2 and len(theirs) >= 2 and len(joined) >= 4 and joined in theirs:
         return True
-    # And the other way: "Minjae" for Min Jae Choi.
+    # The other way round: "Minjae" written for Min Jae Choi.
     raw = re.findall(r"[A-Za-z]+", schedule_parser.without_brackets(on_file))
     if len(mine) == 1 and len(joined) >= 5 and any(
             schedule_parser._fold(raw[i] + raw[i + 1]) == joined for i in range(len(raw) - 1)):
@@ -55,19 +54,18 @@ def _said_alike(written: str, on_file: str) -> bool:
 
 
 def link_spellings(app_lessons: list[dict], history_lessons: list[dict]) -> dict[tuple[str, str], str]:
-    """Past-schedule spellings of children the app holds under another name.
+    """Match past-schedule spellings to the name the app uses for that child.
 
-    Learned only from lessons in both -- same teacher, date and start. On such
-    a lesson, a name the past schedule has and the app doesn't is tied to the
-    one name the app has and the past schedule doesn't that passes
-    ``_said_alike``. Never tied: a spelling that is itself a student's name in
-    the app (another "Hana" may be exactly who it means), or one that points
-    at two different students anywhere. A wrong tie would merge two children,
-    so a spelling nothing ties stays as written.
+    Only lessons found in both (same teacher, date and start time) are used.
+    On such a lesson, a name that only the past schedule has is linked to the
+    one name that only the app has, if _said_alike says they match. A
+    spelling is never linked if it is already a student's name in the app,
+    or if it would match two different students.
 
-    Returns ``{(teacher casefolded, spelling normalised): the app's name}``.
+    Returns {(teacher in lower case, cleaned spelling): name in the app}.
     """
     def roster(rows):
+        # The names on each lesson, keyed by (teacher, date, start).
         out: dict[tuple, dict[str, str]] = defaultdict(dict)
         for row in rows:
             key = normalise_name(row["student"])
@@ -93,15 +91,14 @@ def link_spellings(app_lessons: list[dict], history_lessons: list[dict]) -> dict
 
 
 def combine(app_lessons: list[dict], history_lessons: list[dict]) -> tuple[list[dict], dict]:
-    """Every lesson once, taken from the app wherever the app has the month.
+    """Merge app lessons and past-schedule lessons so each lesson counts once.
 
-    A month the app holds for a teacher is the app's alone: that teacher's
-    past schedules for the month are left out. The past schedules are often a
-    later copy of the workbook the app imported, so taking both would count a
-    moved lesson twice, and a child written one way in each as two children.
-    Past schedules fill in only the months the app doesn't have, with any
-    spelling that ``link_spellings`` ties to an app student written the app's
-    way, so the same child is one student from their first lesson on record.
+    If the app has a teacher's month, that month comes from the app only and
+    the past schedule for it is skipped. (Past schedules are often a later
+    copy of the same workbook, so using both would double count.) Past-schedule
+    names that link_spellings matched are changed to the app's spelling.
+
+    Returns the merged rows and some counts shown on the screen.
     """
     held = {(row["teacher"].casefold(), row["date"].year, row["date"].month) for row in app_lessons}
     links = link_spellings(app_lessons, history_lessons)
@@ -121,19 +118,16 @@ def combine(app_lessons: list[dict], history_lessons: list[dict]) -> tuple[list[
 
 
 def monthly_activity(lessons: list[dict]) -> dict[str, list[dict[str, Any]]]:
-    """What was taught each month: students, lessons and teaching hours.
+    """Count students, lessons and teaching hours for each month and each teacher.
 
-    From every lesson on record -- the app's and past schedules alike -- so a
-    month billed outside the app still counts. A student marked cancelled
-    didn't come and isn't counted; a lesson nobody came to isn't either. A
-    lesson's hours are the teacher's time, counted once however many came.
-    A child taught by two teachers is one student in the academy's month and
-    one in each teacher's. Past schedules name a teacher as the workbook did
-    ("Jason"); they're matched to the app's spelling of the same teacher.
+    - Cancelled places are not counted, and nor is a lesson nobody came to.
+    - A lesson's hours count once, however many students were in it.
+    - A student taught by two teachers counts once in the academy's total.
+    - Teacher names from past schedules are changed to the app's spelling.
 
-    Returns ``{"by_month": [...], "by_teacher": [...]}``, one row per month,
-    and per teacher per month.
+    Returns {"by_month": [...], "by_teacher": [...]}.
     """
+    # Use the app's spelling of each teacher's name where there is one.
     spelling = {row["teacher"].casefold(): row["teacher"] for row in lessons}
     for row in lessons:
         if row.get("source") == "app":
@@ -149,6 +143,7 @@ def monthly_activity(lessons: list[dict]) -> dict[str, list[dict[str, Any]]]:
             continue
         teacher = spelling[row["teacher"].casefold()]
         month = (row["date"].year, row["date"].month)
+        # One entry per lesson, so its hours are only added once.
         lesson = (teacher, row["date"], row["start"])
         if lesson not in taught:
             start = row["start"].hour * 60 + row["start"].minute
@@ -165,6 +160,7 @@ def monthly_activity(lessons: list[dict]) -> dict[str, list[dict[str, Any]]]:
         })
         row["Lessons"] += 1
         row["Hours"] += lesson["hours"]
+    # Add the teacher rows up into one row per month for the whole academy.
     by_month: dict[tuple, dict] = {}
     for (teacher, month), row in by_teacher.items():
         total = by_month.setdefault(month, {
