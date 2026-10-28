@@ -1,38 +1,31 @@
-"""Parser for the KS Academia teacher schedule workbooks.
+"""Reads the teachers' Excel schedule workbooks into lessons.
 
-The workbooks are calendar grids rather than tables:
+The workbooks are calendars, not tables:
 
-* Usually each worksheet is one month (``Aug``, ``Sep``, ``July`` ...).
-  Some teachers keep several months, or a whole year, on one sheet
-  (``Jan- Feb 2026``, ``2026``): the months then sit side by side, each
-  named in the row above its day labels (``JAN.2026``, ``FEB``, ``SEP``).
-* One header row holds day labels such as ``15(SAT)``.  A day label is
-  usually merged over two columns: the first column holds the class cell,
-  the second holds status cells (Online / Recording / Cancelled).
-* One or more columns hold the 30 minute time axis and are repeated across
-  the sheet purely for readability.
-* A class cell looks like::
+* Usually each worksheet is one month ("Aug", "Sep", "July"...). Some
+  teachers keep several months, or a whole year, on one sheet ("Jan- Feb
+  2026", "2026"); each month is then named in the row above its day labels
+  ("JAN.2026", "FEB").
+* One row holds day labels like "15(SAT)", each usually merged over two
+  columns: the class goes in the first, statuses (Online / Recording /
+  Cancelled) in the second.
+* One or more columns hold the half-hour time axis.
+* A class cell looks like:
 
       G11 Chem HL B
       9am-11am
       Nam Jihoon
       Oh Minseok
-      ...
 
-* A status cell looks like::
+* A status cell looks like:
 
       Recording
       Yoon Chaewon
       Nam Jihoon
 
-  and may contain several labelled sections in one cell.
+  and can hold several labelled sections.
 
-The public API is intentionally small:
-
-``get_sheet_names(source)``
-``infer_month(sheet_name)``
-``parse_schedule(source, sheet_name, year)``
-``parse_workbook(source, sheet_names, year)``
+Main functions: get_sheet_names, infer_month, parse_schedule, parse_workbook.
 """
 
 from __future__ import annotations
@@ -69,16 +62,15 @@ ONLINE = "Online"
 RECORDING = "Recording"
 CANCELLED = "Cancelled"
 
-# Order matters: "cancel" is checked first so that a line such as
-# "Cancelled online class" is treated as a cancellation.
+# Order matters: "cancel" is checked first, so "Cancelled online class" counts as cancelled.
 STATUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (CANCELLED, re.compile(r"cancel+ed|cancell?ed|cancel|취소|결석", re.I)),
-    # "ONLIN" and "REC" as teachers shorten them: "Sohee(ONLIN)", "Yerin(REC)".
+    # Also the short forms teachers write: "Sohee(ONLIN)", "Yerin(REC)".
     (ONLINE, re.compile(r"on\s*-?\s*line|(?<![a-z])onlin(?![a-z])|zoom|온라인", re.I)),
     (RECORDING, re.compile(r"record(?:ing|ed)?|(?<![a-z])rec(?![a-z])|녹화|영상", re.I)),
 )
 
-# Words that may sit beside a status keyword without being a student name.
+# Words that can sit next to a status word and aren't a student's name.
 _LABEL_FILLER = {
     "review",
     "only",
@@ -95,7 +87,7 @@ _LABEL_FILLER = {
 # Regular expressions
 # --------------------------------------------------------------------------
 
-# "15(SAT)", and "3(Thu)" with "ONLINE" beside or under it for a day taught online.
+# A day label: "15(SAT)", or "3(Thu)" with "ONLINE" next to or under it for a day taught online.
 DAY_HEADER_RE = re.compile(
     r"^\s*(?P<day>\d{1,2})\s*[\(\[]?\s*(?P<dow>[A-Za-z]{2,9})?\.?\s*[\)\]]?"
     r"(?:\s*(?P<mode>(?i:online|zoom)|온라인))?\s*$"
@@ -118,8 +110,8 @@ WEEKDAYS = {
     "sun": 6, "sunday": 6,
 }
 
-# Month words as they appear in sheet names and in the labels above a month's
-# day columns, lower-case, longest first so "june" is tried before "jun".
+# Month words as written in sheet names and month labels, lower case, longest first
+# (so "june" is tried before "jun").
 MONTH_NUMBERS = {
     **{calendar.month_name[index].lower(): index for index in range(1, 13)},
     **{calendar.month_abbr[index].lower(): index for index in range(1, 13)},
@@ -128,11 +120,9 @@ MONTH_NUMBERS = {
 _MONTH_WORD = "|".join(sorted(MONTH_NUMBERS, key=len, reverse=True))
 _MONTH_WORD_RE = re.compile(rf"(?<![a-z])(?:{_MONTH_WORD})(?![a-z])")
 
-# A month label must *start* with its month -- "JAN.2026", " MARCH 2026",
-# "8월", "2026 JAN" -- because the rest of the cell is often a note, and notes
-# are full of other dates ("APRIL / 5월2일-6월4일 한국출국") that must not be
-# read as the month. "5월2일" on its own is a date, not a month, hence the
-# lookahead. Matched against lower-cased text.
+# A month label has to start with the month ("JAN.2026", "8월", "2026 JAN"), because the
+# rest of the cell is often a note full of other dates. "5월2일" alone is a date, not a
+# month, hence the lookahead. Matched against lower-case text.
 MONTH_LABEL_RE = re.compile(
     r"^[\s\W_]*"
     r"(?:(?P<lead>(?:19|20)\d{2})\s*년?[\s.\-/]*)?"
@@ -140,10 +130,9 @@ MONTH_LABEL_RE = re.compile(
     r"(?:[\s.,/\-]*(?P<year>(?:19|20)\d{2})(?!\d))?"
 )
 
-# Words that make a line a class rather than a person. Each word is checked
-# piece by piece ("Lang&Lit" is "lang" and "lit"). A grade or a subject word
-# is enough on its own; a school code or a two-letter IB tag only supports
-# one, because on its own it could as easily be part of a name.
+# Words that make a line a class name rather than a student. A grade or subject word
+# is enough on its own; a school code or two-letter IB tag only counts next to one,
+# since alone it could be part of a name.
 _STRONG_SUBJECT = {
     "math", "maths", "mathematics", "eng", "english", "econ", "econs", "economics",
     "chem", "chemistry", "bio", "biology", "phys", "physics", "science", "sci",
@@ -158,17 +147,16 @@ _WEAK_SUBJECT = {"sl", "hl", "aa", "ai", "ee", "ia", "ap", "sat", "pre", "cal", 
                  "sjii", "acsi", "sas", "ofs", "sais", "nlcs", "cis", "tts"}
 _GRADE_WORD = re.compile(r"^(?:g|y|gr)\d{1,2}$")
 
-# Cells that sit on the schedule but are not lessons anyone is billed for.
+# Cells on the schedule that aren't billable lessons: meetings, consultations, assistant shifts.
 NON_LESSON_RE = re.compile(r"(?i)meeting|consult|interview|상담|설명회|보조\s*강사|회의|면접")
 
-# Things written onto a student's line that are not part of their name.
+# Extra things written on a student's line that aren't part of their name.
 _GRADE_PREFIX = re.compile(r"^(?:g|y|gr\.?|grade)\s?(?P<grade>\d{1,2})\b[\s.:\-]*(?P<rest>.+)$", re.I)
 _UNTIL_NOTE = re.compile(
     r"^(?P<name>.+?)\s+(?P<note>(?:until|till|til|from|after|before|left at|came at)\b.*\d.*)$",
     re.I)
 _SLASH_NOTE = re.compile(r"^(?P<name>.+?)\s*/\s*(?P<note>half|late|early|trial|make-?up)$", re.I)
-# "Sohee,nam" is one student -- given name, then the surname in lower case --
-# not Sohee and a second student called "nam".
+# "Sohee,nam" is one student (given name, then surname in lower case), not two.
 _SURNAMES = frozenset(
     "kim lee yi rhee park pak bak choi choe jung jeong chung kang cho jo yoon yun "
     "jang chang lim im han oh seo suh shin sin kwon hwang ahn an song yoo yu ryu "
@@ -177,29 +165,27 @@ _SURNAMES = frozenset(
     "gong kong yeo choo tak ma gil seok hyun hyeon sim shim".split()
 )
 _AWAY_NOTE = re.compile(r"여행|한국|휴가|병가|아파|출국|귀국")
-# Words that make a free-standing note an absence worth putting in front of whoever imports:
+# Words that make a note under the grid an absence worth showing at import:
 # "안옴" didn't come, "없었음" wasn't there, "참여불가" can't attend, "스킵" skip,
 # "필드트립" field trip, "학교행사" school event, "한국행"/"출국" off to Korea.
-# A bare "없음" is left out -- "답변없음" is no reply, "필요없음" not needed.
+# A bare "없음" is left out ("답변없음" means no reply).
 _ABSENCE_WORD = re.compile(
     r"(?i)결석|병가|아파|캔슬|휴가|여행|불참|취소|absent|cancel|안\s*옴|안\s*왔|없었|\s없음"
     r"|참여\s*(?:불가|안\s*함)|스킵|skip|트립|(?<![a-z])trip|학교\s*행사|출국|한국행"
 )
-# Of those, the words that say the student was absent. "한국" (in Korea) and
-# the rest only say where someone was -- they may well have joined online.
-# "Seo Yerin(Absent)", "Oh Minseok없었음" (wasn't there), "결석" (absent), "안옴"
-# (didn't come), "불참" (didn't attend) were read as attending, and billed;
-# the Hangul runs on to the end of the word, so "없었음" is taken whole.
+# Of those, the words that mean the student was absent. "한국" (in Korea) and the like
+# only say where someone was; they may have joined online. Examples: "Seo Yerin(Absent)",
+# "Oh Minseok없었음", "결석" (absent), "불참" (didn't attend). The Hangul match runs to the
+# end of the word, so "없었음" is taken whole.
 _ABSENT_NOTE = re.compile(
     r"(?:병가|아파|캔슬|휴가|여행|결석|없었|안\s*옴|안\s*왔|불참)[\uac00-\ud7a3]*|absent\w*",
     re.I,
 )
-# A bracket that holds a grade -- "Nam Jihoon(G9)" -- tells one child of a
-# name from another, the opposite of a nickname.
+# A grade in brackets ("Nam Jihoon(G9)") tells two children with one name apart;
+# it isn't a nickname.
 GRADE_TAG = re.compile(r"(?i)^\s*(?:g|gr\.?|grade|y|yr|year)\s*\d{1,2}\s*$")
 
-# Zero-width and non-breaking characters that survive copy-paste into Excel and
-# make two visually identical names compare as different strings.
+# Invisible characters that come in with copy-paste and make identical-looking names differ.
 INVISIBLE = dict.fromkeys(
     map(ord, "\u2060\u200b\u200c\u200d\ufeff\u00a0"), " "
 )
@@ -213,7 +199,7 @@ MERGE_THRESHOLD = 0.88
 
 
 def _as_stream(source: Any) -> io.BytesIO:
-    """Accept raw bytes, a path, or a file-like object."""
+    """Return something readable from raw bytes, a file path or an open file."""
     if isinstance(source, (bytes, bytearray)):
         return io.BytesIO(bytes(source))
     if hasattr(source, "read"):
@@ -228,45 +214,50 @@ def _as_stream(source: Any) -> io.BytesIO:
         return io.BytesIO(handle.read())
 
 
-# "6pm7.30pm": two times with the dash between them left out.
+# "6pm7.30pm": two times with the dash missing.
 _JOINED_TIMES = re.compile(
     r"(?i)(\d{1,2}(?:[.:]\d{2})?\s*[ap]\.?\s?m\.?)\s*(?=\d{1,2}(?:[.:]\d{2})?\s*[ap]\.?\s?m)"
 )
 
 
-# "9.30m - 11am": the a or p of am/pm dropped, leaving a lone m before the dash.
+# "9.30m - 11am": the a or p of am/pm left out.
 _STRAY_M = re.compile(r"(?i)(?<![\d.:])(\d{1,2}(?:[.:]\d{2})?)\s*m(?=\s*[-~‐-―])")
 
 
 def _cell_lines(value: Any) -> list[str]:
+    """Split a cell into its non-empty lines, fixing common time typos ("6pm7.30pm", "9.30m")."""
     if not isinstance(value, str):
         return []
     return [_JOINED_TIMES.sub(r"\1-", _STRAY_M.sub(r"\1", line.strip()))
             for line in value.splitlines() if line.strip()]
 
 
-# Anything in round or square brackets: a nickname, a tag, a grade, a note.
-# The group is what is inside.
+# Anything in round or square brackets: a nickname, tag, grade or note.
+# The group is what's inside.
 _BRACKETED = re.compile(r"[\(\[]([^\)\]]*)[\)\]]")
 
 
 def without_brackets(text: str, replacement: str = " ") -> str:
-    """``text`` with every bracketed part -- "(Emily)", "[UWC D]" -- taken out."""
+    """Return the text with every bracketed part ("(Emily)", "[UWC D]") removed."""
     return _BRACKETED.sub(replacement, text)
 
 
 def normalise_name(name: str) -> str:
-    """Lower-case, drop bracketed aliases and punctuation, collapse spaces."""
+    """Return a name in a form for comparing: lower case, no brackets or punctuation, single spaces.
+    """
     text = without_brackets(name.translate(INVISIBLE))
     text = re.sub(r"[^\w\s\uac00-\ud7a3]", " ", text, flags=re.UNICODE)
     return re.sub(r"\s+", " ", text).strip().lower()
 
 
 def _name_key(name: str) -> tuple[str, ...]:
+    """Return a name's words in sorted order, so word order doesn't matter."""
     return tuple(sorted(normalise_name(name).split()))
 
 
 def looks_like_name(text: str) -> bool:
+    """Return True if the text could be a person's name (has letters and isn't just filler words).
+    """
     cleaned = text.strip()
     if len(cleaned) < 2:
         return False
@@ -285,12 +276,10 @@ UNNAMED_CLASS = "(unnamed class)"
 
 
 def infer_month(sheet_name: str) -> int:
-    """Return the 1-12 month number encoded in a worksheet name.
+    """Return the month number (1-12) a worksheet's name gives.
 
-    A name that spans several months -- "Jan- Feb 2026", "FEB-MAR 2026",
-    "2026(1-7월)" -- means the sheet *starts* at the first of them and its
-    day columns roll forward from there, so the first month wins. Taking a
-    later one dates every lesson on the sheet a month or more late.
+    A name covering several months ("Jan- Feb 2026", "2026(1-7월)") gives the
+    first one, since the sheet's day columns start from there.
     """
     text = str(sheet_name).strip().lower()
     if not text:
@@ -302,14 +291,13 @@ def infer_month(sheet_name: str) -> int:
         if 1 <= month <= 12:
             return month
 
-    # Whole month words, earliest in the name first: "Summary June" is June,
-    # not the "mar" buried inside "summary".
+    # Whole month words, earliest first: "Summary June" is June, not the "mar" inside "summary".
     words = [(match.start(), MONTH_NUMBERS[match.group(0)])
              for match in _MONTH_WORD_RE.finditer(text)]
     if words:
         return min(words)[1]
 
-    # Anything else keeps the old reading: a month anywhere in the text.
+    # Otherwise, any month found anywhere in the text.
     candidates: list[tuple[int, int]] = []
     for index in range(1, 13):
         for label in (calendar.month_name[index], calendar.month_abbr[index]):
@@ -331,23 +319,17 @@ def infer_month(sheet_name: str) -> int:
 
 
 def infer_year(sheet_name: str, fallback: int) -> int:
-    """The year a worksheet names, or ``fallback`` when it names none.
+    """Return the year a worksheet's name gives, or `fallback` if it gives none.
 
-    Some workbooks keep years apart by sheet -- "2026.Jun", "2025.Dec" -- and
-    span two or three of them in one file. Taking the year from the name means
-    those sheets land on the right dates instead of every one of them being
-    forced into whichever year was picked on the upload form, which silently
-    moves a class onto the wrong day of the week.
-
-    Only a full four-digit year counts. A trailing "26" could as easily be a
-    day or a class number, and guessing wrong is worse than asking.
+    Some workbooks have sheets for different years ("2026.Jun", "2025.Dec").
+    Only a four-digit year counts: a trailing "26" could be a day or a class number.
     """
     match = re.search(r"(19|20)\d{2}", str(sheet_name))
     return int(match.group(0)) if match else int(fallback)
 
 
 def _sheet_years(sheet_name: str) -> set[int]:
-    """Every year a worksheet's name gives, with "2025-26" counting as both."""
+    """Return every year a sheet name gives; "2025-26" gives both."""
     text = str(sheet_name)
     years = {int(y) for y in re.findall(r"(?<!\d)((?:19|20)\d{2})(?!\d)", text)}
     for first, second in re.findall(r"(?<!\d)((?:19|20)\d{2})\s*[-~/]\s*(\d{2})(?!\d)", text):
@@ -356,11 +338,10 @@ def _sheet_years(sheet_name: str) -> set[int]:
 
 
 def read_month_label(value: Any) -> tuple[int, int | None] | None:
-    """``(month, year or None)`` for a label above a month's columns, else None.
+    """Read a month label above a month's columns: (month, year or None), or None if it isn't one.
 
-    Several teachers keep many months -- or a whole year -- on one sheet, side
-    by side, each named in the row above its day labels: "JAN.2026",
-    "FEB 2026", "JUNE", "AUG(8/26, 8/29~9/2)". See MONTH_LABEL_RE.
+    Used for sheets that hold several months side by side, labelled e.g.
+    "JAN.2026", "FEB 2026", "JUNE". See MONTH_LABEL_RE.
     """
     if not isinstance(value, str):
         return None
@@ -378,11 +359,10 @@ def read_month_label(value: Any) -> tuple[int, int | None] | None:
 
 
 def _month_labels(worksheet, header_row: int) -> tuple[int | None, list[tuple[int, int, int | None, str]]]:
-    """The row of month labels above the day labels, read left to right.
+    """Find the row of month labels above the day labels, read left to right.
 
-    Returns ``(row, [(column, month, year or None, text), ...])`` for the row
-    above the day labels holding the most month labels, or ``(None, [])``
-    when there is none -- as when the day labels are themselves in row 1.
+    Returns (row, [(column, month, year or None, text), ...]) for the row with
+    the most labels, or (None, []) if there isn't one.
     """
     best_row, best = None, []
     for row in range(1, header_row):
@@ -398,7 +378,7 @@ def _month_labels(worksheet, header_row: int) -> tuple[int | None, list[tuple[in
 
 
 def _weekday_agreement(columns, days, month: int, year: int) -> int:
-    """How many of these day labels name the right weekday for that month."""
+    """Count how many of these day labels give the right weekday for that month and year."""
     agree = 0
     for column in columns:
         day, dow = days[column]
@@ -414,26 +394,23 @@ def _weekday_agreement(columns, days, month: int, year: int) -> int:
 def _plan_months(sheet_name, label_row, labels, days, name_month, year):
     """Decide which month and year each day column belongs to.
 
-    Returns ``(blocks, notes)``. A block is a run of day columns read as one
-    month -- rolling into the next where the day numbers restart, as always
-    -- with ``hint`` saying where its month and year came from, for the
-    weekday-mismatch warning. ``notes`` are ``(row, column, message)``.
+    Returns (blocks, notes). A block is a run of day columns read as one month
+    (rolling into the next month where the day numbers start again); `hint`
+    says where its month and year came from, for the weekday warning. Notes
+    are (row, column, message).
 
-    With no month labels, or a single label on a sheet whose name gives a
-    month, the whole sheet is one block dated by its name: exactly how every
-    one-month-per-sheet workbook has always been read, so none of them
-    changes. Otherwise each label starts a block running to the next label.
+    With no month labels, or one label on a sheet whose name gives the month,
+    the whole sheet is one block dated by its name, as one-month sheets have
+    always been read. Otherwise each label starts a block that runs to the next.
     """
     columns = sorted(days)
     named_years = _sheet_years(sheet_name)
     notes: list[tuple[int | None, int | None, str]] = []
 
     if name_month is None and not named_years:
-        # Only a sheet named for its year ("2026", "2026(1-7월)") is read by
-        # its labels. Anything else with no month in its name -- "세미나",
-        # "Holiday", a student list -- is not a schedule, however much it
-        # looks like one: a seminar sign-up sheet has day labels and a "JAN"
-        # above them, and importing it would bill everyone who came.
+        # Only a sheet named after its year ("2026", "2026(1-7월)") is read by its labels.
+        # Anything else with no month in its name (a seminar sign-up, a holiday list) isn't a
+        # schedule, even with day labels, and importing it would bill whoever is on it.
         return [], [(None, None,
                      "skipped — the worksheet name gives neither a month nor a "
                      "year; a sheet holding several months should be named for "
@@ -455,8 +432,7 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
                               f"{calendar.month_name[label_month]}, but the worksheet "
                               f"is named for {name}; read as {name}."))
             if label_year is not None and not named_years:
-                # "Jan" with "Jan 2025" above it: the name has no year, the
-                # label does, and the label beats the year on the upload form.
+                # A month label with a year ("Jan 2025") beats the year chosen on the upload form.
                 block_year, hint = label_year, f"check the month label '{text}'"
             elif label_year is not None and label_year not in named_years:
                 notes.append((label_row, column,
@@ -465,7 +441,7 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
         block = {"columns": columns, "month": name_month, "year": block_year,
                  "hint": hint, "label": None}
         if not named_years and not (labels and labels[0][2] is not None):
-            # Nothing on the sheet says which year; only the upload form does.
+            # Only the upload form gives the year; check it against the weekdays.
             _fit_year_to_weekdays([block], days, year, notes)
         return [block], notes
 
@@ -482,10 +458,9 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
                        "explicit": label_year is not None,
                        "label": text, "label_column": column})
 
-    # A block labelled with a year the sheet isn't for -- "Jan 2025" at the
-    # start of the "2026" sheet -- is a leftover copied from elsewhere; the
-    # same block turns up, cell for cell, in several teachers' workbooks.
-    # Importing it would invent lessons, so it is skipped, and said so.
+    # A block labelled with a different year from the sheet's ("Jan 2025" on the "2026"
+    # sheet) is a leftover copied from elsewhere. Skip it, with a note, so it doesn't
+    # create lessons that never happened.
     kept = []
     for block in blocks:
         if block["explicit"] and named_years and block["year"] not in named_years:
@@ -500,8 +475,8 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
     if not blocks:
         return [], notes
 
-    # Fill in missing years from the nearest labelled one, stepping over a
-    # year end whenever the month goes backwards (DEC then JAN).
+    # Fill in missing years from the nearest labelled block, adding a year whenever the
+    # month goes backwards (DEC then JAN).
     anchor = next((i for i, block in enumerate(blocks) if block["explicit"]), None)
     guessed = anchor is None and not named_years
     if anchor is None:
@@ -522,11 +497,11 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
                              else f"check the month label '{block['label']}' and its year")
 
     if guessed:
-        # No label and no worksheet name gives a year; the weekdays can.
+        # No label or sheet name gives a year, so let the weekdays decide.
         _fit_year_to_weekdays(blocks, days, year, notes)
 
-    # Day columns before the first label have no month of their own. They
-    # are nearly always the month before it, but the weekday labels decide.
+    # Day columns before the first label usually belong to the month before it, but the
+    # weekday labels decide.
     if blocks[0]["label"] is None and len(blocks) > 1:
         lead, first = blocks[0], blocks[1]
         if (_weekday_agreement(lead["columns"], days, first["month"], first["year"])
@@ -542,22 +517,19 @@ def _plan_months(sheet_name, label_row, labels, days, name_month, year):
 
 
 def _fit_year_to_weekdays(blocks, days, form_year: int, notes) -> None:
-    """Move a guessed year to the one the day labels actually fit.
+    """Change a guessed year to the one the weekday labels fit.
 
-    Every day label names its weekday -- "3(TUE)" -- and a date falls on a
-    given weekday in only one of any three neighbouring years. So when
-    neither the labels nor the worksheet name write a year, and the year
-    came off the upload form, the weekdays settle it: a wrong form year
-    otherwise dates every lesson on the sheet a year out. The year only
-    moves when the guess fits at most half the labelled days and exactly
-    one neighbouring year fits every one of them -- a few mistyped labels
-    never move it.
+    Each day label gives a weekday ("3(TUE)"), and a date falls on that weekday
+    in only one of three neighbouring years. When the year only came from the
+    upload form, it moves if it fits at most half the labelled days and exactly
+    one neighbouring year fits all of them. A few mistyped labels never move it.
     """
     labelled = sum(1 for block in blocks for column in block["columns"] if days[column][1])
     if labelled < 2:
         return
 
     def misfits(delta: int) -> int:
+        """Count the day labels whose weekday is wrong if the year moves by `delta`."""
         return sum(
             len(_resolve_dates({column: days[column] for column in block["columns"]},
                                block["month"], block["year"] + delta)[1])
@@ -580,7 +552,8 @@ def _fit_year_to_weekdays(blocks, days, form_year: int, notes) -> None:
 
 
 def _months_label(months: list[tuple[int, int]], fallback: int | None) -> str:
-    """"August", "Jan–Sep 2026" or "Jun 2025 – Jan 2026", for the summary table."""
+    """Return a short label for the summary table: "August", "Jan–Sep 2026" or "Jun 2025 – Jan 2026".
+    """
     months = sorted(set(months))
     if not months:
         return calendar.month_name[fallback] if fallback else "—"
@@ -593,18 +566,16 @@ def _months_label(months: list[tuple[int, int]], fallback: int | None) -> str:
 
 
 def _repair_time_range(start, end, grid_time, rows, step_minutes):
-    """Put right a time range that can't be what the teacher meant.
+    """Fix a time range that can't be what the teacher meant, using the grid as a check.
 
-    A range that ends before it starts, or runs past five hours, is almost
-    always a slip: "11.30pm-1.30pm" on the 11:30 row, "12.30am-2.30pm" on the
-    12:30 row. The grid is the second opinion. Moving one end by twelve hours
-    is accepted only when that puts the start on the row the cell sits on and
-    leaves a sensible length; failing that, a backwards range whose start
-    matches its row takes its end from how many rows the cell spans.
+    A range that ends before it starts, or runs over five hours, is usually a
+    typo ("11.30pm-1.30pm" on the 11:30 row). Moving one end by 12 hours is
+    accepted only if it puts the start on the cell's row and gives a sensible
+    length; otherwise a backwards range whose start matches its row takes its
+    end from how many rows the cell covers.
 
-    Returns ``(start, end, message or None)``, or None when a backwards range
-    has no safe reading -- it would bill as nothing, so it must not slip
-    through as though it were fine. A long range with no fix is kept, flagged.
+    Returns (start, end, message or None), or None when a backwards range
+    can't be fixed safely. A long range with no fix is kept and flagged.
     """
     base = dt.date(2000, 1, 1)
     begin, finish = dt.datetime.combine(base, start), dt.datetime.combine(base, end)
@@ -641,6 +612,7 @@ def _repair_time_range(start, end, grid_time, rows, step_minutes):
 
 
 def _to_time(hour: int, minute: int, meridiem: str | None) -> dt.time:
+    """Build a time from hour, minute and am/pm (if given)."""
     if meridiem:
         flag = meridiem.replace(".", "").replace(" ", "").lower()
         if flag.startswith("p") and hour != 12:
@@ -652,7 +624,7 @@ def _to_time(hour: int, minute: int, meridiem: str | None) -> dt.time:
 
 
 def parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
-    """Parse ``9am-11am`` / ``11.15am-1.15pm`` / ``5pm-6.30pm`` style ranges."""
+    """Read a time range like "9am-11am", "11.15am-1.15pm" or "5pm-6.30pm"."""
     match = TIME_RANGE_RE.search(text)
     if not match:
         return None
@@ -667,7 +639,7 @@ def parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
     start_flag = match.group("sap")
     end_flag = match.group("eap")
 
-    # Academy hours run 08:00-22:00, so infer the missing am/pm marker.
+    # Lessons run 08:00-22:00, so work out a missing am/pm from that.
     if start_flag is None and end_flag is None:
         start_flag = "am" if start_hour >= 8 and start_hour != 12 else "pm"
         end_flag = "am" if end_hour >= 8 and end_hour != 12 and end_hour > start_hour else "pm"
@@ -690,7 +662,7 @@ def parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
 
 
 def _is_time_line(line: str) -> bool:
-    """True when the line is only a time range (not a class name)."""
+    """Return True if the line is only a time range (not a class name)."""
     match = TIME_RANGE_RE.search(line)
     if not match:
         return False
@@ -699,7 +671,7 @@ def _is_time_line(line: str) -> bool:
     return remainder == ""
 
 
-# The grade a class name carries, and what the academy charges for it.
+# The grade in a class name, and the price per hour for it.
 _GRADE_RE = re.compile(r"(?i)(?<![a-z])g(?:rade)?\s?(\d{1,2})(?!\d)")
 _IB_YEAR_RE = re.compile(r"(?i)(?<![a-z])y(\d)(?!\d)")
 _IB_YEAR_GRADE = {3: 9, 4: 10, 5: 11, 6: 12}
@@ -708,7 +680,7 @@ SENIOR_RATE = 65.0     # Grade 11 and above
 
 
 def grade_of(class_name: str) -> int | None:
-    """The school grade a class name gives: "G11 Econs HL" -> 11, "Y3(G9) ACSI" -> 9."""
+    """Return the school grade a class name gives: "G11 Econs HL" -> 11, "Y3(G9) ACSI" -> 9."""
     match = _GRADE_RE.search(class_name or "")
     if match and 1 <= int(match.group(1)) <= 13:
         return int(match.group(1))
@@ -717,25 +689,22 @@ def grade_of(class_name: str) -> int | None:
 
 
 def rate_for_grade(grade: int) -> float:
-    """The academy's hourly price for a grade: $60 to Grade 10, $65 from Grade 11."""
+    """Return the price per hour for a grade: $60 up to Grade 10, $65 from Grade 11."""
     return JUNIOR_RATE if grade <= 10 else SENIOR_RATE
 
 
 def standard_rate(class_name: str) -> float | None:
-    """The academy's price for a class, from the grade in its name.
+    """Return the standard price for a class from the grade in its name, or None.
 
-    Grade 10 and below is charged at ``JUNIOR_RATE``, Grade 11 and above at
-    ``SENIOR_RATE``. A name with no grade in it -- "Basic Eng", a class the
-    sheet never named -- has no standard price, and ``None`` keeps it on the
-    placeholder so somebody has to choose one rather than have a figure
-    nobody picked go out on an invoice.
+    A name with no grade ("Basic Eng", an unnamed class) gets None, so it keeps
+    the placeholder until someone chooses a price.
     """
     grade = grade_of(class_name)
     return None if grade is None else rate_for_grade(grade)
 
 
 def _own_tagged_status(text: str, status: str) -> dict[str, Any] | None:
-    """One student with their status in brackets -- "Jihoon(당일취소)" -- or None."""
+    """Read one student with their status in brackets, e.g. "Jihoon(당일취소)", or return None."""
     tag = _BRACKETED.search(text)
     if not tag or status_from_line(tag.group(1))[0] != status:
         return None
@@ -747,7 +716,7 @@ def _own_tagged_status(text: str, status: str) -> dict[str, Any] | None:
 
 
 def _status_part(part: str, current: str | None, notes: list[str]) -> list[dict[str, Any]]:
-    """The students one comma-separated part names, with any status of its own."""
+    """Return the students named in one comma-separated part, with any status of their own."""
     own, rest = status_from_line(part)
     tagged = _own_tagged_status(part, own) if own else None
     if tagged:
@@ -757,14 +726,13 @@ def _status_part(part: str, current: str | None, notes: list[str]) -> list[dict[
 
 
 def status_from_line(line: str) -> tuple[str | None, str]:
-    """Return ``(status, leftover_text)`` for a possible status label line."""
+    """Read a line that may be a status label: returns (status, the rest of the text)."""
     for status, pattern in STATUS_PATTERNS:
         match = pattern.search(line)
         if match:
             leftover = (line[: match.start()] + " " + line[match.end():]).strip()
-            # Drop the brackets the status word sat in -- "Sohee(ONLINE)" --
-            # but keep a real tag: "Sohee(G6) ONLINE" must stay "Sohee(G6)",
-            # not lose its closing bracket to a blanket strip.
+            # Remove the brackets a status word sat in ("Sohee(ONLINE)"), but keep a real tag:
+            # "Sohee(G6) ONLINE" must stay "Sohee(G6)".
             leftover = re.sub(r"[\(\[]\s*[\)\]]", " ", leftover).strip(" -:/,.")
             opened = leftover.count("(") + leftover.count("[")
             closed = leftover.count(")") + leftover.count("]")
@@ -779,7 +747,7 @@ def status_from_line(line: str) -> tuple[str | None, str]:
             ]
             return status, leftover if tokens else ""
 
-    # Catch single-word typos such as "Reording" or "Onilne".
+    # Catch one-word typos such as "Reording" or "Onilne".
     token = re.sub(r"[^a-z]", "", line.lower())
     if len(token) >= 5:
         for status, keyword in ((CANCELLED, "cancelled"), (ONLINE, "online"), (RECORDING, "recording")):
@@ -795,7 +763,7 @@ def status_from_line(line: str) -> tuple[str | None, str]:
 
 
 def _subject_strength(word: str) -> int:
-    """2 for a grade or subject word, 1 for a school code or IB tag, else 0."""
+    """Score a word: 2 for a grade or subject word, 1 for a school code or IB tag, else 0."""
     if word.strip() == "1:1":
         return 1
     best = 0
@@ -810,17 +778,20 @@ def _subject_strength(word: str) -> int:
 
 
 def _is_subject_line(line: str) -> bool:
+    """Return True if the line has a grade or subject word, so it's a class name."""
     return any(_subject_strength(word) == 2 for word in line.split())
 
 
 def _is_person_line(line: str) -> bool:
+    """Return True if the line looks like a student's name (no digits, no subject words)."""
     untagged = without_brackets(line)
     return (looks_like_name(line) and not re.search(r"\d", untagged)
             and not any(_subject_strength(word) for word in untagged.split()))
 
 
 def _split_subject_line(line: str) -> tuple[str, str | None]:
-    """"UWC Lang&Lit Jihoon" -> ("UWC Lang&Lit", "Jihoon"): a name typed onto a class."""
+    """Split a student's name off a class line: "UWC Lang&Lit Jihoon" -> ("UWC Lang&Lit", "Jihoon").
+    """
     words = line.split()
     last = max((i for i, word in enumerate(words) if _subject_strength(word)), default=None)
     if last is None or last == len(words) - 1:
@@ -829,23 +800,24 @@ def _split_subject_line(line: str) -> tuple[str, str | None]:
     return (" ".join(words[: last + 1]), rest) if _is_person_line(rest) else (line, None)
 
 
-# A note typed into brackets on a student's line -- "(5pm-7pm KR) Lee Hana",
-# "Hana(1시간)" one hour, "Hana(13일보강)" make-up on the 13th, "Hana(시간잘못보고옴)"
-# came at the wrong time -- as opposed to a tag that tells two children apart:
-# "(G9 UWC D)", "(G7)", "(Emma)". Left on the name, each note made a new student.
+# A note typed in brackets on a student's line, e.g. "(5pm-7pm KR) Lee Hana",
+# "Hana(1시간)" (one hour), "Hana(13일보강)" (make-up on the 13th). Not the same as a tag
+# that tells two children apart, e.g. "(G9 UWC D)", "(G7)", "(Emma)". Left on the name,
+# each note would create a new student.
 _NOTE_IN_BRACKETS = re.compile(
-    # 예정 "planned", 체험 "trial", 미정 "not decided": short, but notes, not a Korean name.
+    # 예정 "planned", 체험 "trial", 미정 "not decided": short words, but notes, not names.
     r"(?i)보강|시간|결석|늦|일찍|잘못|예정|체험|미정|\d+\s*일|\d\s*(?:[.:]\s*\d+)?\s*[ap]\.?\s?m|\bKR\b|[가-힣]{5,}"
 )
-# "Ayoon 보강": Ayoon, at a make-up class.
+# "Bomi 보강": Bomi, at a make-up class.
 _TRAILING_NOTE = re.compile(r"\s+(보강)\s*$")
 
 
 def _take_name_notes(part: str) -> tuple[str, str | None]:
-    """``part`` without the notes typed onto it, and those notes (or None)."""
+    """Return the name part with any notes typed on it removed, and those notes (or None)."""
     taken: list[str] = []
 
     def take(match: re.Match) -> str:
+        """Keep a bracketed part as part of the name, or take it out as a note."""
         inside = match.group(1).strip()
         leading = match.start() == 0 and part[match.end():].strip()
         if leading or _NOTE_IN_BRACKETS.search(inside):
@@ -863,16 +835,15 @@ def _take_name_notes(part: str) -> tuple[str, str | None]:
 
 
 def _roster_names(line: str, notes: list[str]) -> list[tuple[str, str | None, str | None]]:
-    """The students one roster line names, as ``[(name, note, status), ...]``.
+    """Return the students one roster line names, as [(name, note, status), ...].
 
-    Teachers write more than a name on a student's line, and each extra is a
-    student or a bill that doesn't exist: "Jihoon,Yerin" is two students, not
-    one called "Jihoon,Yerin"; "G5 Sohee" is Sohee, in grade 5, not a
-    different Sohee each school year; "Minseok until 8pm" and "Minseok/half"
-    are Minseok with a note. A student marked off sick or away -- "Sohee(병가)",
-    "수민여행" -- stays on the roster as a cancellation (``status``), so they
-    are neither billed as present nor silently dropped. A part that is no
-    name at all -- "2명적용", someone "in Korea" -- goes to ``notes``.
+    Teachers write more than a name on a student's line:
+    - "Jihoon,Yerin" is two students;
+    - "G5 Sohee" is Sohee, in grade 5;
+    - "Minseok until 8pm" and "Minseok/half" are Minseok with a note;
+    - "Sohee(병가)" (sick) or "수민여행" (travelling) stays on the roster as
+      cancelled, so they're neither billed nor dropped;
+    - a part that isn't a name at all ("2명적용", someone "in Korea") goes to notes.
     """
     parts = [part.strip() for part in re.split(r"\s*[,，]\s*", line) if part.strip()]
     if (len(parts) == 2 and " " not in parts[0] and parts[1].islower()
@@ -918,11 +889,11 @@ _AMPM = re.compile(r"(?i)\d\s*(?:[.:]\s*\d{2})?\s*[ap]\.?\s?m")
 
 
 def _time_trailer(after: str):
-    """What follows a lesson time on its line, or None if it can't follow one.
+    """Read what follows a lesson time on its line, or None if nothing valid can follow it.
 
-    ``("none", None)``, ``("note", None)`` for a room or a slip of the keyboard
-    ("11층", "(6pm KR)", the "m" of "5pm-6.30m"), ``("status", STATUS)`` for
-    "ONLINE", or ``("names", text)`` for students.
+    Returns ("none", None); ("note", None) for a room or typo ("11층", "(6pm KR)",
+    the stray "m" in "5pm-6.30m"); ("status", STATUS) for "ONLINE"; or
+    ("names", text) for students.
     """
     if not after:
         return ("none", None)
@@ -938,14 +909,13 @@ def _time_trailer(after: str):
 
 
 def _time_on_line(line: str):
-    """The lesson time a line holds, as ``(time_range, class_text, trailer)``, else None.
+    """Find a lesson time on a line: (time_range, class_text, trailer), or None.
 
-    The time usually has a line of its own. Some teachers put more on it: the
-    class before it ("G12 Chem HL 1.30pm-3.30pm", "관리수업11am-1pm"), students
-    or a status after it ("2pm-4pm Nam Jihoon", "4pm-5.30pm ONLINE"), a room
-    ("10am-1.30pm 11층"). Only a time with am or pm counts when it shares a
-    line, and only beside a class, a name, a status or a room -- so a date in
-    a note, or a shift such as "TA 9am-4pm", never turns into a lesson.
+    The time usually has its own line, but some teachers add more: the class
+    before it ("G12 Chem HL 1.30pm-3.30pm"), students or a status after it
+    ("2pm-4pm Nam Jihoon", "4pm-5.30pm ONLINE"), or a room. On a shared line
+    only a time with am/pm counts, and only next to a class, name, status or
+    room, so a date in a note or a "TA 9am-4pm" shift never becomes a lesson.
     """
     if _is_time_line(line):
         parsed = parse_time_range(line)
@@ -964,12 +934,11 @@ def _time_on_line(line: str):
 
 
 def _is_remark(line: str) -> bool:
-    """A line that is plainly a note rather than something the parser failed to read.
+    """Return True if a line is clearly a note, not something the parser failed to read.
 
-    A reminder with a date or time in it, someone being away, a meeting or an
-    assistant's shift. A line holding an am/pm time range is *not* a remark
-    unless it is one of those: it may be a lesson in a layout not yet known,
-    and that is worth a warning.
+    E.g. a reminder with a date or time, someone being away, a meeting or an
+    assistant's shift. A line with an am/pm time range isn't a note unless it
+    is one of those, since it may be a lesson in a layout not seen before.
     """
     if NON_LESSON_RE.search(line) or re.match(r"\s*TA\b", line):
         return True
@@ -980,16 +949,13 @@ def _is_remark(line: str) -> bool:
 
 
 def parse_cell(text: str) -> dict[str, Any]:
-    """Split a calendar cell into class name, time range and student entries.
+    """Split a class cell into its class name, time range and students.
 
-    Returns ``{"class_lines", "time_range", "entries", "notes"}`` where each
-    entry is ``{"name", "status"}`` and ``status`` is ``None`` for a plain
-    roster line.
+    Returns {"class_lines", "time_range", "entries", "notes"}; each entry is
+    {"name", "status"}, with status None for a plain student line.
     """
-    # Two classes can share a cell, an empty line between them, each with its
-    # own time. Only the first is this cell's lesson -- a teacher's schedule
-    # holds one class at a time -- so the rest is handed back for a warning
-    # instead of being read as more students of the first.
+    # Two classes can share one cell, separated by an empty line. Only the first is this
+    # cell's lesson; the rest is returned for a warning, not read as more students.
     extra_classes: list[str] = []
     if isinstance(text, str):
         chunks = re.split(r"\n[ \t]*\n", text)
@@ -1027,9 +993,8 @@ def parse_cell(text: str) -> dict[str, Any]:
             body = ([student] if student else []) + body[1:]
         elif (len(class_lines) > 1 and not body and _is_subject_line(class_lines[0])
               and all(_is_person_line(line) for line in class_lines[1:])):
-            # The student written above the time: "G6 Math 1:1 / Sohee / 2pm-3.30pm".
-            # Only when nothing follows the time; otherwise a class name's
-            # second line has to stay part of the class name.
+            # The student written above the time: "G6 Math 1:1 / Sohee / 2pm-3.30pm". Only when
+            # nothing follows the time; otherwise that line is the class name's second line.
             body = class_lines[1:]
             class_lines = class_lines[:1]
 
@@ -1039,22 +1004,19 @@ def parse_cell(text: str) -> dict[str, Any]:
 
     for line in body:
         if _is_time_line(line):
-            # A second time among the students -- those who joined late. It
-            # is not a student; the lesson keeps the cell's first time.
+            # A second time among the students (those who joined late) isn't a student.
+            # The lesson keeps the cell's first time.
             notes.append(line)
             continue
         status, leftover = status_from_line(line)
         if status is not None:
             if not leftover:
-                # A label on its own line -- "Online" -- and the students under it.
+                # A status label on its own line ("Online") applies to the students under it.
                 current_status = status
                 continue
-            # Several students on the line, and the word after one of them --
-            # "Minseok 결석, Yerin", "Sohee(online), Yerin" -- is that one's
-            # alone: Yerin was there, in the room. Carried across the line it
-            # cancelled a student who came, or made "Sohee, Yerin" one name.
-            # Only a word leading the line, "Online: Sohee, Yerin", labels all;
-            # so does a bare word of its own, "Sohee, Yerin, 결석".
+            # Several students on one line: a status word after one of them belongs to that
+            # student only ("Minseok 결석, Yerin": only Minseok was absent). A status word at the
+            # start ("Online: Sohee, Yerin") or on its own ("Sohee, Yerin, 결석") applies to all.
             parts = [part.strip() for part in re.split(r"\s*[,，]\s*", line) if part.strip()]
             word = next(m for _, p in STATUS_PATTERNS if (m := p.search(line)))
             leads = not re.sub(r"[\s\-:\(\[.]", "", line[: word.start()])
@@ -1064,8 +1026,8 @@ def parse_cell(text: str) -> dict[str, Any]:
                 for part in parts:
                     entries.extend(_status_part(part, current_status, notes))
                 continue
-            # A status on a student's own line -- "Sohee(Online)", "Jihoon(당일취소)" --
-            # is theirs alone. Carried down, it billed nobody below a sick student.
+            # A status on a student's own line ("Sohee(Online)", "Jihoon(당일취소)") is theirs only;
+            # it doesn't carry on to the students below.
             own = _own_tagged_status(line, status)
             if own:
                 entries.append(own)
@@ -1098,14 +1060,16 @@ def parse_cell(text: str) -> dict[str, Any]:
 
 
 class _Roster:
-    """Matches names found in status cells back onto the class roster."""
+    """Matches names found in status cells to the students on the class roster."""
 
     def __init__(self) -> None:
+        """Start with an empty roster."""
         self.names: list[str] = []
         self._by_exact: dict[str, int] = {}
         self._by_tokens: dict[tuple[str, ...], int] = {}
 
     def add(self, name: str) -> int:
+        """Add a name to the roster (once) and return its position."""
         key = normalise_name(name)
         if key in self._by_exact:
             return self._by_exact[key]
@@ -1116,7 +1080,8 @@ class _Roster:
         return index
 
     def match(self, name: str) -> tuple[int | None, str | None]:
-        """Return ``(index, warning_kind)``; index is ``None`` when unmatched."""
+        """Find a name on the roster: returns (index, warning kind), with index None if not found.
+        """
         key = normalise_name(name)
         if key in self._by_exact:
             return self._by_exact[key], None
@@ -1146,7 +1111,7 @@ class _Roster:
 
 
 def _find_header_row(worksheet, max_scan: int = 8) -> tuple[int, dict[int, tuple[int, str | None]]]:
-    """Find the row holding ``15(SAT)`` style day labels."""
+    """Find the row holding day labels like "15(SAT)"."""
     best_row = 0
     best_days: dict[int, tuple[int, str | None]] = {}
     limit = min(max_scan, worksheet.max_row or max_scan)
@@ -1171,13 +1136,11 @@ def _find_header_row(worksheet, max_scan: int = 8) -> tuple[int, dict[int, tuple
 
 
 def _second_calendar(worksheet, header_row: int) -> tuple[int, list[str]] | None:
-    """A second row of day labels further down the sheet: ``(row, its labels)``.
+    """Find a second row of day labels lower down the sheet: (row, its labels), or None.
 
-    A teacher reworking some weeks may paste a new calendar under the month's
-    grid, with its own day labels in different columns. Read as part of the
-    grid above, its lessons land on whatever day that column is up top -- the
-    12th's lessons filed under the 16th -- so the sheet is read only down to
-    it, and which calendar is right is left to a person.
+    A teacher reworking some weeks may paste a new calendar under the grid,
+    with its days in different columns. The sheet is read only down to it,
+    and the import screen asks which calendar is right.
     """
     last_column = (worksheet.max_column or 1) + 1
     for row in range(header_row + 1, (worksheet.max_row or header_row) + 1):
@@ -1194,7 +1157,7 @@ def _second_calendar(worksheet, header_row: int) -> tuple[int, list[str]] | None
 
 
 def _time_axis(worksheet, header_row: int, last_row: int | None = None) -> tuple[dict[int, dt.time], set[int]]:
-    """Return ``(row -> time)`` and the set of columns used as a time axis."""
+    """Find the time axis: a map of row -> time, and the set of columns used for times."""
     counts: dict[int, int] = {}
     row_times: dict[int, dt.time] = {}
     last_row = min(last_row or (worksheet.max_row or 1), worksheet.max_row or 1)
@@ -1222,13 +1185,10 @@ def _time_axis(worksheet, header_row: int, last_row: int | None = None) -> tuple
 
 
 def _fill_key(cell) -> str | None:
-    """A comparable identity for a cell's background fill.
+    """Return a comparable key for a cell's background colour, or None if it has none.
 
-    Excel stores a fill three different ways -- a literal RGB value, an index
-    into the theme palette, or an indexed legacy colour -- and two cells that
-    look identical on screen can be stored differently.  Returns ``None`` for
-    an unfilled cell, and a string that only compares equal to a fill of the
-    same kind.
+    Excel stores colours three ways (RGB, theme colour, or old indexed colour),
+    so two cells that look the same can differ; the key includes the kind.
     """
     fill = cell.fill
     if fill is None or fill.patternType != "solid":
@@ -1246,6 +1206,7 @@ def _fill_key(cell) -> str | None:
 
 
 def _merged_lookup(worksheet) -> dict[tuple[int, int], tuple[int, int, int, int]]:
+    """Map each merged range's top-left cell to the range's (min_row, min_col, max_row, max_col)."""
     lookup: dict[tuple[int, int], tuple[int, int, int, int]] = {}
     for merged in worksheet.merged_cells.ranges:
         bounds = (merged.min_row, merged.min_col, merged.max_row, merged.max_col)
@@ -1254,6 +1215,7 @@ def _merged_lookup(worksheet) -> dict[tuple[int, int], tuple[int, int, int, int]
 
 
 def _row_step_minutes(row_times: dict[int, dt.time]) -> int:
+    """Return how many minutes one row of the time axis covers (usually 30)."""
     rows = sorted(row_times)
     deltas = []
     for first, second in zip(rows, rows[1:]):
@@ -1272,14 +1234,12 @@ def _row_step_minutes(row_times: dict[int, dt.time]) -> int:
 # --------------------------------------------------------------------------
 # Absence notes: who a note under the grid is about
 # --------------------------------------------------------------------------
-# A note like "태우결석" (Taewoo absent) names the student in Hangul, while the
-# lessons list them in English letters -- "Kim Taewoo". To see they are the
-# same person, the Hangul is spelled out every way families actually write
-# it in English (현 as Hyun or Hyeon, 우 as Woo or U), both sides are folded
-# over spellings that never tell two names apart (K/G, oo/u, a doubled
-# letter), and only an exact match counts -- among the students taught on
-# the same sheet. A match never changes a bill; it only decides which notes
-# are worth a warning.
+# A note like "태우결석" (Taewoo absent) gives the name in Hangul, while the lessons list
+# it in English ("Kim Taewoo"). To match them, each Hangul name is spelled every way
+# families write it in English (현 as Hyun or Hyeon, 우 as Woo or U), both sides are
+# simplified the same way (K/G, oo/u, double letters), and only an exact match among
+# the sheet's students counts. A match never changes a bill; it only decides which
+# notes get a warning.
 _INITIALS = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
              "j", "jj", "ch", "k", "t", "p", "h")
 _MEDIALS = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe",
@@ -1291,7 +1251,7 @@ _FOLDS = tuple((re.compile(pattern), replacement) for pattern, replacement in (
     ("(?<=[aeiouy])h(?![aeiouy])", ""),          # Ahn, Oh, Suh
     ("k", "g"), ("t", "d"), ("p", "b"), ("r", "l"), (r"(.)\1+", r"\1"),
 ))
-# How a Korean surname is spelled in English, for a note that gives it.
+# How Korean surnames are spelled in English, for notes that give one.
 _KO_SURNAMES = {
     "김": "kim gim", "이": "lee yi rhee i", "박": "park pak bak", "최": "choi choe",
     "정": "jung jeong chung", "강": "kang gang", "조": "cho jo", "윤": "yoon yun",
@@ -1307,8 +1267,8 @@ _KO_SURNAMES = {
     "변": "byun byeon", "여": "yeo", "추": "choo chu", "도": "do", "석": "seok suk",
     "소": "so", "마": "ma", "길": "gil kil", "연": "yeon", "표": "pyo", "기": "ki gi",
 }
-# English names as they are written in Hangul, which no romanisation recovers:
-# 에스더 reads "eseudeo", not Esther.
+# English names written in Hangul, which romanisation can't turn back into English
+# (e.g. 에스더 would read "eseudeo").
 _KO_ENGLISH = {
     "에스더": "Esther", "알렉시스": "Alexis", "제임스": "James", "루카스": "Lucas",
     "마이크": "Mike", "마이클": "Michael", "소피아": "Sophia", "이자벨": "Isabel",
@@ -1331,22 +1291,20 @@ _KO_ENGLISH = {
     "딜런": "Dylan", "제이": "Jay", "조엘": "Joel", "카일": "Kyle", "테일러": "Taylor",
     "로건": "Logan", "에이바": "Ava", "케일럽": "Caleb", "클라라": "Clara",
 }
-# Words a note wraps round a name -- dates, "teacher", reasons for being away,
-# "make-up class", "checked" -- taken out before looking for names, so
-# "다혜결석 /토요일보강" (Dahye absent, make-up on Saturday) is about 다혜
-# and nobody called 토요일.
+# Words a note wraps around a name (dates, "teacher", reasons for being away,
+# "make-up class"), removed before looking for names, so "다혜결석 /토요일보강"
+# (Dahye absent, make-up on Saturday) is about 다혜 and nobody called 토요일.
 _NOTE_WORDS = re.compile(
     r"\(\s*[월화수목금토일]\s*\)|\d+\s*[월일]|[월화수목금토일]요일|[가-힣]*(?:쌤|선생님)"
     r"|보강|수업|한국|학교|시험|예정|부터|까지|대신|변경|일정|참여|불가|당일|가족|독감|생일"
     r"|필드|캠프|수련회|행사|행가|오케스트라|컨퍼런스|말레이시아|인터림|경시대회|대회|페이"
     r"|확인|완료|관리|봄방학|방학|계속|캐미|이라서|한다고|합니다|으로|중으로"
 )
-# A lone syllable is kept as a name ("민결석", Min absent) unless it is one
-# of the particles a sentence leaves behind.
-# Single syllables a sentence leaves behind -- particles, and 초/말 (early,
-# late in a month), 시 (o'clock), 금 (Friday), 음 (the tail of 없었음).
+# Single syllables left over from a sentence: particles, plus 초/말 (early/late in a
+# month), 시 (o'clock), 금 (Friday) and 음 (end of 없었음). Any other single syllable is
+# kept as a name ("민결석", Min absent).
 _PARTICLES = frozenset("로 에 는 은 를 을 가 와 과 도 만 의 중 후 내 및 완 급 초 말 시 금 음 딜".split())
-# Dates a note gives for itself: "27일", "6월15일-22일", "7/6-15", "4/13(월)~25(토)", "16-21".
+# Dates a note gives: "27일", "6월15일-22일", "7/6-15", "4/13(월)~25(토)", "16-21".
 _NOTE_DATE = re.compile(
     r"(?:(?P<m>\d{1,2})\s*(?:/|월)\s*)?(?P<d>\d{1,2})(?P<unit>\s*일)?(?:\s*\([월화수목금토일]\))?"
     r"(?:\s*[-~]\s*(?:(?P<m2>\d{1,2})\s*(?:/|월)\s*)?(?P<d2>\d{1,2})\s*일?)?"
@@ -1354,6 +1312,7 @@ _NOTE_DATE = re.compile(
 
 
 def _syllable_spellings(char: str, first: bool) -> list[str]:
+    """Return the English spellings of one Hangul syllable (`first`: it starts the name)."""
     code = ord(char) - 0xAC00
     initial, medial, final = code // 588, code % 588 // 28, code % 28
     vowels = [_MEDIALS[medial]]
@@ -1372,6 +1331,7 @@ def _syllable_spellings(char: str, first: bool) -> list[str]:
 
 
 def _fold(text: str) -> str:
+    """Simplify a spelling so variants match: lower case, letters only, then the _FOLDS rules."""
     key = re.sub(r"[^a-z]", "", text.lower())
     for pattern, replacement in _FOLDS:
         key = pattern.sub(replacement, key)
@@ -1379,29 +1339,32 @@ def _fold(text: str) -> str:
 
 
 def name_sound(name: str) -> str:
-    """A name as it is said, in any word order and spacing, without a nickname
-    in brackets: "Choi Jaaemin" and "Jaemin Choi", "Jang Kyubin" and "Jang
-    Gyubin", "Kim Daeun(Emily)" and "Kim Da Eun" all come out the same."""
+    """Return a name as it sounds, ignoring word order, spacing and nicknames in brackets.
+
+    "Choi Jaaemin" and "Jaemin Choi", "Jang Kyubin" and "Jang Gyubin",
+    "Kim Daeun(Emily)" and "Kim Da Eun" all give the same result.
+    """
     return "".join(sorted(_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))))
 
 
 def _name_words(name: str) -> list[str]:
+    """Return the simplified English words of a name, without brackets."""
     return [_fold(word) for word in re.findall(r"[A-Za-z]+", without_brackets(name))]
 
 
 def _close_spelling(parsed: str, full: str) -> bool:
-    """A letter or two apart, in either word order: "Kim Taewo" and "Taewoo Kim"."""
+    """Return True if two names are a letter or two apart, in either word order ("Kim Taewo" / "Taewoo Kim").
+    """
     ordered = [" ".join(sorted(_bare(name).split())) for name in (parsed, full)]
     return max(difflib.SequenceMatcher(None, _bare(parsed), _bare(full)).ratio(),
                difflib.SequenceMatcher(None, *ordered).ratio()) >= MERGE_THRESHOLD
 
 
 def _one_letter_apart(parsed: str, full: str) -> bool:
-    """One letter changed, added or dropped, or two swapped: "Oh Mino" and "Oh Mina".
+    """Return True if two names differ by one letter (changed, added, dropped, or two swapped).
 
-    A short name has too few letters for _close_spelling's 88% to notice one
-    wrong one -- "Oh Mino" is 86% of "Oh Mina" -- so it came in as a new
-    student without anyone being asked.
+    For short names like "Oh Mino" and "Oh Mina", which the 88% similarity
+    check in _close_spelling misses.
     """
     a, b = _bare(parsed), _bare(full)
     if a == b or abs(len(a) - len(b)) > 1:
@@ -1415,11 +1378,10 @@ def _one_letter_apart(parsed: str, full: str) -> bool:
 
 
 def _shortened(parsed: str, full: str) -> bool:
-    """Whether ``parsed`` is ``full`` cut short or with a name added.
+    """Return True if `parsed` is `full` shortened, or with a name added.
 
-    "Hana" for "Park Hana Leong", "Yerin" for "Seo Yerin",
-    "Minsooo" for "Minsoo Kim" (a spelling a letter or two longer), or
-    "Emma Nam Jihoon" for "Nam Jihoon" (an English name in front).
+    E.g. "Hana" for "Park Hana", "Yerin" for "Seo Yerin", "Minsooo" for
+    "Minsoo Kim", or "Emma Nam Jihoon" for "Nam Jihoon".
     """
     mine, theirs = _name_words(parsed), _name_words(full)
     if len(theirs) < 2 or not mine:
@@ -1433,7 +1395,7 @@ def _shortened(parsed: str, full: str) -> bool:
 
 
 def _hangul_sounds(hangul: str) -> set[str]:
-    """Every folded English spelling of a run of Hangul syllables."""
+    """Return every simplified English spelling of a run of Hangul syllables."""
     spellings = [""]
     for position, char in enumerate(hangul):
         if not 0 <= ord(char) - 0xAC00 < 11172:
@@ -1452,7 +1414,7 @@ _SURNAME_SOUNDS = frozenset(_fold(name) for name in _SURNAMES).union(
 
 
 def _roster_sounds(name: str) -> tuple[frozenset, frozenset]:
-    """What a listed student answers to: every way their name can be called, and their surname."""
+    """Return the ways a listed student can be called, and their surname."""
     words = re.findall(r"[A-Za-z]+", name)
     sounds = [_fold(word) for word in words]
     surnames = {sound for sound in sounds if sound in _SURNAME_SOUNDS}
@@ -1474,12 +1436,11 @@ def _roster_sounds(name: str) -> tuple[frozenset, frozenset]:
 
 
 def _note_people(text: str) -> list[tuple[str, list[tuple[frozenset | None, frozenset]]]]:
-    """The people a note names, each as written with the ways it could be read.
+    """Return the people a note names, each with the ways it could be read.
 
-    A name is often run together with the reason -- "태우말레이시아결석",
-    Taewoo absent in Malaysia, or "경시대회다혜" -- so a long run of Hangul is
-    also tried by its first and last two and three syllables, which is how
-    long a Korean name is.
+    A name is often run together with the reason ("태우말레이시아결석", Taewoo absent
+    in Malaysia), so a long Hangul run is also tried by its first and last two and
+    three syllables, the usual length of a Korean name.
     """
     text = re.sub(r"(?i)cancel\w*|absent\w*", " ", text)
     text = _NOTE_WORDS.sub(" ", _ABSENCE_WORD.sub(" ", text))
@@ -1514,7 +1475,7 @@ def _note_people(text: str) -> list[tuple[str, list[tuple[frozenset | None, froz
 
 
 def _answers_to(readings, student: tuple[frozenset, frozenset]) -> int:
-    """2 when the name and the surname the note gives both fit, 1 when the name fits, else 0."""
+    """Score how a note fits a student: 2 if name and surname fit, 1 if the name fits, else 0."""
     calls, surnames = student
     best = 0
     for surname, given in readings:
@@ -1530,13 +1491,11 @@ _HANGUL_NAME = re.compile(r"[가-힣]{2,4}")
 
 
 def hangul_fit(hangul_name: str, other: str) -> int:
-    """How well a name written in Hangul fits one written in English letters.
+    """Score how well a Hangul name fits an English one: 2, 1 or 0.
 
-    Teachers mostly write a child in English and now and then in Korean:
-    "다혜" in one week's cell is the "Dahye" of every other week. 2 when the
-    surname and given name both fit ("강다혜", "Kang Dahye"), 1 when the
-    given name does ("다혜", "Dahye" or "Kang Dahye"), else 0. Only a name
-    that is all Hangul and a name with English letters are compared.
+    2 when surname and given name both fit ("강다혜" / "Kang Dahye"), 1 when the
+    given name fits ("다혜" / "Dahye" or "Kang Dahye"), else 0. Only compares an
+    all-Hangul name with an English one.
     """
     written = hangul_name.strip()
     if not _HANGUL_NAME.fullmatch(written) or not re.search(r"[A-Za-z]", other):
@@ -1546,19 +1505,16 @@ def hangul_fit(hangul_name: str, other: str) -> int:
 
 
 def _note_dates(text: str, day: dt.date) -> set[dt.date]:
-    """The days a note is about: those it gives, and the day it sits under.
+    """Return the days a note is about: the dates it gives, and the day it sits under.
 
-    "27일" is the 27th of the sheet's month; "10월1일 ... 3일" the 1st and 3rd
-    of October; "14,21" two days of the month. The day the note sits under
-    counts too -- "마이크18일부터/소은결석" is Mike from the 18th and Soeun
-    today -- unless every date it gives is in another month: a note in
-    September about October is not about September.
+    "27일" is the 27th of the sheet's month; "14,21" two days of it. The day it
+    sits under counts too, unless every date the note gives is in another month
+    (a September note about October isn't about September).
     """
     found: set[dt.date] = set()
     month = day.month
-    # After an arrow is the plan to make it up -- "예준결석>>5월20일 보강",
-    # Yejun absent, make-up on the 20th -- and a date just before 보강
-    # (make-up) or 참여 (will attend) is a day they come, not one they miss.
+    # After an arrow comes the make-up plan ("예준결석>>5월20일 보강"), and a date just before
+    # 보강 (make-up) or 참여 (will attend) is a day they come, not one they miss.
     text = re.split(r"->|>>|→", text)[0]
     for match in _NOTE_DATE.finditer(text):
         if re.match(r"\s*(?:보강|참여)", text[match.end():]):
@@ -1589,20 +1545,18 @@ def _note_dates(text: str, day: dt.date) -> set[dt.date]:
 
 
 def _absence_note_warnings(notes, sessions, sheet_name: str) -> list[dict[str, Any]]:
-    """Warn about an absence note only where it could change a bill.
+    """Warn about absence notes only where they could change a bill.
 
     Teachers usually take an absent student off the lesson and write why
-    underneath; a warning for every such note asked the importer to act when
-    there was nothing to do. So a note is checked against the lessons on the
-    days it covers: a student it names who is still listed on one is the
-    case that bills someone who wasn't there, and gets a warning naming the
-    lesson. A student who isn't listed on those days isn't billed for them. A
-    note that matches nobody taught on the sheet is still put in front of the
-    importer, unless it covers no lessons at all.
+    underneath, so most notes need nothing. A note is checked against the
+    lessons on the days it covers: a student it names who is still listed on
+    one of them gets a warning, since they would be billed. A note that matches
+    nobody on the sheet is also shown, unless it covers no lessons.
     """
     sounds: dict[str, tuple[frozenset, frozenset]] = {}
 
     def student(name: str):
+        """Return (and remember) the ways a student can be called."""
         if name not in sounds:
             sounds[name] = _roster_sounds(name)
         return sounds[name]
@@ -1619,13 +1573,13 @@ def _absence_note_warnings(notes, sessions, sheet_name: str) -> list[dict[str, A
             best = max(fits.values(), default=0)
             if not best:
                 if re.search(r"[가-힣]", written):
-                    # An English word left in a note is as often "Field" or
-                    # "next" as a name, so only Hangul that fits nobody is named.
+                    # An English word left in a note is as often "Field" or "next" as a name, so only
+                    # Hangul that fits nobody is reported.
                     unknown.append(written)
                 continue
             known = True
-            # Where the note gives a surname, a student it fits beats one
-            # whose surname nobody wrote: 홍다혜 is Hong Dahye, not Dahye.
+            # If the note gives a surname, a student it fits beats one whose surname wasn't
+            # written: 홍다혜 is Hong Dahye, not just any Dahye.
             chosen = {name for name, fit in fits.items() if fit == best}
             listed += [(written, s, a) for s in lessons for a in s["attendance"]
                        if a["student_name"] in chosen and a.get("status") != CANCELLED]
@@ -1657,13 +1611,10 @@ def _warning(
     cell_text: Any = None,
     kind: str | None = None,
 ) -> dict[str, Any]:
-    """One warning, kept structured so the screen can point at the cell.
+    """Build one warning, with fields the import screen uses to point at the cell.
 
-    ``text`` repeats the single line the parser has always produced, so
-    anything that only prints warnings keeps working unchanged; the separate
-    fields let the import screen show the worksheet, the cell reference and
-    what is actually typed in that cell. ``kind`` marks the few the screen
-    puts in front of everyone rather than in the list.
+    `text` is the one-line message; `sheet`, `coordinate` and `cell_text` say
+    where it came from. `kind` marks the few the screen shows at the top.
     """
     where = f"{sheet}!{coordinate}" if coordinate else sheet
     stamp = f" ({date.isoformat()})" if date else ""
@@ -1685,10 +1636,9 @@ def _resolve_dates(
     year: int,
     hint: str = "check the import year",
 ) -> tuple[dict[int, dt.date], list[tuple[int, str]]]:
-    """Map header columns to real dates, rolling over into the next month.
+    """Turn day-label columns into real dates, rolling into the next month when the days restart.
 
-    Warnings come back as ``(column, message)`` so the caller can point at
-    the day header cell they came from.
+    Warnings come back as (column, message), so they can point at the day label.
     """
     dates: dict[int, dt.date] = {}
     warnings: list[tuple[int, str]] = []
@@ -1736,14 +1686,12 @@ def _resolve_dates(
 
 
 def _parse_sheet(worksheet, month: int | None, year: int):
-    """Read one worksheet into ``(sessions, warnings, months, shown)``.
+    """Read one worksheet: returns (sessions, warnings, months, shown).
 
-    ``month`` is the month the worksheet's name gives, or None when it gives
-    none -- a sheet called "2026", which names its months above the day
-    labels instead. ``months`` is the ``(year, month)`` of each month the
-    sheet was read as, for the summary table; empty when nothing was read.
-    ``shown`` is every date the sheet has a day column for, lessons or not:
-    what an import of it can say is on the calendar, and what is not.
+    `month` is the month the sheet's name gives, or None for a sheet like "2026"
+    that labels its months above the day labels. `months` lists each (year,
+    month) the sheet was read as. `shown` is every date the sheet has a day
+    column for, with lessons or not.
     """
     sheet_name = worksheet.title
     warnings: list[dict[str, Any]] = []
@@ -1815,10 +1763,9 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                 )
             )
 
-    # A month standing many months apart from the next one on the same sheet
-    # is almost always a block copied in from elsewhere. At the very start of
-    # a sheet it is the copied "Jan 2025" template -- found cell for cell in
-    # several teachers' workbooks -- so it is skipped; elsewhere, only flagged.
+    # A month far apart from the next one on the same sheet is usually a copied block.
+    # At the very start of a sheet (the copied "Jan 2025" template) it is skipped;
+    # anywhere else it is only flagged.
     for position, (block, following) in enumerate(zip(blocks, blocks[1:])):
         here = [dates[c] for c in block["columns"] if c in dates]
         there = [dates[c] for c in following["columns"] if c in dates]
@@ -1842,10 +1789,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                                  coordinate=label_cell.coordinate,
                                  cell_text=block["label"]))
 
-    # A late lesson is sometimes written under the last time on the axis --
-    # 9.30pm below a column that stops at 9pm. Those rows are read too, but
-    # only for lessons: anything else down there is a notes row, and letting a
-    # note become a status cell would hang it on whichever class sat above.
+    # A late lesson is sometimes written below the last time on the axis. Those rows are
+    # read for lessons only; anything else down there is a notes row.
     axis_end = max(row_times) if row_times else (worksheet.max_row or header_row)
     max_row = min(worksheet.max_row or axis_end, axis_end + 20) if row_times else axis_end
     if last_row:
@@ -1861,7 +1806,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             continue
         session_date = dates[anchor]
 
-        # The day block runs to the next day header or the next time column.
+        # The day's columns run to the next day label or time column.
         block_end = max_column
         if position + 1 < len(header_columns):
             block_end = header_columns[position + 1] - 1
@@ -1885,8 +1830,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                 cell = worksheet.cell(row=row, column=column)
                 if not isinstance(cell.value, str) or not cell.value.strip():
                     continue
-                # Non-anchor cells of a merged range read back as None, so
-                # anything with text here is the anchor of its block.
+                # The other cells of a merged range read as None, so a cell with text here is the
+                # top-left cell of its block.
                 bounds = merged.get((row, column))
                 parsed = parse_cell(cell.value)
                 span_end = bounds[2] if bounds else row
@@ -1937,9 +1882,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                     status_cells.append(
                         (row, column, parsed, _fill_key(cell), cell.value)
                     )
-                    # A teacher's reminder -- a call to someone's mother at
-                    # 5pm, the dates a student is away -- is plainly a note;
-                    # only lines the parser couldn't place are worth a warning.
+                    # A reminder (a call to a parent, dates someone is away) is just a note; only lines
+                    # the parser couldn't place get a warning.
                     unplaced = [note for note in parsed["notes"] if not _is_remark(note)]
                     if not parsed["entries"] and unplaced:
                         warnings.append(
@@ -1952,7 +1896,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                             )
                         )
 
-        # Trim a class span so it cannot swallow the next class in its column.
+        # Trim a class's rows so it can't swallow the next class in the same column.
         for item in classes:
             following = [
                 other["row"]
@@ -1970,7 +1914,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             ).strip()
             session_warnings: list[dict[str, Any]] = []
 
-            # "TA" in capitals is a teaching assistant's shift: "2.30pm-4pm TA".
+            # "TA" in capitals is a teaching assistant's shift, e.g. "2.30pm-4pm TA".
             if (NON_LESSON_RE.search(item["text"])
                     or re.search(r"(?<![A-Za-z])TA(?![A-Za-z])", item["text"])):
                 warnings.append(
@@ -2035,6 +1979,7 @@ def _parse_sheet(worksheet, month: int | None, year: int):
             attendance: list[dict[str, Any]] = []
 
             def add_entry(name: str, status: str | None, source: str, note: str | None = None):
+                """Add a student to this class's list once. Returns (index, True if just added)."""
                 clean = re.sub(r"\s+", " ", name).strip()
                 index = roster.add(clean)
                 if index == len(attendance):
@@ -2084,9 +2029,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                     for other in classes
                     if other["column"] < column and other["row"] <= row <= other["end_row"]
                 ]
-                # The sheet colours each class block and its status cells the
-                # same, so colour decides the owner when it is available and
-                # position decides it otherwise.
+                # A class block and its status cells share a colour, so colour decides which class a
+                # status cell belongs to; position decides when there's no colour.
                 coloured = [
                     other
                     for other in reachable
@@ -2243,9 +2187,9 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                 }
             )
 
-        # An absence written as a note -- "지훈결석" in the row under the grid,
-        # or a status cell no class claimed. Nothing is changed on its say-so;
-        # it is checked once every day's lessons are known, below.
+        # An absence written as a note ("지훈결석" under the grid, or a status cell no class
+        # claimed). Nothing changes because of it; it is checked below once all the day's
+        # lessons are known.
         for row, column, _, _, text in status_cells:
             if (row, column) not in attached and _ABSENCE_WORD.search(text):
                 absence_notes.append((f"{get_column_letter(column)}{row}", text))
@@ -2262,9 +2206,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
 # --------------------------------------------------------------------------
 
 
-# Punctuation that can only be a leftover from typing several names into one
-# cell -- a stray comma, a dangling slash. Never part of a person's name, and
-# leaving it attached turns "Taewoo" and "Taewoo," into two different students.
+# Punctuation that can only be left over from typing several names in one cell (a
+# stray comma or slash). Left on, "Taewoo" and "Taewoo," would be two students.
 _EDGE_PUNCTUATION = " -,;/·•"
 
 
@@ -2274,12 +2217,13 @@ def _display_clean(name: str) -> str:
 
 
 def _bare(name: str) -> str:
-    """The name with any bracketed suffix removed, case-folded."""
+    """Return the name without any bracketed part, in lower case."""
     text = re.sub(r"\s*[\(\[][^\)\]]*[\)\]]", "", _display_clean(name))
     return text.strip(" -").casefold()
 
 
 def _suffix(name: str) -> str:
+    """Return the text in a name's first brackets, or ""."""
     found = _BRACKETED.findall(_display_clean(name))
     return found[0].strip() if found else ""
 
@@ -2291,23 +2235,21 @@ _REASON_TEXT = {
     "spelling": "similar spelling",
 }
 
-# Shown worst-first: a tag difference is the one most likely to be two real
-# people sharing a name (confirmed by the academy -- a bracketed tag is not
-# reliably an alias), so it's surfaced ahead of a probably-safe typo.
+# Questions are listed most important first: a tag difference is the most likely to
+# be two different children with one name.
 _REASON_ORDER = {"tag": 0, "spelling": 1, "sound": 2, "capitalisation": 3}
 
 
 def _likely_same(reason, left, right, together, classes_of, hangul_matches) -> bool:
-    """Whether a pair of spellings in one workbook starts on "merge".
+    """Return True if a pair of spellings in one workbook should start on "merge".
 
-    Never when the two sat one lesson together. Otherwise: a difference only
-    of capitalisation or of how the name is written (word order,
-    romanisation) is one child; a Hangul name is, when it fits just one
-    English name. A spelling or tag difference -- "Nam Jihon" and "Nam
-    Jihoon", "Clement" and "Clement(UWC D)" -- is one child when both turn
-    up in the same class on different days: the same seat, typed two ways.
-    In different classes it stays a question ("Park Hana" in one class, "Park
-    Haena" in another), as do two different tags and a grade in brackets.
+    Never if they were in one lesson together. Otherwise: names that differ only
+    in capitals or in how they're written (word order, romanisation) are one
+    child, and so is a Hangul name that fits just one English name. A spelling
+    or tag difference ("Nam Jihon" / "Nam Jihoon", "Bomi" / "Bomi(UWC D)")
+    counts as one child only when both appear in the same class on different
+    days. In different classes it stays a question, as do two different tags or
+    a grade in brackets.
     """
     if together:
         return False
@@ -2324,33 +2266,20 @@ def _likely_same(reason, left, right, together, classes_of, hangul_matches) -> b
 
 
 def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
-    """Find spellings of the same student across a workbook -- and flag every
-    one for a human decision. Nothing is merged automatically here.
+    """Find spellings of the same student within a workbook, for the admin to decide on.
 
-    A workbook mixes three kinds of variation, and none of them is safe to
-    assume is the same person on its own:
+    Nothing is merged here. Pairs found:
+    * capitals or spacing only ("Bae Sujin" / "bae sujin");
+    * a bracketed tag ("Seo Yerin" / "Seo Yerin(UWC D)"), which can be two
+      children with one name;
+    * similar spellings ("Bae Sujin" / "Bae Sujeong");
+    * the same name said the same way: other word order ("Kim Hayun" /
+      "Hayun Kim"), another romanisation, or a nickname in brackets.
 
-    * Pure case/spacing differences (``Bae Sujin`` vs ``bae sujin``)
-      are usually a typo, but "usually" isn't "always".
-    * A bracketed tag (``Seo Yerin`` vs ``Seo Yerin(UWC D)``) is *not*
-      assumed to be an alias on one person -- two students can share a name
-      and be told apart only by a tag, so a tag difference is flagged, not
-      silently stripped and merged.
-    * A similar-but-not-identical spelling (``Bae Sujin`` / ``Bae
-      Sujeong``) is flagged the same way.
-    * The same name said the same way -- the other word order (``Kim
-      Hayun`` / ``Hayun Kim``), another romanisation (``Sohn Taemin`` / ``Tae
-      Min Sohn``), a nickname added in brackets -- is flagged too. Compared
-      letter by letter these were never close enough to ask about, and
-      each came in as a second student.
-
-    A capitalisation or sound match between two names that never share a
-    class is marked ``likely_same``: the review starts on "merge" for those,
-    and on "keep separate" for everything else -- the admin still decides.
-
-    Attendance entries get only cosmetic clean-up here (invisible
-    characters, extra whitespace) -- nothing is renamed until a human
-    approves a merge via ``apply_review_decisions`` in schedule_backfill.py.
+    A capitals or sound match between two names that never share a class is
+    marked likely_same, so its question starts on "merge"; everything else
+    starts on "keep separate". Names only get cosmetic clean-up here; merges
+    happen in schedule_backfill.apply_review_decisions after the admin agrees.
     """
     roster_mates: dict[str, set[str]] = defaultdict(set)
     counts: Counter = Counter()
@@ -2376,8 +2305,8 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
             classes_of[cleaned].add(session.get("class_name") or "")
 
     names = sorted(counts)
-    # A name in Hangul is taken for the one English name it fits, when only
-    # one in the workbook does; fitting two, it is asked about, not assumed.
+    # A Hangul name is matched to the one English name it fits in the workbook; if it fits
+    # two, it is asked about.
     hangul_fits = {
         name: [other for other in names if hangul_fit(name, other)]
         for name in names if _HANGUL_NAME.fullmatch(name)
@@ -2422,7 +2351,7 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason": reason,
                     "reason_text": detail,
                     "counts": [counts[left], counts[right]],
-                    # Two names in one class are two children, however alike.
+                    # Two names in the same lesson are two children, however alike.
                     "likely_same": _likely_same(reason, left, right, together, classes_of,
                                                 hangul_fits.get(hangul) if hangul in hangul_fits else None),
                 }
@@ -2438,6 +2367,7 @@ def canonicalise_names(sessions: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def get_sheet_names(source: Any) -> list[str]:
+    """Return the worksheet names in a workbook."""
     workbook = load_workbook(_as_stream(source), data_only=True, read_only=True)
     try:
         return list(workbook.sheetnames)
@@ -2446,13 +2376,11 @@ def get_sheet_names(source: Any) -> list[str]:
 
 
 def _name_unnamed(sessions: list[dict[str, Any]]) -> None:
-    """Give each unnamed lesson a placeholder for its student, or its weekly slot.
+    """Give each unnamed lesson a placeholder name: its student, or its weekly slot.
 
-    One placeholder for every unnamed lesson would make the import screen's
-    single name merge them all into one class: several teachers' different
-    groups, one bill. A one-to-one is named for its student, however its time
-    moves around; a group for its weekday and start time. Placeholders sort
-    the lessons for naming at import; typing the same name twice joins them.
+    One placeholder for all of them would merge different groups into one class
+    on the import screen. A one-to-one is named after its student; a group after
+    its weekday and start time. Typing the same name for two placeholders joins them.
     """
     for session in sessions:
         if session["class_name"] != UNNAMED_CLASS:
@@ -2473,11 +2401,9 @@ def _summarise(
     month: int | None,
     year: int,
 ) -> dict[str, Any]:
-    # Counted as the names actually appear, not folded down by
-    # normalise_name: that strips bracketed tags, which would report
-    # "Seo Yerin" and "Seo Yerin(UWC D)" as one student when the rule is that
-    # they are two people. Anything that really is one person typed twice is
-    # raised as a review, and only merges once somebody says so.
+    # Count names as written. normalise_name would strip tags and count "Seo Yerin" and
+    # "Seo Yerin(UWC D)" as one, when they may be two children.
+    """Build the preview dictionary for parsed sessions: the sessions, counts and warnings."""
     unique_students = {
         attendance["student_name"]
         for session in sessions
@@ -2498,7 +2424,7 @@ def _summarise(
 
 
 def parse_schedule(source: Any, sheet_name: str, year: int) -> dict[str, Any]:
-    """Parse a single worksheet into a preview dictionary."""
+    """Parse one worksheet into a preview dictionary."""
     try:
         month = infer_month(sheet_name)
     except ValueError:
@@ -2522,7 +2448,7 @@ def parse_schedule(source: Any, sheet_name: str, year: int) -> dict[str, Any]:
 
 
 def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[str, Any]:
-    """Parse several worksheets and merge them into one preview dictionary."""
+    """Parse several worksheets and combine them into one preview dictionary."""
     year = int(year)
     workbook = load_workbook(_as_stream(source), data_only=True)
     all_sessions: list[dict[str, Any]] = []
@@ -2541,9 +2467,8 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
             try:
                 month = infer_month(sheet_name)
             except ValueError:
-                # No month in the name: a whole year kept on one sheet, which
-                # names its months above the day labels, or a sheet that is
-                # not a schedule at all. _parse_sheet tells the two apart.
+                # No month in the name: either a whole year on one sheet (months labelled above the
+                # day labels) or not a schedule at all. _parse_sheet tells which.
                 month = None
 
             sheet_year = infer_year(sheet_name, year)
@@ -2577,7 +2502,7 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
 
     all_sessions.sort(key=lambda item: (item["date"], item["start_time"], item["class_name"]))
 
-    # Month sheets overlap at the edges (a July sheet often carries 1 August).
+    # Month sheets overlap at the edges (a July sheet often has 1 August too).
     seen: dict[tuple[dt.date, dt.time, str], str] = {}
     for session in all_sessions:
         key = (session["date"], session["start_time"], normalise_name(session["class_name"]))
@@ -2602,9 +2527,8 @@ def parse_workbook(source: Any, sheet_names: Iterable[str], year: int) -> dict[s
     preview["sheet_summaries"] = summaries
     preview["name_reviews"] = report["reviews"]
     preview["dates_shown"] = sorted(shown)
-    # The months the worksheets are *for*: a month sheet's own month, each
-    # month a year sheet labels. Not the day or two a sheet spills into the
-    # next month -- those are the next sheet's to say.
+    # The months the sheets are for: a month sheet's own month, and each month a year
+    # sheet labels. Not the day or two a sheet spills into the next month.
     preview["sheet_months"] = sorted(own_months)
     return preview
 
