@@ -1,30 +1,19 @@
-"""Printable invoice.
+"""Draws invoices: as an A4 web page, as PNG images, or as PDFs.
 
-Renders one invoice as a self-contained A4 page: the academy's letterhead, the
-student, a line per subject, and the payment details.  Opened in a new tab it
-prints straight to PDF from the browser, so nothing else has to be installed.
+- HTML: one self-contained page per invoice (letterhead, student, a line
+  per subject, payment details). It prints to PDF from any browser.
+- PNG (render_invoices_png): pictures of the same page, made with a
+  headless Chromium through Playwright. Parents get these on KakaoTalk,
+  which shows images right in the chat.
+- PDF (render_invoices_pdf): made with xhtml2pdf, which is pure Python.
+  Used on the hosted app, where Chromium can't be installed. It has its
+  own simpler template, because xhtml2pdf understands much less CSS.
 
-It can also be rendered as PNGs (``render_invoices_png``)
-for sending straight to a parent's phone over a chat app -- an image needs no
-"which app opens this" decision the way an HTML or PDF attachment does, and a
-chat app shows it inline. That path renders through a real (headless) Chromium
-via Playwright, so what's sent is pixel-for-pixel what the HTML version looks
-like -- no separate rendering engine to keep in sync.
+Use image_export_available() and pdf_export_available() to see which
+formats work on this machine.
 
-Chromium is a heavy thing to ask of a host, though, and the free tier this is
-deployed to has no way to install one. So there is a third renderer,
-``render_invoices_pdf``, which drives xhtml2pdf -- pure Python, with no system
-libraries behind it at all, so it runs anywhere pip does. It carries its own
-cut-down template, because that engine understands far less CSS than a
-browser. PDFs are the lesser option for KakaoTalk -- they arrive as an
-attachment rather than previewing inline -- so the app prefers images
-wherever Chromium is actually present and falls back to PDF where it is
-not. Ask ``image_export_available`` and ``pdf_export_available``
-rather than assuming either works.
-
-Everything the academy needs to change -- address, phone, bank -- lives in
-the app's secrets under ``[academy]``, not in this file; see
-``_AcademyDetails``.
+The academy's address, phone and bank details come from the app's
+secrets under [academy], not from this file (see _AcademyDetails).
 """
 
 from __future__ import annotations
@@ -37,11 +26,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-# Playwright and xhtml2pdf are both imported lazily, inside the functions
-# that use them. Playwright especially: the package installs fine but the
-# Chromium it drives is absent on the deployed host, and a module-scope
-# import would take the whole app down on start rather than disabling one
-# button.
+# Playwright and xhtml2pdf are imported inside the functions that use them.
+# The hosted app has no Chromium, and importing Playwright at the top would stop
+# the whole app from starting instead of just turning off image export.
 
 __all__ = [
     "ACADEMY",
@@ -67,15 +54,10 @@ ACADEMY_FIELDS = (
 
 
 class _AcademyDetails:
-    """The academy's letterhead and bank details, from the app's secrets.
+    """The academy's letterhead and bank details, read from the app's secrets.
 
-    These used to sit in this file. They are a bank account number and a
-    UEN, and while they are hardly a secret from the parents -- they print on
-    every invoice -- a public repository is a different thing from an
-    invoice. Account numbers left in one get collected by people who collect
-    account numbers.
-
-    Configure them under ``[academy]`` in the app's secrets::
+    Kept out of the code because the repository is public. Set them under
+    [academy] in the secrets:
 
         [academy]
         name = "..."
@@ -86,16 +68,16 @@ class _AcademyDetails:
         bank = "..."
         paynow = "..."
 
-    Read on first use rather than at import, so that importing this module
-    needs no Streamlit runtime. Missing configuration raises rather than
-    falling back to a placeholder: an invoice that quietly goes to a parent
-    with no way to pay it is worse than one that refuses to render.
+    They are read the first time they're needed. If any are missing this
+    raises an error, so an invoice is never made without payment details.
     """
 
     def __init__(self) -> None:
+        """Start with nothing loaded; the secrets are read on first use."""
         self._values: dict[str, str] | None = None
 
     def _load(self) -> dict[str, str]:
+        """Read and check the [academy] secrets once, then keep them. Raises if any are missing."""
         if self._values is not None:
             return self._values
         import streamlit as st
@@ -124,22 +106,24 @@ class _AcademyDetails:
         return values
 
     def __getitem__(self, key: str) -> str:
+        """Return one detail, e.g. details["bank"]."""
         return self._load()[key]
 
     def get(self, key: str, default: Any = None) -> Any:
+        """Return one detail, or `default` if it isn't set."""
         return self._load().get(key, default)
 
 
 ACADEMY = _AcademyDetails()
 
-# The shield mark cropped out of assets/ks_icon.png (which also carries the
-# "ACADEMIA PREP" wordmark and tagline baked in -- not wanted a second time
-# next to ACADEMY['name'] above). Embedded as a data URI so the invoice stays
-# a single self-contained file, same as the rest of this page.
+# Just the shield logo (assets/ks_icon_mark.png), without the wordmark, since the
+# academy's name is written next to it. It is embedded in the page so each invoice
+# is one self-contained file.
 _LOGO_PATH = Path(__file__).resolve().parent / "assets" / "ks_icon_mark.png"
 
 
 def _logo_data_uri() -> str:
+    """Return the logo as a data: URI to embed in the page, or "" if the file is missing."""
     if not _LOGO_PATH.exists():
         return ""
     encoded = base64.b64encode(_LOGO_PATH.read_bytes()).decode("ascii")
@@ -153,10 +137,10 @@ MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 
 def format_dates(dates: list[dt.date]) -> str:
-    """``4,11,18,25/Apr/2026`` -- days collapsed, month and year written once.
+    """Write a line's dates compactly, e.g. "4,11,18,25/Apr/2026".
 
-    A line that runs across a month boundary is split, so the dates are never
-    ambiguous.
+    Dates in different months are written as separate groups, so it's
+    always clear which month a day belongs to.
     """
     if not dates:
         return ""
@@ -173,6 +157,7 @@ def format_dates(dates: list[dt.date]) -> str:
 
 
 def _money(value: float) -> str:
+    """Write an amount with commas and two decimals, e.g. 1,234.50."""
     return f"{value:,.2f}"
 
 
@@ -246,24 +231,21 @@ _STYLE = """
 
 
 def _line_cells(line: dict[str, Any]) -> tuple[str, str, str, str, str, bool]:
-    """One invoice line as its five display columns, plus "is a credit".
+    """Return one invoice line as its five columns, plus whether it is a credit.
 
-    Shared by the HTML and the PDF renderers. They cannot share markup -- the
-    PDF engine needs a much plainer subset -- but they must not disagree about
-    what a line actually says, so the formatting decisions live here once
-    rather than in whichever renderer the author last edited.
+    Used by both the HTML and the PDF templates, so a line reads the same in
+    every format.
     """
     subject = html.escape(str(line.get("Subject", "")))
     dates = html.escape(format_dates(line.get("Dates") or []))
     quantity = str(line.get("Quantity", 0))
     amount = line.get("Amount", 0)
     if line.get("Extra"):
-        # A line of the academy's own -- materials, a discount: an amount, no class.
+        # An extra line added by hand (materials, a discount): just an amount, no class.
         text = f"-{_money(abs(amount))}" if amount < 0 else _money(amount)
         return "", subject, "", "", text, amount < 0
     if line.get("Credit"):
-        # A cancelled class already billed for: no unit price to quote,
-        # because nothing is being charged.
+        # A credit for a class already billed: no unit price, since nothing is being charged.
         return quantity, subject, dates, "credit", f"-{_money(abs(amount))}", True
     hours = line.get("Hours", 0)
     rate = line.get("Rate", 0)
@@ -272,7 +254,7 @@ def _line_cells(line: dict[str, Any]) -> tuple[str, str, str, str, str, bool]:
 
 
 def _status_mark(invoice: dict[str, Any]) -> str:
-    """The banner across an invoice that is not the one to pay: a draft, or a voided one."""
+    """Return the banner shown across an invoice that isn't for paying: a draft or a void one."""
     if invoice.get("Status") == "Void":
         by = invoice.get("Replaced by")
         return ("<div class='draft'>VOID &mdash; replaced by invoice "
@@ -281,7 +263,7 @@ def _status_mark(invoice: dict[str, Any]) -> str:
 
 
 def _invoice_sheet(invoice: dict[str, Any]) -> str:
-    """The billing content for one invoice -- no <html>/<head>, just the sheet."""
+    """Return the HTML for one invoice's sheet, without the <html> and <head> around it."""
     lines = invoice.get("Lines") or []
     number = invoice.get("Number")
     issued = invoice.get("Issued") or dt.date.today()
@@ -290,9 +272,7 @@ def _invoice_sheet(invoice: dict[str, Any]) -> str:
 
     rows = ""
     for line in lines:
-        # Qty is the number of classes, not the row number: the unit price
-        # beside it already reads "rate x hours", so the two together
-        # explain the amount.
+        # Qty is the number of classes. With "rate x hours" next to it, the two explain the amount.
         quantity, subject, dates, unit, amount_text, is_credit = _line_cells(line)
         rows += (
             f"<tr class='credit'>" if is_credit else "<tr>"
@@ -370,7 +350,7 @@ def _invoice_sheet(invoice: dict[str, Any]) -> str:
 
 
 def render_invoice_html(invoice: dict[str, Any]) -> str:
-    """Build the full page for one invoice."""
+    """Return the full web page for one invoice."""
     number = invoice.get("Number")
     title = f"Invoice {'#' + str(number) if number else 'draft'} — {html.escape(invoice.get('Student', ''))}"
     return f"""<!DOCTYPE html>
@@ -383,11 +363,9 @@ def render_invoice_html(invoice: dict[str, Any]) -> str:
 
 
 def render_invoices_batch_html(invoices: list[dict[str, Any]]) -> str:
-    """Build one page holding several invoices, one per printed sheet of paper.
+    """Return one web page holding several invoices, one per printed page.
 
-    For "select several, issue them, now print them all" -- opening one file
-    and printing (or saving as PDF) once produces one invoice per page,
-    instead of downloading and printing each invoice separately.
+    Lets the admin print a whole batch at once instead of opening each invoice.
     """
     title = f"{len(invoices)} invoices" if len(invoices) != 1 else "1 invoice"
     body = "\n".join(_invoice_sheet(invoice) for invoice in invoices)
@@ -401,19 +379,18 @@ def render_invoices_batch_html(invoices: list[dict[str, Any]]) -> str:
 
 
 def _sheet_page_html(invoice: dict[str, Any]) -> str:
-    """A minimal document holding just one invoice, for screenshotting."""
+    """Return a bare page holding one invoice, for taking its screenshot."""
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>{_STYLE}</style></head>
 <body>{_invoice_sheet(invoice)}</body></html>"""
 
 
 def _screenshot_sheet(browser, invoice: dict[str, Any], scale: float) -> bytes:
+    """Take a PNG screenshot of one invoice, using an already-open browser."""
     page = browser.new_page(viewport={"width": 900, "height": 200}, device_scale_factor=scale)
     try:
         page.set_content(_sheet_page_html(invoice))
-        # The letterhead font loads over the network (Google Fonts) -- wait
-        # for it, or a screenshot taken mid-load would freeze the fallback
-        # system font into the image instead.
+        # Wait for the web font to load, or the picture would show the fallback font.
         page.evaluate("document.fonts.ready")
         return page.locator(".sheet").screenshot()
     finally:
@@ -423,18 +400,12 @@ def _screenshot_sheet(browser, invoice: dict[str, Any], scale: float) -> bytes:
 def render_invoices_png(
     invoices: list[dict[str, Any]], *, scale: float = 2.0, on_progress=None
 ) -> list[bytes]:
-    """Several invoices at once, as PNGs, sharing one browser instance.
+    """Turn several invoices into PNG images, using one browser for the whole batch.
 
-    Launching headless Chromium costs real time (roughly a second); reusing
-    one instance across a whole batch instead of relaunching it per invoice
-    is what keeps "issue 30 invoices, now image all of them" from being
-    dramatically slower than the single-invoice case.
-
-    ``on_progress(done, total)`` is called after each invoice.  A full month
-    runs to about six tenths of a second apiece, so a ninety-student month is
-    the better part of a minute -- long enough that the caller needs to be
-    able to show it moving rather than leave the admin looking at a page that
-    appears to have hung.
+    Starting Chromium takes about a second, so it is started once, not once per
+    invoice. Each invoice takes about 0.6 seconds, so a full month can take most
+    of a minute; on_progress(done, total) is called after each one so the screen
+    can show a progress bar.
     """
     from playwright.sync_api import sync_playwright
 
@@ -456,16 +427,11 @@ def render_invoices_png(
 
 @lru_cache(maxsize=1)
 def image_export_available() -> bool:
-    """Whether PNG export can actually run, not merely whether it imports.
+    """Return True if PNG export really works here.
 
-    The Playwright package installing successfully says nothing about the
-    Chromium it drives, which is a separate several-hundred-megabyte
-    download. On the deployed host the package is present and the browser is
-    not, so importing is exactly the wrong thing to test. Ask for the
-    executable's path and check something is really there.
-
-    Cached because this is consulted on every rerender of the invoice list
-    and the answer cannot change while the process is alive.
+    Playwright can be installed without the Chromium browser it needs (as on the
+    hosted app), so this checks the browser file is actually there. The answer is
+    cached, since it can't change while the app is running.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -480,13 +446,7 @@ def image_export_available() -> bool:
 
 @lru_cache(maxsize=1)
 def pdf_export_available() -> bool:
-    """Whether PDF export can run.
-
-    With xhtml2pdf this is simply "is it installed": it is pure Python, with
-    no system libraries behind it, which is the whole reason it was chosen
-    over better-looking engines for a host where nothing can be
-    apt-installed.
-    """
+    """Return True if PDF export works here, which just means xhtml2pdf is installed."""
     try:
         from xhtml2pdf import pisa  # noqa: F401
     except Exception:
@@ -494,14 +454,14 @@ def pdf_export_available() -> bool:
     return True
 
 
-# Adobe's stock Korean face. Used only for the characters that need it:
-# its Latin glyphs are fixed-width and look wrong next to the rest of the
-# invoice, and it is referenced rather than embedded, so it costs nothing in
-# file size. Registered lazily because it is a reportlab import.
+# Adobe's standard Korean font, used only for Korean characters (its English
+# letters are fixed-width and look out of place). It is referenced, not embedded,
+# so it adds nothing to the file size.
 _CJK_FONT = "HYGothic-Medium"
 
 
 def _register_cjk_font() -> None:
+    """Register the Korean font with reportlab, once."""
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
@@ -512,6 +472,7 @@ def _register_cjk_font() -> None:
 
 
 def _needs_cjk(character: str) -> bool:
+    """Return True for a character that needs the Korean font (Hangul or other CJK)."""
     code = ord(character)
     return (
         0x1100 <= code <= 0x11FF      # Hangul Jamo
@@ -524,17 +485,12 @@ def _needs_cjk(character: str) -> bool:
 
 
 def _cjk_spans(escaped: str) -> str:
-    """Mark runs of Korean text so the PDF switches font for just those.
+    """Wrap runs of Korean text in a span, so the PDF uses the Korean font for them.
 
-    The academy's students include Korean names, and the PDF engine's default
-    Helvetica has no Hangul at all -- it silently draws them as vertical
-    bars, so an invoice would go to a parent with their child's name turned
-    into gibberish. Rather than set the whole document in the CID font and
-    make every Latin word fixed-width, only the characters that need it are
-    switched.
-
-    Safe to run over already-escaped markup: escaping only ever emits ASCII,
-    so no entity can be split down the middle by this.
+    The PDF's default Helvetica has no Korean letters and draws them as bars,
+    which would garble a student's name. Only the Korean characters switch
+    font, so English text keeps its normal look. Safe on text that is already
+    HTML-escaped.
     """
     if not escaped:
         return escaped
@@ -604,18 +560,12 @@ td, th { vertical-align: top; }
 
 
 def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
-    """The same invoice, in the narrow dialect the PDF engine understands.
+    """Return the HTML for one invoice in the simpler form xhtml2pdf can handle.
 
-    Deliberately a second template rather than the shared one. The PDF engine
-    is not a browser: it has no flexbox, no ``nth-child``, no
-    ``border-radius`` and no webfonts, and it fails outright on a nested
-    table whose columns it cannot size. All of those appear in ``_STYLE``,
-    which exists to look right in a browser and should not be dragged down to
-    a lowest common denominator to keep this path alive.
-
-    What the two templates must agree on is the *content* of a line, and they
-    do -- both go through ``_line_cells``. Row striping is written out as an
-    explicit class here because ``nth-child`` silently does nothing.
+    xhtml2pdf has no flexbox, nth-child, rounded corners or web fonts, and fails
+    on nested tables it can't size, so this is a separate template from the web
+    page. The lines themselves still come from _line_cells, so the content is
+    the same. Row striping uses a class because nth-child doesn't work here.
     """
     rows = ""
     for index, line in enumerate(invoice.get("Lines") or []):
@@ -688,14 +638,11 @@ def _sheet_pdf_html(invoice: dict[str, Any]) -> str:
 def render_invoices_pdf(
     invoices: list[dict[str, Any]], *, on_progress=None
 ) -> list[bytes]:
-    """Several invoices, each as its own one-page A4 PDF, without a browser.
+    """Turn several invoices into one-page A4 PDFs, without a browser.
 
-    ``on_progress(done, total)`` is called after each invoice, matching
-    ``render_invoices_png`` so either format drives the same progress bar.
-
-    A failed conversion raises rather than returning a broken file. A zip of
-    silently empty PDFs going out to parents is a far worse outcome than an
-    error the admin can see and fall back from.
+    on_progress(done, total) is called after each invoice, the same as for
+    PNGs. A conversion that fails raises an error instead of returning an
+    empty file, so a broken PDF never goes out to a parent.
     """
     from xhtml2pdf import pisa
 
