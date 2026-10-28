@@ -138,9 +138,9 @@ def _md(text: str) -> str:
 # glance. Streamlit draws ``:color-badge[...]`` in any of its Markdown:
 # alerts, captions, toasts.
 CHIP_COLOURS = {"student": "blue", "teacher": "violet", "subject": "orange",
-                "when": "gray", "money": "green"}
+                "when": "gray", "money": "green", "flag": "red"}
 _CHIP_KEY = {"student": "Student", "teacher": "Teacher", "subject": "Subject",
-             "when": "Date / time", "money": "Amount"}
+             "when": "Date / time", "money": "Amount", "flag": "Needs attention"}
 _MARKDOWN_SYNTAX = re.compile(r"([\\`*_{}\[\]<>()#+\-.!|$:~])")
 
 
@@ -176,6 +176,11 @@ def _money(amount) -> str:
     return _chip("money", amount if isinstance(amount, str) else f"${float(amount):,.2f}")
 
 
+def _flag(text) -> str:
+    """Something that needs doing, such as a missing price or an overdue invoice, in red."""
+    return _chip("flag", text)
+
+
 def _chips(kind: str, names, most: int = 6) -> str:
     """Several of one kind, "A, B and C", or "A, B, C and 4 more" past ``most``."""
     chips = [_chip(kind, name) for name in names]
@@ -187,6 +192,50 @@ def _chips(kind: str, names, most: int = 6) -> str:
 def _chip_key() -> None:
     """What the colours mean, once, beside Sign out."""
     st.sidebar.markdown(" ".join(_chip(kind, label) for kind, label in _CHIP_KEY.items()))
+
+
+# Table cells in the same colours as the badges: (text, background).
+_CELL_COLOURS = {
+    "student": ("rgb(0, 84, 163)", "rgba(28, 131, 255, 0.1)"),
+    "teacher": ("rgb(88, 63, 132)", "rgba(154, 93, 255, 0.1)"),
+    "subject": ("rgb(226, 102, 12)", "rgba(255, 164, 33, 0.1)"),
+    "when": ("rgba(49, 51, 63, 0.75)", "rgba(49, 51, 63, 0.06)"),
+    "money": ("rgb(21, 130, 55)", "rgba(33, 195, 84, 0.1)"),
+    "flag": ("rgb(189, 64, 67)", "rgba(255, 43, 43, 0.1)"),
+}
+# What each table column holds, by its heading. A table can set others
+# itself, for a heading that means something else there.
+_COLUMN_KINDS = {
+    "Student": "student", "Who": "student",
+    "Teacher": "teacher",
+    "Subject": "subject", "Subjects": "subject",
+    "Date": "when", "Dates": "when", "From": "when", "To": "when", "Issued": "when",
+    "Month": "when", "On": "when", "Overdue since": "when",
+    "Amount": "money", "Total (SGD)": "money", "Rate": "money", "Price": "money",
+    "Unit price": "money", "Invoiced": "money", "Still to invoice": "money",
+    "Per teaching hour": "money",
+}
+
+
+def _plain_number(value) -> str:
+    """A number written the way an unstyled table shows it: 1.5, 65, 97.5."""
+    return ("%f" % value).rstrip("0").rstrip(".")
+
+
+def _coloured(rows, kinds: dict | None = None):
+    """A table for st.dataframe, with its student, teacher, subject, date and money columns coloured."""
+    frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
+    styler = frame.style
+    # A styled table would print 1.5 as 1.500000, so decimals keep their plain form.
+    decimals = [column for column in frame.columns if pd.api.types.is_float_dtype(frame[column])]
+    if decimals:
+        styler = styler.format(_plain_number, subset=decimals, na_rep="")
+    for column in frame.columns:
+        kind = (kinds or {}).get(column, _COLUMN_KINDS.get(column))
+        if kind:
+            colour, background = _CELL_COLOURS[kind]
+            styler = styler.set_properties(subset=[column], **{"color": colour, "background-color": background})
+    return styler
 
 
 def _flash(message: str, kind: str = "success") -> None:
@@ -503,7 +552,7 @@ def _import_detail(preview: dict) -> None:
     if view == "Subject":
         st.caption(f"{len(by_subject)} subject(s) across {len(sessions)} class(es).")
         st.dataframe(
-            [
+            _coloured([
                 {
                     "Subject": name,
                     "Classes": data["Sessions"],
@@ -514,14 +563,14 @@ def _import_detail(preview: dict) -> None:
                     "Who": ", ".join(sorted(data["Students"])),
                 }
                 for name, data in sorted(by_subject.items())
-            ],
+            ]),
             width="stretch",
             hide_index=True,
         )
     else:
         st.caption(f"{len(by_student)} student(s) found in the workbook.")
         st.dataframe(
-            [
+            _coloured([
                 {
                     "Student": name,
                     "Classes": data["Sessions"],
@@ -530,7 +579,7 @@ def _import_detail(preview: dict) -> None:
                     "Flagged": ", ".join(sorted(data["Conditions"])),
                 }
                 for name, data in sorted(by_student.items())
-            ],
+            ]),
             width="stretch",
             hide_index=True,
         )
@@ -601,7 +650,7 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
         return
     st.markdown("**What this changes**")
     st.dataframe(
-        [
+        _coloured([
             {
                 "Month": f"{calendar.month_abbr[month]} {year}",
                 "New": counts["new"],
@@ -611,7 +660,7 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
                 "Not added": counts["clash"] + counts["skipped"],
             }
             for (year, month), counts in sorted(plan.items())
-        ],
+        ]),
         width="stretch",
         hide_index=True,
     )
@@ -791,7 +840,7 @@ def _import_upload_panel() -> None:
             first, second = review["names"]
             first_count, second_count = review["counts"]
             choice = st.radio(
-                f"'{first}' ({first_count}×) vs '{second}' ({second_count}×) "
+                f"{_student(first)} ({first_count}×) vs {_student(second)} ({second_count}×) "
                 f"— {review['reason_text']}",
                 ["Keep separate", "Merge — same person"],
                 index=1 if review.get("likely_same") else 0,
@@ -815,9 +864,9 @@ def _import_upload_panel() -> None:
                 "letter": "one letter different",
             }.get(candidate["reason"], "similar spelling")
             choice = st.radio(
-                f"'{candidate['parsed_name']}' — {reason_text} to existing "
-                f"student '{candidate['existing_name']}'",
-                ["New / different person", f"Same as '{candidate['existing_name']}'"],
+                f"{_student(candidate['parsed_name'])} — {reason_text} to existing "
+                f"student {_student(candidate['existing_name'])}",
+                ["New / different person", f"Same as {_student(candidate['existing_name'])}"],
                 index=1 if candidate.get("likely_same") else 0,
                 horizontal=True,
                 key=f"import_match_{scope}_{index}",
@@ -857,7 +906,7 @@ def _import_upload_panel() -> None:
                     + (_chips("student", students, most=99) or "nobody listed")
                 )
                 typed = st.text_input(
-                    f"Subject for {placeholder}",
+                    f"Subject for {_subject(placeholder)}",
                     key=f"import_unnamed_{generation}_{placeholder}",
                     placeholder="e.g. Upper-Sec Science",
                 ).strip()
@@ -875,8 +924,8 @@ def _import_upload_panel() -> None:
                 keep, drop = item["keep"], item["drop"]
                 kept_n, drop_n = item["counts"]
                 choice = st.radio(
-                    f"'{drop}' ({drop_n} class(es)) and '{keep}' ({kept_n} class(es))",
-                    [f"Merge into '{keep}'", "Keep separate"],
+                    f"{_subject(drop)} ({drop_n} class(es)) and {_subject(keep)} ({kept_n} class(es))",
+                    [f"Merge into {_subject(keep)}", "Keep separate"],
                     key=f"import_merge_{scope}_{index}",
                     horizontal=True,
                 )
@@ -900,7 +949,7 @@ def _import_upload_panel() -> None:
             st.caption("Each subject name must be unique across the academy.")
             for original, suggestion in renames.items():
                 new_name = st.text_input(
-                    f"Rename '{original}'",
+                    f"Rename {_subject(original)}",
                     value=suggestion,
                     key=f"import_rename_{generation}_{original}",
                 )
@@ -1037,10 +1086,13 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
     typed: dict[int, str] = {}
     for item in unnamed:
         slot = item["Class"].split("·", 1)[-1].strip() if "·" in item["Class"] else ""
-        who = ", ".join(item["Students"][:4]) + (" …" if len(item["Students"]) > 4 else "")
-        span = (f"{item['First']:%d %b}–{item['Last']:%d %b}" if item["First"] else "no classes")
+        who = _chips("student", item["Students"], most=4)
+        span = (_when(f"{item['First']:%d %b}–{item['Last']:%d %b}") if item["First"] else "no classes")
         typed[item["Class ID"]] = st.text_input(
-            f"{item['Teacher']} · {slot or 'no time'} · {item['Lessons']} class(es), {span} · {who}",
+            # An unnamed group is labelled by its weekly time, or by its one student.
+            f"{_teacher(item['Teacher'])} · "
+            f"{(_when(slot) if re.search(r'[0-9]:[0-9]', slot) else _student(slot)) if slot else 'no time'} · "
+            f"{item['Lessons']} class(es), {span} · {who}",
             key=f"name_subject_{key}_{item['Class ID']}",
             placeholder="Subject name, e.g. G9 English",
         )
@@ -1082,7 +1134,7 @@ def _unpriced_everywhere() -> None:
     with st.expander("Which, and the price each would get"):
         rule = schedule_backfill.price_rule(unpriced)
         st.dataframe(
-            [
+            _coloured([
                 {
                     "Teacher": item["Teacher"],
                     "Subject": item["Class"],
@@ -1092,7 +1144,7 @@ def _unpriced_everywhere() -> None:
                     "Because": rule[item["Class ID"]][1] or "the grade in its name",
                 }
                 for item in unpriced
-            ],
+            ]),
             width="stretch",
             hide_index=True,
         )
@@ -1196,14 +1248,14 @@ def _bulk_rate_section(
         # The placeholder an import seeds is not a price anybody chose, so it
         # reads as unset here -- same as it does in the Invoices warning.
         if not (month_rate and month_rate > db.UNSET_RATE):
-            rate_text = "no price"
+            rate_text = _flag("no price")
         elif starts is None or starts == month_start:
-            rate_text = f"${month_rate:,.0f}/h"
+            rate_text = _money(f"${month_rate:,.0f}/h")
         else:
-            rate_text = f"${month_rate:,.0f}/h since {calendar.month_abbr[starts.month]}" + (
+            rate_text = _money(f"${month_rate:,.0f}/h") + f" since {calendar.month_abbr[starts.month]}" + (
                 f" {starts.year}" if starts.year != year else "")
         # Not when an import already named the subject for its teacher.
-        who = (f" ({item['Teacher']})" if show_teacher and item.get("Teacher")
+        who = (f" with {_teacher(item['Teacher'])}" if show_teacher and item.get("Teacher")
                and not item["Class"].endswith(f"({item['Teacher']})") else "")
         # What the rule says it costs, when that differs from what it is on
         # now: the price is a rule, and a screen that knows the rule should
@@ -1211,13 +1263,13 @@ def _bulk_rate_section(
         standard, why, certain = rule[class_id]
         unset = not (month_rate and month_rate > db.UNSET_RATE)
         if certain and abs((month_rate or 0) - standard) > 0.005:
-            suggestion = f" (standard ${standard:,.0f}" + (f", {why})" if why else ")")
+            suggestion = f", standard {_money(f'${standard:,.0f}')}" + (f" ({why})" if why else "")
         elif not certain and unset:
-            suggestion = f" (${standard:,.0f} by default, {why})"
+            suggestion = f", {_money(f'${standard:,.0f}')} by default ({why})"
         else:
             suggestion = ""
         checked = st.checkbox(
-            f"{item['Class']}{who} — {rate_text} · {item['Sessions']} classes{suggestion}",
+            f"{_subject(item['Class'])}{who} — {rate_text} · {item['Sessions']} classes{suggestion}",
             key=f"bulk_rate_pick_{scope}_{class_id}",
         )
         if checked:
@@ -1322,7 +1374,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
         st.checkbox("Select all", key=f"del_subj_all_{scope}", on_change=_select_all)
         picked = [
             item["ID"] for item in subjects
-            if st.checkbox(item["Class"], key=f"del_subj_{scope}_{item['ID']}")
+            if st.checkbox(_subject(item["Class"]), key=f"del_subj_{scope}_{item['ID']}")
         ]
         if not picked:
             st.caption("Tick the subjects to remove.")
@@ -1330,7 +1382,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
 
         impact = db.describe_class_deletion(picked)
         st.dataframe(
-            [
+            _coloured([
                 {
                     "Subject": row["Class"],
                     "Classes": row["Lessons"],
@@ -1340,7 +1392,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
                     "To": row["Last"],
                 }
                 for row in impact
-            ],
+            ]),
             width="stretch",
             hide_index=True,
         )
@@ -1444,7 +1496,7 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     class_lessons = sorted(by_class[class_id], key=lambda item: (item["Date"], item["Start"]))
     class_name = class_lessons[0]["Class"]
 
-    st.markdown(f"###### {class_name} — {calendar.month_name[month]} {year}")
+    st.markdown(f"###### {_subject(class_name)} — {_when(f'{calendar.month_name[month]} {year}')}")
     # One query for the month's rosters, not two per class listed: the
     # Schedule screen already reads them this way, and a busy subject here
     # was thirty round trips to a database an ocean away.
@@ -1491,14 +1543,14 @@ def teachers_tab() -> None:
             for item in db.get_all_classes():
                 per_teacher[item["Teacher"]] = per_teacher.get(item["Teacher"], 0) + 1
             st.dataframe(
-                [
+                _coloured([
                     {
                         "Teacher": item["Name"],
                         "Subjects": per_teacher.get(item["Name"], 0),
                         "Active": item["Active"],
                     }
                     for item in teachers
-                ],
+                ], {"Subjects": None}),
                 width="stretch",
                 hide_index=True,
                 height=250,
@@ -1709,7 +1761,8 @@ def students_tab() -> None:
         marker = " 📝" if student_notes.get(item["ID"]) else ""
         parent = f" · {item['Parent']}" if item["Parent"] else ""
         owes = breakdowns.get(item["ID"], {}).get("total") or 0
-        with st.expander(f"{item['Name']}{parent}{marker}" + (f" — ${owes:,.0f}" if owes else "")):
+        with st.expander(f"{_student(item['Name'])}{parent}{marker}"
+                         + (f" — {_money(f'${owes:,.0f}')}" if owes else "")):
             breakdown = breakdowns.get(item["ID"], {"lines": [], "total": 0.0})
             if breakdown["lines"]:
                 # A subject still on the import's placeholder has no price
@@ -1718,7 +1771,7 @@ def students_tab() -> None:
                 priced = [line for line in breakdown["lines"] if line["Rate"] > db.UNSET_RATE]
                 unpriced = len(breakdown["lines"]) - len(priced)
                 st.dataframe(
-                    [
+                    _coloured([
                         {
                             "Subject": line["Subject"],
                             "Teacher": line["Teacher"],
@@ -1730,7 +1783,7 @@ def students_tab() -> None:
                                        else "—"),
                         }
                         for line in breakdown["lines"]
-                    ],
+                    ]),
                     width="stretch",
                     hide_index=True,
                 )
@@ -2707,7 +2760,7 @@ def _invoice_table(invoice: dict) -> None:
         st.caption("No classes on this invoice yet.")
         return
     st.dataframe(
-        [
+        _coloured([
             {
                 "Qty": line["Quantity"],
                 "Subject": line["Subject"],
@@ -2723,7 +2776,7 @@ def _invoice_table(invoice: dict) -> None:
                 "Amount": f"{line['Amount']:,.2f}",
             }
             for line in lines
-        ],
+        ]),
         width="stretch",
         hide_index=True,
     )
@@ -2752,7 +2805,7 @@ def _just_issued_panel(year: int, month: int) -> None:
 
     period = f"{calendar.month_name[month]} {year}"
     st.divider()
-    st.markdown(f"#### Just issued — {len(details)} invoice(s) for {period}")
+    st.markdown(f"#### Just issued — {len(details)} invoice(s) for {_when(period)}")
 
     scope = f"{year}_{month}"
 
@@ -2766,7 +2819,7 @@ def _just_issued_panel(year: int, month: int) -> None:
     chosen = []
     for detail in details:
         if st.checkbox(
-            f"#{detail['Number']} — {detail['Student']} — ${detail['Total']:,.2f}",
+            f"#{detail['Number']} — {_student(detail['Student'])} — {_money(detail['Total'])}",
             key=f"ji_pick_{scope}_{detail['ID']}",
         ):
             chosen.append(detail)
@@ -2944,8 +2997,9 @@ def credits_tab() -> None:
         return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
 
     def line(credit):
-        return (f"{when(credit)} · {credit['Subject']} · {credit['Teacher'] or '—'} · "
-                f"${credit['Amount']:,.2f} · {credit['Reason']}")
+        return (f"{_when(when(credit))} · {_subject(credit['Subject'])} · "
+                f"{_teacher(credit['Teacher']) if credit['Teacher'] else '—'} · "
+                f"{_money(credit['Amount'])} · {credit['Reason']}")
 
     # One line a student, with what they are owed; open it for the classes
     # behind the figure. A parent asks "why is there a credit on my bill",
@@ -2961,7 +3015,7 @@ def credits_tab() -> None:
     for owed in sorted(by_student.values(), key=lambda cs: cs[0]["Student"].casefold()):
         student_id = owed[0]["Student ID"]
         with st.expander(
-            f"**{owed[0]['Student']}** — ${sum(c['Amount'] for c in owed):,.2f} "
+            f"{_student(owed[0]['Student'])} — {_money(sum(c['Amount'] for c in owed))} "
             f"· {len(owed)} class(es)"
         ):
             st.caption("Tick a class only if its money has already been paid back to the parent.")
@@ -2994,11 +3048,11 @@ def credits_tab() -> None:
                     key=lambda cs: max(c["Settled"] or dt.date.min for c in cs), reverse=True)
     for done in latest[:60]:
         with st.expander(
-            f"{done[0]['Student']} — ${sum(c['Amount'] for c in done):,.2f} "
+            f"{_student(done[0]['Student'])} — {_money(sum(c['Amount'] for c in done))} "
             f"· {len(done)} class(es)"
         ):
             st.dataframe(
-                [
+                _coloured([
                     {
                         "Class": when(c),
                         "Subject": c["Subject"],
@@ -3010,7 +3064,7 @@ def credits_tab() -> None:
                         "On": c["Settled"],
                     }
                     for c in sorted(done, key=lambda c: c["Class date"] or dt.date.min)
-                ],
+                ], {"Class": "when"}),
                 width="stretch",
                 hide_index=True,
             )
@@ -3054,7 +3108,7 @@ def _issued_lookup_section(counts: dict) -> None:
         ]
         st.caption(f"{len(found)} of {len(issued)} shown, newest first.")
         st.dataframe(
-            [
+            _coloured([
                 {
                     "Invoice": f"#{item['Number']}" + (
                         f" · void, now #{item['Replaced by']}" if item["Status"] == "Void" else ""),
@@ -3064,7 +3118,7 @@ def _issued_lookup_section(counts: dict) -> None:
                     "Total (SGD)": f"{item['Total']:,.2f}",
                 }
                 for item in found[:100]
-            ],
+            ]),
             width="stretch",
             hide_index=True,
         )
@@ -3138,7 +3192,7 @@ def _number_changer(detail: dict) -> None:
     )
     with st.form(f"{key}_clash_form", border=False):
         move_to = st.number_input(
-            f"New number for {holder['Student']}'s invoice", min_value=db.INVOICE_NUMBER_START,
+            f"New number for {_student(holder['Student'])}'s invoice", min_value=db.INVOICE_NUMBER_START,
             value=db.get_next_invoice_number()["top"], step=1,
             help=f"#{detail['Number']} swaps the two invoices' numbers.",
         )
@@ -3429,10 +3483,11 @@ def _out_of_step_warning() -> None:
     with st.expander("Which, and what changed"):
         for entry in found[:40]:
             columns = st.columns([6, 1, 1.4])
-            changes = "; ".join(f"{change['Date']:%d %b} {change['Subject']}: {change['What']}"
+            changes = "; ".join(f"{_when(change['Date'].strftime('%d %b'))} {_subject(change['Subject'])}: "
+                                + _md(change["What"])
                                 for change in entry["Changes"][:3])
             more = len(entry["Changes"]) - 3
-            columns[0].markdown(f"**#{entry['Number']}** · {_student(entry['Student'])} — {_md(changes)}"
+            columns[0].markdown(f"**#{entry['Number']}** · {_student(entry['Student'])} — {changes}"
                                 + (f" and {more} more" if more > 0 else ""))
             if columns[1].button("Edit", key=f"oos_edit_{entry['ID']}", width="stretch"):
                 st.session_state["invoice_reference_open"] = True
@@ -3461,8 +3516,8 @@ def _unpriced_warning(year: int, month: int) -> None:
     lessons = sum(item["Sessions"] for item in unpriced)
     hours = sum(item["Hours"] for item in unpriced)
     st.warning(
-        f"**{len(unpriced)} subject(s) have no price for "
-        f"{calendar.month_name[month]} {year}** — {lessons} class(es) ({hours:,.1f}h) "
+        f"**{len(unpriced)} subject(s) have no price for** "
+        f"{_when(f'{calendar.month_name[month]} {year}')} — {lessons} class(es) ({hours:,.1f}h) "
         "can't be invoiced until they do."
     )
     _price_all_button(
@@ -3490,7 +3545,7 @@ def _month_download(year: int, month: int) -> None:
     """
     period = f"{calendar.month_name[month]} {year}"
     issued = db.get_issued_invoices_for_month(year, month)
-    st.markdown(f"###### Download {period}'s invoices ({len(issued)})")
+    st.markdown(f"###### Download the invoices for {_when(period)} ({len(issued)})")
     if not issued:
         st.caption(f"None issued for {_when(period)} yet.")
         return
@@ -3566,8 +3621,8 @@ def _past_invoices_section(counts: dict, year: int, month: int) -> None:
         }
         for invoice in shown_open:
             with st.expander(
-                f"{invoice['Student']} — {invoice['Classes']} class(es), "
-                f"${invoice['Total']:,.2f}"
+                f"{_student(invoice['Student'])} — {invoice['Classes']} class(es), "
+                f"{_money(invoice['Total'])}"
             ):
                 _invoice_table(invoice)
                 # No "bill the whole thing" button. An invoice covers one
@@ -3707,7 +3762,7 @@ def _number_clash(numbering: dict) -> None:
     )
     with st.form("number_clash_form", border=False):
         move_to = st.number_input(
-            f"New number for {holder['Student']}'s invoice", min_value=db.INVOICE_NUMBER_START,
+            f"New number for {_student(holder['Student'])}'s invoice", min_value=db.INVOICE_NUMBER_START,
             value=numbering["top"], step=1,
         )
         move = st.form_submit_button(f"Renumber it and use #{wanted} next", type="primary",
@@ -3755,8 +3810,8 @@ def invoices_tab() -> None:
     # One line, not a four-metric dashboard: there is only ever one question
     # on this screen -- how much is there to send this month.
     st.markdown(
-        f"#### {period} — {summary['to_bill_count']} to bill, "
-        f"${summary['to_bill_value']:,.2f}"
+        f"#### {_when(period)} — {summary['to_bill_count']} to bill, "
+        f"{_money(summary['to_bill_value'])}"
     )
     trail = f"{summary['billed_count']} already sent, {_money(summary['billed_value'])}"
     if summary.get("credit_outstanding"):
@@ -3789,7 +3844,7 @@ def invoices_tab() -> None:
             every = st.checkbox(f"All {len(month_items)}", key="invoice_select_all")
             ticked = {
                 row["Invoice ID"]: st.checkbox(
-                    f"{row['Student']} — {row['Classes']} class(es), ${row['Month Amount']:,.2f}",
+                    f"{_student(row['Student'])} — {row['Classes']} class(es), {_money(row['Month Amount'])}",
                     key=f"inv_pick_{row['Invoice ID']}",
                 )
                 for row in month_items
@@ -3912,11 +3967,11 @@ def payments_tab() -> None:
     collected = round(
         sum(r["Paid amount"] if r["Paid amount"] is not None else r["Total"] for r in paid), 2
     )
-    st.markdown(f"#### {period} — {len(unpaid)} to collect, ${outstanding:,.2f}")
+    st.markdown(f"#### {_when(period)} — {len(unpaid)} to collect, {_money(outstanding)}")
     trail = f"{len(paid)} paid, {_money(collected)} · due {_when(data['due'].strftime('%d %b %Y'))}"
     late = [row for row in unpaid if row["Overdue"] > 0]
     if late:
-        trail += f" · **{len(late)} overdue**"
+        trail += f" · {_flag(f'{len(late)} overdue')}"
     st.caption(trail)
 
     if not unpaid:
@@ -3942,16 +3997,16 @@ def payments_tab() -> None:
             every = shown and st.checkbox(f"All {len(shown)} below" if search else f"All {len(shown)}")
             ticks = {}
             for row in shown:
-                bits = [f"{row['Student']} — ${row['Owing']:,.2f}"]
+                bits = [f"{_student(row['Student'])} — {_money(row['Owing'])}"]
                 if row["Owing"] < row["Total"] - 0.005:
-                    bits.append(f"part paid, ${row['Total']:,.2f} invoice")
+                    bits.append(f"part paid, {_money(row['Total'])} invoice")
                 bits.append(f"#{row['Number']}")
                 if row.get("Covers"):
                     # Billed whole rather than a month at a time, so the amount
                     # beside their name is not only this month's classes.
-                    bits.append(f"covers {row['Covers']}")
+                    bits.append(f"covers {_when(row['Covers'])}")
                 if row["Overdue"]:
-                    bits.append(f"**{row['Overdue']} days overdue**")
+                    bits.append(_flag(f"{row['Overdue']} days overdue"))
                 ticks[row["ID"]] = st.checkbox(" · ".join(bits), key=f"pay_pick_{row['ID']}")
             if not shown:
                 st.caption("Nobody matches that search.")
@@ -4804,7 +4859,7 @@ def reminders_tab() -> None:
         )
 
     st.dataframe(
-        [
+        _coloured([
             {
                 "Student": item["Student"],
                 "Invoice": f"#{item['Number']}" if item["Number"] else "",
@@ -4816,7 +4871,7 @@ def reminders_tab() -> None:
                 "Days": item["Days overdue"],
             }
             for item in show
-        ],
+        ], {"Days": "flag"}),
         width="stretch",
         hide_index=True,
     )
