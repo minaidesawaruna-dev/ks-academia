@@ -1,21 +1,22 @@
-"""KS Academia — scheduling and attendance.
+"""KS Academia: the admin app for schedules, invoices and payments.
 
-Eight tabs:
+Nine screens:
 
-* **Teachers** — upload a teacher's Excel schedule (the primary way classes
-  enter the system), price a month's subjects, and read one subject's classes.
-* **Students** — who took a class in a given month, and what it would come to
-  at today's prices.
-* **Schedule** — the month grid, for one-off manual fixes.
-* **Invoices** — bill students for a month's unbilled classes.
-* **Payments** — record what parents have actually paid, in full or in part.
-* **Credits** — classes invoiced and then missed, owed back off the next invoice.
-* **Data** — what was taught and invoiced, per teacher by month; and past
-  schedules kept for analysis only.
-* **Reminders** — students overdue on payment.
+* Teachers: upload a teacher's Excel schedule (the main way lessons get
+  into the app), price a month's subjects, and list one subject's lessons.
+* Students: who had a lesson in a month, and what it comes to.
+* Schedule: the month grid, for one-off fixes by hand.
+* Create schedule: plan a teacher's month and download it as their sheet.
+* Invoices: bill students for a month's lessons.
+* Payments: record what parents have paid, in full or in part.
+* Credits: lessons invoiced and then missed, which come off the next invoice.
+* Data: what was taught and invoiced, per teacher and month, plus past
+  schedules kept for those figures.
+* Reminders: invoices past their due date.
 
-A *subject* is what a teacher teaches — its rate and colour. A *class* is one
-dated sitting of that subject, with its own students, times and conditions.
+A subject is what a teacher teaches, with its price and colour. A class
+(or lesson) is one dated sitting of a subject, with its own students,
+times and conditions.
 
 Run with:  streamlit run app.py
 """
@@ -33,13 +34,12 @@ import time
 import zipfile
 from pathlib import Path
 
-# The academy is in Singapore and the host runs on UTC, so until 8am the
-# server's "today" was still yesterday: overdue counts ran a day short, and
-# on the 1st the month in progress was still last month. Every date.today()
-# here and in db.py reads the process clock, so it is set once, first. A
-# POSIX rule rather than "Asia/Singapore" so it needs no tz database on the
-# host; Singapore keeps no daylight saving. (Windows has no tzset, and a
-# machine there is already on local time.)
+# The academy is in Singapore but the host runs on UTC, so before 8am the server's
+# "today" was still yesterday: overdue counts were a day short, and on the 1st the
+# current month was still last month. Every date.today() here and in db.py uses
+# the process clock, so it's set first. "SGT-8" needs no time zone files on the
+# host, and Singapore has no daylight saving. (Windows has no tzset, and a
+# Windows machine is already on local time.)
 os.environ["TZ"] = "SGT-8"
 if hasattr(time, "tzset"):
     time.tzset()
@@ -73,30 +73,28 @@ st.set_page_config(
     page_title="KS Academia",
     page_icon=_APP_ICON if (ASSETS_DIR / "ks_icon.png").exists() else "📘",
     layout="wide",
-    # The sidebar exists only to hold "signed in as" and the sign-out button,
-    # so it starts out of the way rather than taking a column from the
-    # schedule grid.
+    # The sidebar only holds "signed in as" and Sign out, so it starts closed and
+    # leaves the full width for the schedule grid.
     initial_sidebar_state="collapsed",
 )
 
-# Before the database is touched and before a single student's name is drawn.
-# The host's own private-app setting was found to still serve the running app
-# on its internal path, so the gate has to be here rather than delegated.
+# Sign-in comes before the database is touched or any student's name is shown.
+# The host's own private-app setting still served the app on an internal path,
+# so the check has to be here.
 _authenticator = auth.require_login()
 auth.logout_button(_authenticator)
 
 @st.cache_resource
 def _ensure_database_ready(tables: tuple[str, ...]) -> bool:
-    """Check the schema once per process rather than once per click.
+    """Check the database tables once per process, not on every click.
 
-    Streamlit re-runs this file from the top on every interaction, so
-    anything at module scope is on the critical path of every button press.
-    Even the cheap version of this check is a few round trips, which is
-    little beside the database, but paid on every click all the same.
+    Streamlit reruns this file from the top on every click, so anything at
+    the top level runs on every button press. Even the quick check costs a
+    few database round trips each time.
 
-    Keyed on the tables the code defines: a deploy the host picks up without
-    restarting keeps this cache, and would otherwise run code that needs a
-    new table against a database that does not have it yet.
+    The cache key is the list of tables the code defines. If a new version
+    is deployed without a restart, a new table changes the key, so the check
+    runs again instead of the new code hitting a database without the table.
     """
     db.initialise_database()
     return True
@@ -106,18 +104,18 @@ _ensure_database_ready(tuple(sorted(db.Base.metadata.tables)))
 
 LESSON_STATUSES = ["Scheduled", "Completed", "Cancelled"]
 
-# A student has one condition per class, so this is a single choice rather
-# than three independent ticks that could all be on at once.
+# A student has one condition per class, so it's one choice, not three ticks that
+# could all be on at once.
 IN_CLASS = "In class"
 CONDITIONS = [IN_CLASS, "Online", "Recording", "Cancelled"]
 
-# "A month" of a weekly class is four sittings on the same weekday.
+# "A month" of a weekly class is four lessons on the same weekday.
 WEEKS_PER_MONTH = 4
 
-# How many open invoices to draw at once in the browse-everything list.
-# Every row builds a downloadable invoice file up front, so this is a limit
-# on payload and widget count, not on the data itself -- the search box
-# beside it is how you reach the rest.
+# DELETE_PHRASE is the word typed to confirm deleting subjects. The row limits say
+# how many open invoices, students and paid invoices to draw at once: each row
+# builds its widgets (and sometimes an invoice file) up front, so these keep the
+# pages quick. The search box reaches the rest.
 DELETE_PHRASE = "delete"
 OPEN_INVOICE_ROWS = 25
 STUDENT_ROWS = 25
@@ -125,18 +123,18 @@ PAID_ROWS = 40
 
 
 def _rerun() -> None:
+    """Start the page again from the top."""
     st.rerun()
 
 
 def _md(text: str) -> str:
-    """Money for markdown: two "$" on one line are read as a formula, so escape them."""
+    """Escape "$" for markdown: two of them on one line are read as a formula."""
     return text.replace("$", r"\$")
 
 
-# What a sentence is read for -- who, which subject, when, how much -- each
-# kind in one colour wherever it appears, so a message is taken in at a
-# glance. Streamlit draws ``:color-badge[...]`` in any of its Markdown:
-# alerts, captions, toasts.
+# Each kind of word (who, which subject, when, how much) gets one colour wherever
+# it appears, so a message can be read at a glance. Streamlit draws
+# :color-badge[...] in any of its markdown: alerts, captions, toasts.
 CHIP_COLOURS = {"student": "blue", "teacher": "violet", "subject": "orange",
                 "when": "gray", "money": "green", "flag": "red"}
 _CHIP_KEY = {"student": "Student", "teacher": "Teacher", "subject": "Subject",
@@ -145,44 +143,49 @@ _MARKDOWN_SYNTAX = re.compile(r"([\\`*_{}\[\]<>()#+\-.!|$:~])")
 
 
 def _chip(kind: str, text) -> str:
-    """``text`` as a badge in its kind's colour.
+    """Return `text` as a badge in its kind's colour.
 
-    Everything Markdown or the badge would read as syntax is escaped, so a
-    name with a bracket in it, or two amounts on one line (otherwise read as
-    a formula), shows exactly as written.
+    Anything markdown or the badge would treat as syntax is escaped, so a
+    name with a bracket, or two amounts on one line (otherwise read as a
+    formula), shows exactly as written.
     """
     safe = _MARKDOWN_SYNTAX.sub(r"\\\1", str(text))
     return f":{CHIP_COLOURS[kind]}-badge[{safe}]"
 
 
 def _student(name) -> str:
+    """Return a name as a student badge."""
     return _chip("student", name)
 
 
 def _teacher(name) -> str:
+    """Return a name as a teacher badge."""
     return _chip("teacher", name)
 
 
 def _subject(name) -> str:
+    """Return a name as a subject badge."""
     return _chip("subject", name)
 
 
 def _when(text) -> str:
+    """Return a date or time as a badge."""
     return _chip("when", text)
 
 
 def _money(amount) -> str:
-    """An amount as a badge: a number is written $1,234.50, text as given."""
+    """Return an amount as a badge: a number is written $1,234.50, text as given."""
     return _chip("money", amount if isinstance(amount, str) else f"${float(amount):,.2f}")
 
 
 def _flag(text) -> str:
-    """Something that needs doing, such as a missing price or an overdue invoice, in red."""
+    """Return something that needs doing, like a missing price, as a red badge.
+    """
     return _chip("flag", text)
 
 
 def _chips(kind: str, names, most: int = 6) -> str:
-    """Several of one kind, "A, B and C", or "A, B, C and 4 more" past ``most``."""
+    """Return several badges of one kind: "A, B and C", or "A, B, C and 4 more" past `most`."""
     chips = [_chip(kind, name) for name in names]
     if len(chips) > most:
         return ", ".join(chips[:most]) + f" and {len(chips) - most} more"
@@ -190,7 +193,7 @@ def _chips(kind: str, names, most: int = 6) -> str:
 
 
 def _chip_key() -> None:
-    """What the colours mean, once, beside Sign out."""
+    """Show what the colours mean, once, next to Sign out."""
     st.sidebar.markdown(" ".join(_chip(kind, label) for kind, label in _CHIP_KEY.items()))
 
 
@@ -203,8 +206,8 @@ _CELL_COLOURS = {
     "money": ("rgb(21, 130, 55)", "rgba(33, 195, 84, 0.1)"),
     "flag": ("rgb(189, 64, 67)", "rgba(255, 43, 43, 0.1)"),
 }
-# What each table column holds, by its heading. A table can set others
-# itself, for a heading that means something else there.
+# What each table column holds, by its heading. A table can pass its own for a
+# heading that means something else there.
 _COLUMN_KINDS = {
     "Student": "student", "Who": "student",
     "Teacher": "teacher",
@@ -218,12 +221,13 @@ _COLUMN_KINDS = {
 
 
 def _plain_number(value) -> str:
-    """A number written the way an unstyled table shows it: 1.5, 65, 97.5."""
+    """Return a number written the way a plain table shows it: 1.5, 65, 97.5."""
     return ("%f" % value).rstrip("0").rstrip(".")
 
 
 def _coloured(rows, kinds: dict | None = None):
-    """A table for st.dataframe, with its student, teacher, subject, date and money columns coloured."""
+    """Return a table for st.dataframe with its names, dates and money in colour.
+    """
     frame = rows if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
     styler = frame.style
     # A styled table would print 1.5 as 1.500000, so decimals keep their plain form.
@@ -239,14 +243,13 @@ def _coloured(rows, kinds: dict | None = None):
 
 
 def _flash(message: str, kind: str = "success") -> None:
-    """Queue a message to appear after the rerun that follows.
+    """Save a message to show after the next rerun.
 
-    Writing a message and immediately rerunning throws the message away --
-    the rerun redraws the page from scratch before anything is shown. Almost
-    every action here ends that way (save, add, delete, rename), so without
-    this an admin clicks a button and sees nothing at all happen. Stashing
-    it in session_state carries it across the rerun; ``_show_flash`` prints
-    it at the top of the page, where it is visible from any tab.
+    A message shown just before a rerun is lost, because the rerun redraws
+    the page from scratch. Almost every action here ends with a rerun (save,
+    add, delete, rename), so without this the admin clicks a button and sees
+    nothing happen. The message is kept in session_state, and _show_flash
+    shows it at the top of the page, where it's visible from any screen.
     """
     st.session_state["_flash"] = (kind, message)
 
@@ -255,18 +258,19 @@ _TOAST_ICONS = {"success": "✅", "warning": "⚠️", "info": "ℹ️", "error"
 
 
 def _show_flash() -> None:
+    """Show the message saved by _flash, at the top of the page and as a toast."""
     entry = st.session_state.pop("_flash", None)
     if entry:
         kind, message = entry
         getattr(st, kind)(message)
-        # The line above sits at the top of the page, and a button is often
-        # far below it -- an import confirmed at the foot of a long preview
-        # showed nothing where anyone was looking. A toast floats over the
-        # page wherever it is scrolled.
+        # The message above is at the top of the page, but the button is often far below
+        # it, so a confirmation after a long import preview was out of sight. A toast
+        # floats over the page wherever it's scrolled.
         st.toast(message, icon=_TOAST_ICONS.get(kind), duration="long")
 
 
 def _hours(start: dt.time, end: dt.time) -> float:
+    """Return the hours between two times, to 2 decimals and never below 0."""
     minutes = (end.hour * 60 + end.minute) - (start.hour * 60 + start.minute)
     return round(max(minutes, 0) / 60, 2)
 
@@ -323,14 +327,14 @@ _SCROLL_TOP_JS = """
 
 
 def _floating_back_to_top() -> None:
-    """A fixed corner button, present on every tab, that scrolls back to top.
+    """Add a fixed "back to top" button in the corner of every screen.
 
-    Injected into the parent document (not the iframe it runs in) so it
-    can sit fixed over the whole page rather than just the iframe's box --
-    same trick ``_scroll_to`` uses. Called once; since the HTML is identical
-    on every rerun, Streamlit reuses the existing iframe rather than
-    re-running the script, so the button is never appended twice. The guard
-    on the element id makes that belt-and-braces.
+    The script is added to the parent page, not the iframe it runs in, so
+    the button can sit over the whole page (_scroll_to works the same way).
+    It's called once per run; because the HTML is the same each time,
+    Streamlit keeps the existing iframe instead of running the script again,
+    so the button is never added twice. The check on the element id is an
+    extra guard.
     """
     st.iframe(
         """<script>
@@ -354,19 +358,19 @@ def _floating_back_to_top() -> None:
           doc.body.appendChild(button);
         })();
         </script>""",
-        # Script only -- there is nothing to show, and this must not take
-        # up space. st.iframe rejects a height of 0, and "content"
-        # measures an empty body at 150px, so: the smallest legal box.
+        # Script only: there's nothing to show and it mustn't take up space. st.iframe
+        # refuses a height of 0, and "content" makes an empty page 150px tall, so use the
+        # smallest height allowed.
         height=1,
     )
 
 
 def _offer_billing() -> None:
-    """A one-click hop from "schedule imported" to "bill that month".
+    """Offer a button straight from "schedule imported" to "bill that month".
 
-    Sits directly under the import confirmation because that is the next
-    thing anyone does. Pre-sets the Invoices month pickers so the screen
-    opens on the month just imported rather than on today's.
+    It sits right under the import message because billing is the next step.
+    It sets the Invoices month pickers, so that screen opens on the month just
+    imported instead of today's.
     """
     period = st.session_state.get("offer_billing")
     if not period:
@@ -389,7 +393,7 @@ def _offer_billing() -> None:
 
 
 def _month_picker(key_prefix: str) -> tuple[int, int]:
-    """Year + month pickers defaulting to the current month, used across tabs."""
+    """Draw year and month pickers, starting on the current month. Used on several screens."""
     today = dt.date.today()
     columns = st.columns(2)
     year = columns[0].number_input(
@@ -411,6 +415,7 @@ def _month_picker(key_prefix: str) -> tuple[int, int]:
 
 
 def _condition_of(row: dict) -> str:
+    """Return a student's condition as one choice: Cancelled, Recording, Online or In class."""
     if row.get("is_cancelled"):
         return "Cancelled"
     if row.get("has_recording"):
@@ -421,10 +426,10 @@ def _condition_of(row: dict) -> str:
 
 
 def _repeat_weekly(teacher_id, class_id, base, start, end, weeks, rows, note=""):
-    """Create weekly copies of a class and report how it went.
+    """Create weekly copies of a class and say how it went.
 
     Both the add form and the class editor repeat by the month, so the loop
-    lives here rather than twice over.  Returns (created, skipped, last date).
+    is kept here once. Returns (created, skipped, last date).
     """
     created = skipped = 0
     last = base
@@ -449,7 +454,7 @@ def _repeat_weekly(teacher_id, class_id, base, start, end, weeks, rows, note="")
 
 
 def _blank_row(student_id: int) -> dict:
-    """A student in a class with nothing marked against them yet."""
+    """Return a student on a class with nothing marked yet."""
     return {
         "student_id": student_id,
         "is_online": False,
@@ -461,6 +466,7 @@ def _blank_row(student_id: int) -> dict:
 
 
 def _flags_for(condition: str) -> dict:
+    """Turn a condition choice back into the three database flags."""
     return {
         "is_online": condition == "Online",
         "has_recording": condition == "Recording",
@@ -469,6 +475,7 @@ def _flags_for(condition: str) -> dict:
 
 
 def _explain(outcome: str, clash: str = "") -> str:
+    """Return a plain message for a save that failed."""
     if outcome == "teacher_conflict":
         return "This teacher is already busy then. " + (
             clash or "Pick a different time or day."
@@ -486,19 +493,19 @@ def _explain(outcome: str, clash: str = "") -> str:
 
 
 def _import_detail(preview: dict) -> None:
-    """Every subject and every student the parse found, before anything commits.
+    """Show every subject and student the upload found, before anything is saved.
 
-    Built only when asked for: a workbook can hold a couple of years of
-    classes, and folding all of that into tables on every rerun would make
-    the upload form crawl for something most imports never need to look at.
+    Only built when asked for: a workbook can hold a couple of years of
+    lessons, and building these tables on every rerun would slow the upload
+    form down for something most imports never need.
     """
     sessions = preview.get("sessions") or []
     if not sessions:
         return
 
-    # A class the sheet never named. Worth its own callout rather than being
-    # left to the warnings list -- it imports under a placeholder, and only
-    # the person holding the spreadsheet can say what it should be called.
+    # A class the sheet never named. Shown on its own, not left in the warnings list:
+    # it imports under a placeholder, and only the person with the spreadsheet knows
+    # what it should be called.
     unnamed = [item for item in sessions if item["class_name"].startswith(UNNAMED_CLASS)]
     if unnamed:
         st.warning(
@@ -586,12 +593,11 @@ def _import_detail(preview: dict) -> None:
 
 
 def _warning_panel(preview: dict) -> None:
-    """Every warning, grouped by the cell that raised it.
+    """Show every warning, grouped by the cell it came from.
 
-    A warning is only actionable if the person holding the spreadsheet can
-    find what it is about, so each block leads with the cell reference and
-    the worksheet, then prints that cell's own text underneath. Several
-    warnings about one cell share a block rather than repeating all of that.
+    A warning only helps if the person with the spreadsheet can find the
+    cell, so each group starts with the cell reference and worksheet, then
+    shows the cell's text. Several warnings about one cell share a group.
     """
     all_warnings = list(preview["warnings"]) + [
         warning for session in preview["sessions"] for warning in session["warnings"]
@@ -634,11 +640,11 @@ def _warning_panel(preview: dict) -> None:
 
 
 def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> None:
-    """What committing will do to the calendar, month by month, before anything is written.
+    """Show what saving will change on the calendar, month by month, before anything is written.
 
-    Re-uploading a corrected workbook is routine; this is how anyone doing it
-    sees that it touches what they expect and nothing else. Worked out on a
-    copy of the parse, because settling the name questions rewrites it.
+    Re-uploading a corrected workbook is routine; this lets the admin check
+    it changes what they expect and nothing else. It works on a copy of the
+    upload, because answering the name questions changes it.
     """
     planned = {**preview, "sessions": copy.deepcopy(preview["sessions"])}
     planned["sessions"] = schedule_backfill.apply_review_decisions(planned, decisions)
@@ -685,10 +691,9 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
 
 
 def _import_upload_panel() -> None:
-    """Upload an Excel schedule for a teacher, review the parse, then commit it."""
-    # Retired teachers are not offered: marking one inactive means they are
-    # off the roster until they are taken back on, so a schedule should not
-    # be importable against them. Bring them back from "Rename or retire".
+    """Upload a teacher's Excel schedule, check what was read, then save it."""
+    # Retired teachers aren't offered: a retired teacher shouldn't get a schedule
+    # until they're taken back on. They can be brought back from "Rename or retire".
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
 
     mode = st.radio(
@@ -727,7 +732,7 @@ def _import_upload_panel() -> None:
     file_bytes = upload.getvalue()
     try:
         sheets = schedule_parser.get_sheet_names(file_bytes)
-    except Exception as error:  # a corrupt or non-Excel file
+    except Exception as error:  # a damaged or non-Excel file
         st.error(f"Could not read that workbook: {error}")
         return
 
@@ -738,10 +743,9 @@ def _import_upload_panel() -> None:
         st.info("Pick at least one worksheet.")
         return
 
-    # What was actually parsed, so a different file or a changed worksheet
-    # selection can never silently commit a stale preview -- and so widget
-    # keys below can be namespaced per parse, rather than reused across a
-    # fresh one and showing decisions from a previous, unrelated workbook.
+    # What was actually read. A different file or worksheet choice can then never save
+    # an old preview by mistake, and the widget keys below are unique to each upload,
+    # so answers from a previous workbook don't show up on a new one.
     fingerprint = (upload.file_id, tuple(sorted(chosen_sheets)), int(year))
 
     if st.button("Parse workbook", key="import_parse"):
@@ -769,10 +773,10 @@ def _import_upload_panel() -> None:
         return
     generation = st.session_state.get("import_generation", 0)
 
-    # A worksheet can hold a whole year, and every month in it would be
-    # imported -- the months billed before a teacher came onto the app put up
-    # for billing a second time. So the months are chosen, starting from the
-    # ones the app already holds for this teacher and any after them.
+    # A worksheet can hold a whole year, and importing every month in it would put
+    # months billed before the teacher joined the app up for billing again. So the
+    # months are chosen, starting with the ones the app already has for this teacher
+    # and any after them.
     found = {
         f"{item['month'][0]}-{item['month'][1]:02d}": item
         for item in schedule_backfill.months_found(preview)
@@ -783,6 +787,7 @@ def _import_upload_panel() -> None:
     ]
 
     def _month_option(key: str) -> str:
+        """Return the label for one month in the month list."""
         item = found[key]
         label = f"{calendar.month_name[item['month'][1]]} {item['month'][0]} — {item['classes']} class(es)"
         return label if item["own"] else label + f", {item['days']} day(s) spilling from the month before"
@@ -808,8 +813,8 @@ def _import_upload_panel() -> None:
         preview, [tuple(map(int, key.split("-"))) for key in chosen_months]
     )
     preview["name_reviews"] = schedule_backfill.mark_names_on_file(preview["name_reviews"])
-    # Questions below are numbered within the months chosen, so their answers
-    # must not carry over to a different choice of months.
+    # The questions below are numbered within the chosen months, so their answers
+    # mustn't carry over to a different choice of months.
     scope = f"{generation}_{'_'.join(sorted(chosen_months))}"
 
     pending = len(preview["name_reviews"])
@@ -826,7 +831,7 @@ def _import_upload_panel() -> None:
 
     _import_detail(preview)
 
-    # Too big to leave in the folded list: a whole calendar that was not read.
+    # Too big to leave in the closed list: a whole calendar that wasn't read.
     for warning in preview["warnings"]:
         if warning.get("kind") == "second_calendar":
             st.warning(f"Worksheet `{warning['sheet']}`: {warning['message']}")
@@ -876,13 +881,11 @@ def _import_upload_panel() -> None:
 
     name_overrides: dict[str, str] = {}
     if teacher_name:
-        # Same subject typed two ways in one workbook. Settled before the
-        # cross-teacher check below, because merging changes which names are
-        # left to collide with anyone else's.
-        # A class the sheet never named. Offered here rather than left as a
-        # placeholder, because only the person holding the spreadsheet knows
-        # what it should be called, and editing Excel and re-uploading just to
-        # supply one word is a poor trade.
+        # The same subject typed two ways in one workbook. Settled before the check
+        # against other teachers below, because merging changes which names are left.
+        # A class the sheet never named is named here, not left as a placeholder: only
+        # the person with the spreadsheet knows its name, and editing Excel and uploading
+        # again just to add one word is a lot of work.
         unnamed_groups: dict[str, list[dict]] = {}
         for item in preview["sessions"]:
             if item["class_name"].startswith(UNNAMED_CLASS):
@@ -932,10 +935,9 @@ def _import_upload_panel() -> None:
                 if choice.startswith("Merge"):
                     merged_into[drop] = keep
 
-        # Collisions are looked for among the names that will actually be
-        # created: a subject just merged is checked under the name it merges
-        # into, and a newly named class under the name just typed, rather than
-        # under the spelling being retired.
+        # Clashes are checked against the names that will actually be created: a merged
+        # subject under the name it merges into, and a newly named class under the name
+        # just typed, not the old spelling.
         settled = dict(merged_into)
         settled.update(named_unnamed)
         effective = [
@@ -955,9 +957,9 @@ def _import_upload_panel() -> None:
                 )
                 renamed_to[original] = new_name.strip() or suggestion
 
-        # backfill applies these in one pass with no chaining, so each original
-        # spelling has to name its final destination outright: a merged name
-        # follows its target through any rename applied to it.
+        # backfill applies these in one pass, without following chains, so each original
+        # spelling must point straight to its final name: a merged name follows its
+        # target if that target is renamed.
         name_overrides.update(renamed_to)
         for original, chosen in settled.items():
             name_overrides[original] = renamed_to.get(chosen, chosen)
@@ -997,10 +999,9 @@ def _import_upload_panel() -> None:
                 f"{counts.get('students', 0)} new student(s), "
                 f"{counts.get('classes', 0)} new subject(s)."
             )
-            # "lessons_removed" also begins with "lessons_", but a class the
-            # workbook no longer lists was deliberately taken off the
-            # calendar -- counting it as skipped read as a failure and
-            # inflated the number.
+            # "lessons_removed" also starts with "lessons_", but a lesson the workbook no longer
+            # has was taken off the calendar on purpose. Counting it as skipped looked like a
+            # failure and made the number too big.
             skipped = sum(
                 value for key, value in counts.items()
                 if (key.startswith("class_") or key.startswith("lessons_"))
@@ -1037,11 +1038,11 @@ def _import_upload_panel() -> None:
                     f"written; check {', '.join(twice[:5])}{' …' if len(twice) > 5 else ''}."
                 )
             _flash(message)
-            # Also kept where the preview was, which is where anyone who just
-            # clicked the button is looking, until the next workbook is read.
+            # Also shown where the preview was, which is where the admin who just clicked
+            # is looking, until the next workbook is read.
             st.session_state["import_done"] = f"{_teacher(teacher_name)} — {message}"
-            # The month just imported is almost always the one about to be
-            # billed, so offer the jump instead of making anyone re-pick it.
+            # The month just imported is almost always the next one to bill, so offer to go
+            # straight there instead of making the admin pick it again.
             months = sorted(
                 {(item["date"].year, item["date"].month) for item in sessions
                  if item.get("date")}
@@ -1055,7 +1056,7 @@ def _import_upload_panel() -> None:
 
 
 def _price_all_button(unpriced: list[dict], key: str) -> None:
-    """One click that prices every subject listed by the academy's rule."""
+    """Show one button that prices every listed subject by the academy's rule."""
     if st.button(
         f"Price all {len(unpriced)} by grade — ${schedule_parser.SENIOR_RATE:,.0f}/h Grade 11 "
         f"and above, ${schedule_parser.JUNIOR_RATE:,.0f}/h otherwise",
@@ -1069,11 +1070,11 @@ def _price_all_button(unpriced: list[dict], key: str) -> None:
 
 
 def _unnamed_subjects(key: str, year: int | None = None, month: int | None = None) -> None:
-    """Subjects a workbook left without a name, in plain sight with a box to name each.
+    """List subjects a workbook left without a name, with a box to name each.
 
-    Parents' invoices call such a subject "(unnamed class) · Sun 13:30".
-    Asked about once at import, then never again, a few got through that
-    way and nothing on any screen said so.
+    Parents' invoices call such a subject "(unnamed class) · Sun 13:30". They
+    used to be asked about only once, at import, so a few got through and no
+    screen showed them.
     """
     unnamed = db.get_unnamed_subjects(year, month)
     if not unnamed:
@@ -1116,11 +1117,11 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
 
 
 def _unpriced_everywhere() -> None:
-    """Every subject without a price, in any month, in plain sight with its fix.
+    """List every subject without a price, in any month, with a way to fix it.
 
-    An upload prices every new subject now; this catches any left from before
-    that, or a price removed by hand. A warning, not a fold -- a subject with
-    no price is an invoice nobody can send.
+    An upload prices every new subject now; this catches any left from
+    before that, or a price removed by hand. A warning, not a closed list: a
+    subject without a price is an invoice nobody can send.
     """
     unpriced = db.get_unpriced_subjects()
     if not unpriced:
@@ -1153,8 +1154,7 @@ def _unpriced_everywhere() -> None:
 def _save_subject_rate(class_id: int, month_start: dt.date, rate: float) -> str:
     """Price one subject from a whole calendar month onward.
 
-    The work is a single transaction in db.set_class_rate_for_month; this is
-    the screen's name for it.
+    The work is one transaction in db.set_class_rate_for_month.
     """
     return db.set_class_rate_for_month(class_id, month_start, rate)
 
@@ -1168,28 +1168,25 @@ def _bulk_rate_section(
     heading: str = "Set a rate for several subjects at once",
     show_teacher: bool = False,
 ) -> None:
-    """Tick several subjects at once and set one rate for all of them.
+    """Tick several subjects and set one price for all of them.
 
-    Subjects are often all the same price -- doing that one at a time through
-    the single-subject editor is needless repetition.  Shared by the Teachers
-    tab (one teacher's month) and the Invoices tab (whatever is still
-    unpriced for the month being billed, which can span teachers), so
-    ``subjects`` is a plain list of ``{"Class ID", "Class", "Sessions"}``
-    rather than anything either caller's shape.
+    Subjects often share a price, and setting them one by one is slow. Used
+    by the Teachers screen (one teacher's month) and the Invoices screen
+    (whatever is unpriced in the month being billed, across teachers), so
+    `subjects` is a plain list of {"Class ID", "Class", "Sessions"}.
 
-    Uses the "on_change pre-seeds session_state before the checkboxes render"
-    pattern for Select all, which is the reliable way to make a bulk checkbox
-    toggle actually work in Streamlit.
+    Select all sets each checkbox's session_state in on_change, before the
+    checkboxes are drawn, which is the reliable way to make a select-all box
+    work in Streamlit.
     """
     if not subjects:
         return
     month_start = dt.date(year, month, 1)
     subjects = sorted(subjects, key=lambda item: (item.get("Teacher", ""), item["Class"]))
-    # Clearing the ticks after applying can't be done by resetting their
-    # session_state: on a rerun the frontend still reports each checkbox as
-    # checked, so the old value comes straight back. Giving the checkboxes a
-    # new key instead -- by bumping this counter -- makes Streamlit treat
-    # them as brand-new widgets, which come up at their unticked default.
+    # The ticks can't be cleared after saving by resetting their session_state: on a
+    # rerun the browser still reports each box as ticked, so the old value comes
+    # back. Bumping this counter gives the checkboxes new keys, so Streamlit treats
+    # them as new widgets, which start unticked.
     generation = st.session_state.get(f"bulk_rate_gen_{base}", 0)
     scope = f"{base}_{generation}"
 
@@ -1197,30 +1194,29 @@ def _bulk_rate_section(
         st.markdown(f"###### {heading}")
 
     def _select_all_subjects() -> None:
+        """Tick or untick every subject to match Select all."""
         value = st.session_state.get(f"bulk_rate_all_{scope}", False)
         for item in subjects:
             st.session_state[f"bulk_rate_pick_{scope}_{item['Class ID']}"] = value
 
     st.checkbox("Select all", key=f"bulk_rate_all_{scope}", on_change=_select_all_subjects)
 
-    # The rate that actually applies in the month being looked at -- not the
-    # month before it. Showing the previous month's price here would mean a
-    # subject still reads "no rate set" right after its rate was set for this
-    # month, which is exactly backwards. Fetched for every subject at once.
+    # The price that applies in the month on screen, not the month before. Showing
+    # last month's price would make a subject still read "no price set" right after
+    # its price was set for this month. Fetched for every subject at once.
     month_rates = db.get_class_rates_for_date(
         [item["Class ID"] for item in subjects], month_start
     )
-    # The price on its own cannot say whether it was chosen for this month or
-    # is last month's still running on, and that is the whole question when
-    # pricing a fresh month. A rate period always starts on the 1st, so the
-    # one covering this month either starts on it -- set here -- or earlier,
-    # in which case the label names the month the price carries over from.
+    # The price alone can't say whether it was set for this month or carried over
+    # from an earlier one, and that's what matters when pricing a new month. A price
+    # period always starts on the 1st, so the one covering this month either starts
+    # on it (set here) or earlier, and then the label names the month it carries over
+    # from.
     month_end = dt.date(year, month, calendar.monthrange(year, month)[1])
     priced_from: dict[int, dt.date] = {}
-    # A subject created by an import is priced from its first lesson, which
-    # can fall after the 1st. That price is still this month's: reading only
-    # the 1st called a G11 subject "no price set" when billing would charge
-    # its $65 on every lesson.
+    # A subject created by an import is priced from its first lesson, which can be
+    # after the 1st. That price is still this month's: checking only the 1st called a
+    # G11 subject "no price set" when billing would charge $65 on every lesson.
     starts_within: dict[int, tuple[dt.date, float]] = {}
     all_rates = db.get_all_class_rates()
     for row in all_rates:
@@ -1245,8 +1241,8 @@ def _bulk_rate_section(
         if not (month_rate and month_rate > db.UNSET_RATE) and class_id in starts_within:
             month_rate = starts_within[class_id][1]
             starts = month_start
-        # The placeholder an import seeds is not a price anybody chose, so it
-        # reads as unset here -- same as it does in the Invoices warning.
+        # The import placeholder isn't a price anyone chose, so it reads as unset here,
+        # the same as in the Invoices warning.
         if not (month_rate and month_rate > db.UNSET_RATE):
             rate_text = _flag("no price")
         elif starts is None or starts == month_start:
@@ -1254,12 +1250,11 @@ def _bulk_rate_section(
         else:
             rate_text = _money(f"${month_rate:,.0f}/h") + f" since {calendar.month_abbr[starts.month]}" + (
                 f" {starts.year}" if starts.year != year else "")
-        # Not when an import already named the subject for its teacher.
+        # Not when an import already put the teacher in the subject's name.
         who = (f" with {_teacher(item['Teacher'])}" if show_teacher and item.get("Teacher")
                and not item["Class"].endswith(f"({item['Teacher']})") else "")
-        # What the rule says it costs, when that differs from what it is on
-        # now: the price is a rule, and a screen that knows the rule should
-        # say so rather than leave it to memory.
+        # What the rule says it should cost, when that differs from its current price.
+        # The screen knows the rule, so it should say so instead of leaving it to memory.
         standard, why, certain = rule[class_id]
         unset = not (month_rate and month_rate > db.UNSET_RATE)
         if certain and abs((month_rate or 0) - standard) > 0.005:
@@ -1276,17 +1271,15 @@ def _bulk_rate_section(
             selected_ids.append(class_id)
 
     columns = st.columns([2, 1])
-    # Keyed on `base`, not `scope`, so the rate typed here survives applying
-    # -- handy when the same price is being set for another month next.
+    # Keyed on `base`, not `scope`, so the price typed here stays after saving, which
+    # helps when the same price is set for another month next.
     bulk_rate = columns[0].number_input(
         "New rate ($ per hour)",
         min_value=0.0, step=1.0, key=f"bulk_rate_value_{base}",
     )
-    # Only where the rule would change something, and across everything
-    # listed unless some are ticked -- pricing a month by the rule is one
-    # click, not thirty ticks and a click.
-    # A default only ever fills a subject with no price; it never replaces
-    # one somebody chose.
+    # Only where the rule would change something, and for everything listed unless
+    # some are ticked, so pricing a month by the rule is one click, not thirty ticks.
+    # A default only fills a subject with no price; it never replaces one someone chose.
     by_grade = {}
     for item in subjects:
         rate, _, certain = rule[item["Class ID"]]
@@ -1329,17 +1322,16 @@ def _bulk_rate_section(
                     ok += 1
                 else:
                     fail += 1
-                # Not needed to clear the tick (the new generation does
-                # that) -- just keeps spent keys from piling up in state.
+                # Not needed to clear the tick (the new counter does that); it just stops old
+                # keys piling up in session_state.
                 st.session_state.pop(f"bulk_rate_pick_{scope}_{class_id}", None)
             st.session_state.pop(f"bulk_rate_all_{scope}", None)
             if fail:
                 st.warning(f"{fail} subject(s) could not be updated.")
             if ok:
                 st.session_state[f"bulk_rate_gen_{base}"] = generation + 1
-                # Flashed at the top of the page rather than shown here: once
-                # the last subject is priced this whole section stops being
-                # rendered, and a confirmation inside it would never appear.
+                # Shown at the top of the page, not here: once the last subject is priced this
+                # section isn't drawn at all, so a message inside it would never appear.
                 _flash(
                     f"Set {_money(f'${bulk_rate:,.2f}/h')} for {ok} subject(s), "
                     f"from {_when(f'{calendar.month_name[month]} {year}')} onward."
@@ -1350,10 +1342,10 @@ def _bulk_rate_section(
 def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
     """Remove subjects, and everything under them, from a teacher.
 
-    The way back from an import filed under the wrong teacher: delete what it
-    created, then upload the same workbook again against the right one. Kept
-    behind a tick and a typed confirmation because it is the one genuinely
-    destructive thing on this screen.
+    The way to undo an import saved under the wrong teacher: delete what it
+    created, then upload the same workbook again for the right one. It needs
+    a tick and a typed confirmation, because it's the one truly destructive
+    thing on this screen.
     """
     subjects = [
         item for item in db.get_all_classes() if item["Teacher ID"] == teacher_id
@@ -1367,6 +1359,7 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
         scope = f"{teacher_id}_{generation}"
 
         def _select_all() -> None:
+            """Tick or untick every subject to match Select all."""
             value = st.session_state.get(f"del_subj_all_{scope}", False)
             for item in subjects:
                 st.session_state[f"del_subj_{scope}_{item['ID']}"] = value
@@ -1439,19 +1432,19 @@ def _delete_subjects_section(teacher_id: int, teacher_name: str) -> None:
 
 
 def _teacher_drilldown(teachers: list[dict]) -> None:
-    """Pick a teacher and a month: price the subjects, then read one's classes.
+    """Pick a teacher and month: price the subjects, then list one subject's lessons.
 
-    Active teachers only, matching the Schedule and Data screens -- a
-    retired teacher is off every working screen until somebody takes them
-    back on from "Rename or retire", which still lists everybody.
+    Active teachers only, like the Schedule and Data screens. A retired
+    teacher is off every working screen until they're taken back on from
+    "Rename or retire", which still lists everyone.
     """
     labels = {item["Name"]: item["ID"] for item in teachers if item["Active"]}
     if not labels:
         st.caption("No active teachers. Bring one back from the panel above.")
         return
     if st.session_state.get("teacher_drill_pick") not in labels:
-        # Open on whoever teaches most this month rather than whoever sorts
-        # first: "No classes for …" is a poor first screen after signing in.
+        # Start on whoever teaches most this month, not whoever sorts first: "No classes
+        # for ..." isn't a useful first screen after signing in.
         today = dt.date.today()
         busy = db.get_teacher_session_counts(today.year, today.month)
         st.session_state["teacher_drill_pick"] = max(
@@ -1484,12 +1477,10 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
         f"{items[0]['Class']} ({len(items)} session(s))": class_id
         for class_id, items in sorted(by_class.items(), key=lambda kv: kv[1][0]["Class"])
     }
-    # Pricing lives entirely in the section above: it already lists every
-    # subject with the price in force and where that price came from, and
-    # ticking one is the same edit this used to duplicate -- badly, since it
-    # pre-filled the $1 import placeholder as though somebody had chosen it.
-    # What is left here is the one thing that section cannot do: read out a
-    # single subject's classes.
+    # Pricing is all in the section above, which already lists every subject with
+    # its price and where it came from. This part used to repeat it, badly, showing
+    # the $1 import placeholder as if someone had chosen it. What's left here is the
+    # one thing that section can't do: list one subject's lessons.
     st.markdown("###### Or list one subject's classes")
     subject_choice = st.selectbox("Subject", list(subject_labels), key="teacher_drill_subject")
     class_id = subject_labels[subject_choice]
@@ -1497,9 +1488,9 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     class_name = class_lessons[0]["Class"]
 
     st.markdown(f"###### {_subject(class_name)} — {_when(f'{calendar.month_name[month]} {year}')}")
-    # One query for the month's rosters, not two per class listed: the
-    # Schedule screen already reads them this way, and a busy subject here
-    # was thirty round trips to a database an ocean away.
+    # One query for the month's rosters, not two per lesson listed. The Schedule
+    # screen reads them the same way; a busy subject here used to be thirty round
+    # trips to the database.
     rosters = db.get_month_attendance(teacher_id, year, month)
     for lesson in class_lessons:
         tagged = []
@@ -1519,13 +1510,14 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
 
 def teachers_tab() -> None:
 
+    """Draw the Teachers screen: upload, manage teachers, then prices and subjects."""
     teachers = db.get_all_teachers()
 
     with st.expander("Upload an Excel schedule", expanded=not teachers):
         _import_upload_panel()
 
-    # Imports add teachers by themselves, so adding, renaming and retiring
-    # one is occasional -- kept out of the way of what needs doing today.
+    # Imports add teachers by themselves, so adding, renaming and retiring one is
+    # occasional and kept out of the way.
     with st.expander(f"Manage teachers ({len(teachers)})" if teachers else "Add a teacher",
                      expanded=not teachers):
         with st.form("add_teacher", clear_on_submit=True, border=False):
@@ -1591,6 +1583,7 @@ def teachers_tab() -> None:
 
 
 def _two_children(dates: list[dt.date]) -> None:
+    """Say the two records shared a lesson, so they're two children."""
     st.warning(
         "They sat the same class on "
         + ", ".join(_when(f"{day:%d %b %Y}") for day in dates[:3])
@@ -1599,11 +1592,11 @@ def _two_children(dates: list[dt.date]) -> None:
 
 
 def _merge_students_section(all_students: list[dict]) -> None:
-    """Two records of one child -- spelled two ways by two teachers -- made one.
+    """Merge two records of one child, spelled two ways by different teachers, into one.
 
-    Shown only when asked for (the tick box on the Students screen): looking
-    compares students' names, and this screen is opened far more often than
-    anyone merges.
+    Only shown when asked for (the tick box on the Students screen), because
+    finding pairs compares every student's name, and this screen is opened
+    far more often than anyone merges.
     """
     st.caption(
         "Merging moves classes, invoices and credits onto one record. Sent invoices keep "
@@ -1612,6 +1605,7 @@ def _merge_students_section(all_students: list[dict]) -> None:
     names = {item["ID"]: item["Name"] for item in all_students}
 
     def merge(keep: int, drop: int) -> None:
+        """Merge `drop` into `keep` and say what moved, or why it couldn't."""
         result = db.merge_students(keep, drop)
         if result["status"] == "merged":
             for key in ("merge_keep", "merge_drop"):
@@ -1635,6 +1629,7 @@ def _merge_students_section(all_students: list[dict]) -> None:
         st.caption("Nobody looks like the same child on file twice.")
 
     def about(index: int, pair: dict) -> str:
+        """Return one side of a pair: its lessons, teachers and grade."""
         grade = pair["grades"][index]
         return (f"{pair['lessons'][index]} class(es)"
                 + (f", {_chips('teacher', pair['teachers'][index], most=99)}" if pair["teachers"][index] else "")
@@ -1682,10 +1677,11 @@ def _merge_students_section(all_students: list[dict]) -> None:
 
 def students_tab() -> None:
 
+    """Draw the Students screen: missing schedules, then the students and their month."""
     year, month = _month_picker("students_month")
 
-    # Only who is missing: a tile per teacher who *had* uploaded was two dozen
-    # green boxes above the students every visit.
+    # Only the teachers missing: a box for every teacher who had uploaded was two
+    # dozen green boxes above the students on every visit.
     statuses = db.get_import_status(year, month)
     missing = [item["Teacher"] for item in statuses if not item["Imported"]]
     if missing:
@@ -1707,8 +1703,8 @@ def students_tab() -> None:
             parent = st.text_input("Parent name", placeholder="optional", key="student_new_parent")
             phone = st.text_input("Contact number", placeholder="optional", key="student_new_phone")
             if st.form_submit_button("Add student", type="primary"):
-                # A parent needs both halves to be stored at all, so half of one
-                # is a slip to point out rather than quietly drop on the floor.
+                # A parent is only saved with both a name and a number, so half of one is pointed
+                # out instead of quietly dropped.
                 outcome = db.create_student(name[:120], parent[:120], phone[:40])
                 if outcome == "created":
                     _flash(f"Added {_student(name.strip())}.")
@@ -1737,17 +1733,17 @@ def students_tab() -> None:
         if not search.strip() or search.strip().lower() in item["Name"].lower()
     ]
 
-    # One query for everyone shown, rather than one per student expanded.
+    # One query for everyone shown, not one per student opened.
     breakdowns = db.get_all_student_month_breakdowns(year, month)
 
-    # Capped hard, because Streamlit builds an expander's body whether or not
-    # it is open: every row here is a table, three inputs, a note box and the
-    # buttons, so a whole academy's worth of them is thousands of widgets and
-    # several seconds before anything appears. Searching is the fast path.
+    # A hard limit, because Streamlit builds an expander's contents whether it's open
+    # or not: each row is a table, three inputs, a note box and buttons, so the whole
+    # academy is thousands of widgets and several seconds before anything appears.
+    # Searching is the quick way to find someone.
     page = shown[:STUDENT_ROWS]
-    # Both of these are collected for the whole page in one pass, because
-    # Streamlit builds every expander's body whether or not it is open: asking
-    # per row turned this screen into a hundred round trips to Neon.
+    # Both are loaded for the whole page in one go, because Streamlit builds every
+    # expander whether it's open or not: asking per row made this screen about a
+    # hundred round trips to the database.
     page_ids = [item["ID"] for item in page]
     credit_waiting = db.get_student_credit_totals(page_ids)
     usage_by_student = db.get_student_usage_many(page_ids)
@@ -1765,9 +1761,8 @@ def students_tab() -> None:
                          + (f" — {_money(f'${owes:,.0f}')}" if owes else "")):
             breakdown = breakdowns.get(item["ID"], {"lines": [], "total": 0.0})
             if breakdown["lines"]:
-                # A subject still on the import's placeholder has no price
-                # anybody chose; showing its $1/h arithmetic as money made a
-                # month of lessons read "$10.00".
+                # A subject still on the import placeholder has no real price; showing its $1/h
+                # sums as money made a month of lessons read "$10.00".
                 priced = [line for line in breakdown["lines"] if line["Rate"] > db.UNSET_RATE]
                 unpriced = len(breakdown["lines"]) - len(priced)
                 st.dataframe(
@@ -1885,15 +1880,15 @@ def students_tab() -> None:
 
 
 def _anchor(name: str) -> None:
-    """Drop an invisible marker the scroll helpers can aim at."""
+    """Add an invisible marker the scroll helpers can jump to."""
     st.markdown(f"<div id='{name}'></div>", unsafe_allow_html=True)
 
 
 def _scroll_to(name: str, token: object = "") -> None:
     """Scroll the page to a marker.
 
-    The script runs inside an iframe, which is same-origin, so it can
-    reach the parent document that actually scrolls.
+    The script runs in an iframe from the same site, so it can reach the
+    parent page, which is the part that scrolls.
     """
     st.iframe(
         f"""<!-- {token} -->
@@ -1916,15 +1911,15 @@ def _scroll_to(name: str, token: object = "") -> None:
           }}, 150);
         }})();
         </script>""",
-        # Script only -- there is nothing to show, and this must not take
-        # up space. st.iframe rejects a height of 0, and "content"
-        # measures an empty body at 150px, so: the smallest legal box.
+        # Script only: there's nothing to show and it mustn't take up space. st.iframe
+        # refuses a height of 0, and "content" makes an empty page 150px tall, so use the
+        # smallest height allowed.
         height=1,
     )
 
 
 def _back_to_grid_button() -> None:
-    """A plain HTML button, so returning to the grid costs no rerun."""
+    """Show a plain HTML button back to the grid, so going back needs no rerun."""
     st.iframe(
         """<style>
           .top-link { font-family: system-ui, -apple-system, sans-serif;
@@ -1946,6 +1941,7 @@ def _back_to_grid_button() -> None:
 
 
 def _month_navigator() -> tuple:
+    """Draw Previous and Next month buttons for the Schedule screen. Returns (year, month)."""
     today = dt.date.today()
     if "month" not in st.session_state:
         st.session_state["month"] = (today.year, today.month)
@@ -1975,6 +1971,7 @@ def _month_navigator() -> tuple:
 
 
 def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) -> str:
+    """Return a sentence naming the teacher's lesson that clashes, or "" if none does."""
     for item in lessons:
         if db.as_date(item["Date"]) != when:
             continue
@@ -1988,7 +1985,7 @@ def _describe_clash(lessons: list, when: dt.date, start: dt.time, end: dt.time) 
 
 
 def _clash_lines(clashes: list, dated: bool = False) -> str:
-    """Students booked into another class at the same time, a line each."""
+    """Return the students booked into another class at the same time, a line each."""
     lines = [
         f"{_student(item['Student'])} is also in {_subject(item['Class'])}"
         + (f" with {_teacher(item['Teacher'])}" if item["Teacher"] else "")
@@ -2002,7 +1999,7 @@ def _clash_lines(clashes: list, dated: bool = False) -> str:
 
 
 def _roster_rows(attendance: list) -> list:
-    """A class's roster as it is saved, in the order the students were added."""
+    """Return a class's roster as saved, in the order the students were added."""
     return [
         {
             "student_id": row["student_id"],
@@ -2017,7 +2014,7 @@ def _roster_rows(attendance: list) -> list:
 
 
 def _saved_message(message: str, lesson_id: int) -> None:
-    """Flash ``message``, with a warning if a student is now booked twice at once."""
+    """Flash `message`, with a warning if a student is now booked twice at once."""
     clashes = db.get_session_clashes(lesson_id)
     if clashes:
         _flash(message + " Booked into two classes at once:  \n" + _clash_lines(clashes), "warning")
@@ -2026,7 +2023,7 @@ def _saved_message(message: str, lesson_id: int) -> None:
 
 
 def _month_clashes(year: int, month: int) -> None:
-    """Every student booked into two classes at once this month, whichever teachers."""
+    """Show every student booked into two classes at once this month, across all teachers."""
     clashes = db.get_month_student_clashes(year, month)
     if not clashes:
         return
@@ -2048,6 +2045,7 @@ def _month_clashes(year: int, month: int) -> None:
 
 
 def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
+    """Draw the "Add a class" form on the Schedule screen."""
     classes = db.get_teacher_classes_for_schedule(teacher_id, dt.date(year, month, 1))
     students = db.get_all_students()
     lookup = {item["Name"]: item["ID"] for item in students}
@@ -2063,9 +2061,9 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
             new_name = columns[0].text_input(
                 "Subject name", key="new_class_name"
             )
-            # Empty unless someone types one: the academy's rule prices it --
-            # the grade in its name, else its students' grades, else $60. A
-            # figure in the box by default was a price nobody chose.
+            # Empty unless someone types a price: the academy's rule prices it (the grade in
+            # its name, else its students' grades, else $60). A number in the box by default
+            # was a price nobody chose.
             rate = columns[1].number_input(
                 "Hourly rate ($)", min_value=0.01, value=None, step=5.0,
                 placeholder="by grade", key="new_class_rate",
@@ -2079,8 +2077,8 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
         when = columns[0].date_input(
             "Date", value=dt.date(year, month, default_day), key="new_lesson_date"
         )
-        # No suggested times: a pre-filled time is easy to miss and then gets
-        # copied into every repeat of the class.
+        # No suggested times: a filled-in time is easy to miss and then gets copied into
+        # every repeat of the class.
         start = columns[1].time_input(
             "Start", value=None, step=60, key="new_lesson_start"
         )
@@ -2214,10 +2212,10 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
 
 
 def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) -> list:
-    """Every date this subject runs at this time, from ``base`` onwards.
+    """Return every date this subject runs at this time, from `base` onward.
 
-    Looks six months ahead so a run that has crossed a month boundary is still
-    found in full.
+    Looks six months ahead, so a run that crosses into the next month is
+    still found in full.
     """
     found = []
     year, month = base.year, base.month
@@ -2234,10 +2232,10 @@ def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) ->
 
 
 def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
-    """Everything about one class, then everything about its subject.
+    """Show everything about one class, then everything about its subject.
 
-    Both sit in expanders so the screen reads as two decisions rather than a
-    wall of controls: what happened in this sitting, and what the subject is.
+    Both are in expanders so the screen reads as two decisions instead of a
+    wall of controls: what happened in this lesson, and what the subject is.
     """
     detail = db.get_schedule_session(lesson_id)
     if not detail:
@@ -2321,9 +2319,9 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             else:
                 st.warning(_explain(str(outcome)))
 
-        # Taking a student out had no button of its own: a row could be
-        # deleted in the table and saved, which nobody found, and "Delete"
-        # below -- tried instead -- is for the whole class.
+        # Taking a student out had no button of its own: you could delete a row in the
+        # table and save, which nobody found, and the "Delete" below, which people tried
+        # instead, deletes the whole class.
         on_class = [row["student_name"] for row in attendance]
         if on_class:
             out_columns = st.columns([4, 1])
@@ -2375,10 +2373,8 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                     help="One condition per student per class — picking a new "
                          "one replaces the old.",
                 ),
-                # Read-only: payment belongs to the invoice a parent actually
-                # pays, and is recorded on the Payments screen. Editable here
-                # too, it would be a second source of truth that could
-                # disagree with the invoice.
+                # Read-only: payment belongs to the invoice the parent pays and is recorded on
+                # the Payments screen. Editable here too, it could disagree with the invoice.
                 "Paid": st.column_config.CheckboxColumn(
                     width="small",
                     disabled=True,
@@ -2415,8 +2411,8 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                     continue
                 student_id = lookup[name]
                 if student_id in seen:
-                    # One row per student: the table allows picking the same
-                    # name twice, the database does not.
+                    # One row per student: the table lets you pick the same name twice, the database
+                    # doesn't.
                     duplicates.append(name)
                     continue
                 seen.add(student_id)
@@ -2444,8 +2440,8 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
             )
             if outcome in ("updated", "success", True):
                 if (when.year, when.month) != st.session_state.get("month"):
-                    # The class moved out of the month on screen; follow it
-                    # rather than leaving the user staring at an empty grid.
+                    # The class moved out of the month on screen; follow it instead of leaving an
+                    # empty grid.
                     st.session_state["month"] = (when.year, when.month)
                 _saved_message("Saved.", lesson_id)
                 _rerun()
@@ -2462,8 +2458,8 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
 
         with buttons[1]:
             if not is_last:
-                # Repeating from the middle would land on dates the run already
-                # covers, so point at the class that can actually extend it.
+                # Repeating from the middle would land on dates the run already has, so point to
+                # the class that can extend it.
                 st.button(
                     "Repeat", disabled=True, width="stretch",
                     key=f"repdis_{lesson_id}",
@@ -2569,15 +2565,15 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 class_id=detail["Class ID"],
                 name=class_name,
                 hourly_rate=class_rate,
-                # Students belong to a class, not the subject; keep whatever
-                # enrolment exists rather than rewriting it from this screen.
+                # Students belong to a class, not the subject; keep the existing enrolment instead
+                # of rewriting it from this screen.
                 student_ids=db.get_class_student_ids(detail["Class ID"]),
                 display_color=class_colour,
                 effective_from=db.as_date(detail["Date"]),
             )
             if outcome in ("updated", "success", True):
-                # Only once the subject itself saved: writing the note first
-                # left it applied under a rename that had been rejected.
+                # Only once the subject itself has saved: saving the note first left it on a
+                # rename that was refused.
                 db.set_subject_note(detail["Class ID"], class_note[:1000])
                 _flash("Subject saved.")
                 _rerun()
@@ -2586,6 +2582,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
 
 
 def schedule_tab() -> None:
+    """Draw the Schedule screen: the month grid, then the editor for the class clicked."""
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
     if not teachers:
         st.info("Add a teacher first — a schedule belongs to one.")
@@ -2601,9 +2598,8 @@ def schedule_tab() -> None:
     year, month = _month_navigator()
     _month_clashes(year, month)
     summary = db.get_month_schedule(teacher_id, year, month)
-    # One query for the whole month's rosters, rather than three per class.
-    # The grid only needs each card's student names and their conditions,
-    # which is exactly what this returns.
+    # One query for the whole month's rosters, not three per class. The grid only
+    # needs each card's student names and conditions, which is what this returns.
     rosters = db.get_month_attendance(teacher_id, year, month)
     lessons = [
         {**item, "Attendance": rosters.get(item["ID"], [])} for item in summary
@@ -2632,8 +2628,8 @@ def schedule_tab() -> None:
             key=f"grid_{teacher_id}_{year}_{month}",
         )
         if clicked and clicked.get("nonce") != st.session_state.get("grid_click"):
-            # Compare the nonce, not the class id: clicking the same class
-            # again is a fresh click and should jump to the editor again.
+            # Compare the click's nonce, not the class id: clicking the same class again is
+            # a new click and should jump to the editor again.
             st.session_state["grid_click"] = clicked.get("nonce")
             st.session_state["selected_lesson"] = clicked.get("lesson_id")
             st.session_state["jump_to_editor"] = True
@@ -2661,32 +2657,30 @@ def schedule_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Invoices
+# Invoices and Credits
 # ---------------------------------------------------------------------------
 
 
 def _invoice_filename(invoice: dict, ext: str) -> str:
+    """Return the file name for an invoice: student name, then invoice number."""
     label = invoice.get("Number") or f"draft-{invoice['ID']}"
     student = "".join(
         ch for ch in invoice.get("Student", "student") if ch.isalnum() or ch in " -_"
     ).strip().replace(" ", "-")
-    # Name first, invoice number second -- a folder of these sorts
-    # alphabetically by student, so finding the one file to send to one
-    # parent is a scroll to their name, not a read of every invoice number.
+    # Name first, then number, so a folder of these sorts by student and the file
+    # for one parent is easy to find.
     return f"{student}-invoice-{label}.{ext}"
 
 
 def _invoice_download(invoice: dict, key: str) -> None:
     """Offer the printable invoice as an HTML file, ready to print or send.
 
-    Deliberately HTML here, not the image format -- this renders inside a
-    loop over however many invoices are on screen (up to the whole open
-    list), and a download button's data has to be computed eagerly, on
-    every render, whether or not anyone clicks it. HTML costs nothing to
-    build; a PNG launches a whole headless browser, and doing that once per
-    row for a long list would make the page itself crawl. The bulk "download
-    as images" button generates every image through one shared browser
-    instance instead, which is what makes that one fast.
+    HTML on purpose, not an image: this runs for every invoice on screen
+    (up to the whole open list), and a download button's file has to be made
+    on every page load, clicked or not. HTML costs nothing to build; a PNG
+    starts a whole headless browser, and doing that per row would make the
+    page crawl. The "download as images" button makes every image with one
+    shared browser instead, which is why that one is fast.
     """
     st.download_button(
         "Download / print",
@@ -2704,17 +2698,16 @@ _EXPORT_NOUN = {"png": "image", "pdf": "PDF", "html": "HTML file"}
 
 
 def _send_format() -> str:
-    """Which "send this to a parent" format this machine can actually produce.
+    """Return the format this machine can make for sending to a parent: png, pdf or html.
 
-    Images are the better artefact and stay the first choice: KakaoTalk shows
-    them inline, whereas a PDF arrives as an attachment the parent has to tap
-    to open. But images come out of a headless Chromium, and the deployed
-    host has neither one nor any way to install one, so PDF -- same
-    stylesheet, no browser -- is what is left there. HTML is the floor: it
-    always works and is useless on a phone.
+    Images come first: KakaoTalk shows them in the chat, while a PDF arrives
+    as an attachment the parent has to tap open. But images need a headless
+    Chromium, which the hosted app doesn't have and can't install, so it
+    uses PDF there (same layout, no browser). HTML always works but is no
+    use on a phone.
 
-    Deciding here rather than at each button keeps the answer consistent
-    across the three places invoices can be exported.
+    Deciding it here keeps the answer the same in all three places invoices
+    can be downloaded.
     """
     if image_export_available():
         return "png"
@@ -2724,14 +2717,16 @@ def _send_format() -> str:
 
 
 def _send_noun() -> str:
+    """Return the word for the send format: "image", "PDF" or "HTML file"."""
     return _EXPORT_NOUN[_send_format()]
 
 
 def _invoices_zip(invoices: list[dict], as_images: bool, on_progress=None) -> bytes:
-    """Every invoice as its own file inside one zip -- one click gets you
-    everyone's invoice as a *separate* file, ready to attach individually
-    to each student/parent, rather than one combined document that would
-    show every student's billing to whoever it's sent to.
+    """Return every invoice as its own file inside one zip.
+
+    One click gets each student's invoice as a separate file, ready to send
+    to each parent, instead of one combined document that would show every
+    student's billing to whoever gets it.
     """
     buffer = io.BytesIO()
     ext = _send_format() if as_images else "html"
@@ -2746,8 +2741,8 @@ def _invoices_zip(invoices: list[dict], as_images: bool, on_progress=None) -> by
         for invoice, page in zip(invoices, pages):
             name = _invoice_filename(invoice, ext)
             if name in used_names:
-                # Two different invoices could sanitise to the same file
-                # name (e.g. duplicate student names) -- keep both.
+                # Two invoices could end up with the same file name (e.g. students with the same
+                # name), so add the id to keep both.
                 name = f"{invoice['ID']}-{name}"
             used_names.add(name)
             archive.writestr(name, page)
@@ -2755,6 +2750,7 @@ def _invoices_zip(invoices: list[dict], as_images: bool, on_progress=None) -> by
 
 
 def _invoice_table(invoice: dict) -> None:
+    """Show an invoice's lines as a table."""
     lines = invoice.get("Lines") or []
     if not lines:
         st.caption("No classes on this invoice yet.")
@@ -2765,9 +2761,8 @@ def _invoice_table(invoice: dict) -> None:
                 "Qty": line["Quantity"],
                 "Subject": line["Subject"],
                 "Dates": format_dates(line["Dates"]),
-                # A credit has no unit price to quote -- nothing is being
-                # charged -- so quoting "$0.00 × 0h" would just be noise.
-                # Same treatment the printable copy gives it.
+                # A credit has no unit price (nothing is charged), so "$0.00 × 0h" would just be
+                # clutter. The printable copy does the same.
                 "Unit price": (
                     "credit" if line.get("Credit")
                     else "" if line.get("Extra")
@@ -2783,17 +2778,16 @@ def _invoice_table(invoice: dict) -> None:
 
 
 def _just_issued_panel(year: int, month: int) -> None:
-    """What was just issued, and a way to get those invoices out to parents.
+    """Show what was just issued, and a way to send those invoices to parents.
 
-    Sits at the foot of the tab, not the head: issuing produces a long list,
-    and putting it above the month figures buried the thing you came to the
-    tab to read. It also belongs to the month it was issued for, so it stays
-    out of the way once you move on to a different month.
+    It sits at the bottom of the screen, not the top: issuing makes a long
+    list, and above the month figures it hid what you came to read. It
+    belongs to the month it was issued for, so it's out of the way once you
+    move to another month.
 
-    Nothing is rendered per row beyond a tick box. Building a downloadable
-    invoice up front for every student is what made this section unusable --
-    each one embeds the letterhead, so a whole month of them is megabytes of
-    payload before you have asked for anything.
+    Each row is only a tick box. Building a downloadable invoice for every
+    student up front made this section unusable: each one includes the
+    letterhead, so a whole month was megabytes before anything was asked for.
     """
     batch = st.session_state.get("invoices_just_issued")
     if not batch or tuple(batch.get("period", ())) != (year, month):
@@ -2810,6 +2804,7 @@ def _just_issued_panel(year: int, month: int) -> None:
     scope = f"{year}_{month}"
 
     def _select_all() -> None:
+        """Tick or untick every invoice to match Select all."""
         value = st.session_state.get(f"ji_all_{scope}", False)
         for item in details:
             st.session_state[f"ji_pick_{scope}_{item['ID']}"] = value
@@ -2827,8 +2822,8 @@ def _just_issued_panel(year: int, month: int) -> None:
     if not chosen:
         st.caption("Tick the students you want to send to, or use Select all.")
     else:
-        # Keyed on exactly who is selected, so changing the selection asks
-        # for a fresh render rather than handing back the previous batch.
+        # Keyed on exactly who is ticked, so changing the ticks asks for new files
+        # instead of returning the previous batch.
         token = "_".join(str(d["ID"]) for d in chosen)
         zip_key = f"invoices_zip_png_{token}"
         error_key = f"{zip_key}_error"
@@ -2857,9 +2852,8 @@ def _just_issued_panel(year: int, month: int) -> None:
             "a zip to download.",
         ):
             st.session_state.pop(error_key, None)
-            # A rendered batch runs to tens of megabytes, and every distinct
-            # tick-selection would otherwise leave its own copy behind for
-            # the life of the session. Only the newest one is worth keeping.
+            # A batch of files can be tens of megabytes, and every different selection would
+            # leave its own copy in memory for the whole session. Only the newest is kept.
             for stale in [k for k in st.session_state
                           if k.startswith("invoices_zip_png_") and k != zip_key]:
                 st.session_state.pop(stale, None)
@@ -2885,10 +2879,9 @@ def _just_issued_panel(year: int, month: int) -> None:
             else:
                 st.caption(f"Details: {error}")
 
-        # Deliberately a checkbox, not an expander: Streamlit runs an
-        # expander's body on every rerun, and each of these builds a full
-        # download payload for every selected invoice (megabytes) before
-        # anyone has asked for one.
+        # A checkbox, not an expander, on purpose: Streamlit runs an expander's contents
+        # on every rerun, and each of these builds the files for every ticked invoice
+        # (megabytes) before anyone asks for them.
         if st.checkbox(
             f"Other formats for the {len(chosen)} selected",
             key=f"other_formats_{scope}",
@@ -2914,15 +2907,15 @@ def _just_issued_panel(year: int, month: int) -> None:
 
     if st.button("Dismiss", key=f"dismiss_just_issued_{scope}"):
         st.session_state.pop("invoices_just_issued", None)
-        # A rendered batch can be tens of megabytes; don't keep it in memory
-        # for a panel that has been dismissed.
+        # A batch of files can be tens of megabytes; don't keep it in memory once the
+        # panel is closed.
         for key in [k for k in st.session_state if k.startswith("invoices_zip_png_")]:
             st.session_state.pop(key, None)
         _rerun()
 
 
 def _credits_pointer() -> None:
-    """A line on the Invoices screen saying what credit is waiting, and where it lives."""
+    """Show a line on the Invoices screen saying what credit is waiting, and where to see it."""
     waiting = db.get_credits(status="Open")
     if waiting:
         st.caption(
@@ -2935,19 +2928,19 @@ _ALL_MONTHS = "All months"
 
 
 def credits_tab() -> None:
-    """Every credit: what is waiting to come off an invoice, and what already has.
+    """Draw the Credits screen: credit waiting to come off an invoice, and credit already used.
 
-    A class a student was invoiced for and then missed -- marked cancelled,
-    or taken off the lesson -- is owed back, and comes off their next invoice
-    by itself. This is where that can be seen, a student at a time, and
-    where one already paid back in money is marked refunded so it comes off
-    nothing.
+    A lesson a student was invoiced for and then missed (marked cancelled, or
+    taken off the lesson) is owed back and comes off their next invoice by
+    itself. This screen shows that one student at a time, and lets the admin
+    mark a credit as refunded when it was paid back in cash, so it doesn't
+    come off anything.
     """
     st.caption("Classes already invoiced, then missed. Each comes off the student's next invoice.")
     credits = db.get_credits()
 
-    # By the month of the class that was missed: "what did September's
-    # cancellations come to" is the question this answers.
+    # By the month of the missed lesson, to answer "what did September's
+    # cancellations come to".
     today = dt.date.today()
     years = sorted({c["Class date"].year for c in credits if c["Class date"]} | {today.year},
                    reverse=True)
@@ -2961,6 +2954,7 @@ def credits_tab() -> None:
     ).strip().casefold()
 
     def shown(credit) -> bool:
+        """Return True if a credit is in the chosen month and matches the search."""
         day = credit["Class date"]
         if day is None or day.year != year:
             return False
@@ -2987,25 +2981,26 @@ def credits_tab() -> None:
         "Refunded", f"${sum(c['Amount'] for c in refunded):,.2f}",
         help=f"{len(refunded)} credit(s) for classes in {period}, paid back in money.",
     )
-    # The filter stays in view even with nothing to filter: a screen that
-    # hides its controls until there is data reads as one missing them.
+    # The filter stays on screen even with nothing to filter: a screen that hides its
+    # controls until there's data looks like it's missing them.
     if not credits:
         st.info("No credits yet.")
         return
 
     def when(credit):
+        """Return a credit's lesson date as text."""
         return credit["Class date"].strftime("%d %b %Y") if credit["Class date"] else ""
 
     def line(credit):
+        """Return one credit as a line of badges."""
         return (f"{_when(when(credit))} · {_subject(credit['Subject'])} · "
                 f"{_teacher(credit['Teacher']) if credit['Teacher'] else '—'} · "
                 f"{_money(credit['Amount'])} · {credit['Reason']}")
 
-    # One line a student, with what they are owed; open it for the classes
-    # behind the figure. A parent asks "why is there a credit on my bill",
-    # and the answer is one click from their child's name. A class already
-    # paid back in money is ticked and marked refunded right there, so it
-    # stops coming off their next invoice.
+    # One line per student, with what they're owed; open it to see the lessons behind
+    # the figure. When a parent asks why there's a credit on the bill, the answer is
+    # one click from the child's name. A credit already paid back in cash is ticked
+    # and marked refunded right there, so it stops coming off the next invoice.
     by_student: dict[int, list[dict]] = {}
     for credit in waiting:
         by_student.setdefault(credit["Student ID"], []).append(credit)
@@ -3042,8 +3037,8 @@ def credits_tab() -> None:
     if not settled_by:
         st.caption(f"None settled for classes in {_when(period)}.")
         return
-    # The most recently settled first, and no more than a screenful of names;
-    # the month and the search narrow it to anyone further back.
+    # Most recently settled first, and no more than a screenful of names; the month
+    # and search narrow it to anyone further back.
     latest = sorted(settled_by.values(),
                     key=lambda cs: max(c["Settled"] or dt.date.min for c in cs), reverse=True)
     for done in latest[:60]:
@@ -3074,14 +3069,14 @@ def credits_tab() -> None:
 
 def _issued_lookup_section(counts: dict) -> None:
     """Find and reprint an invoice that has already gone out."""
-    # Issued invoices are done with, so they go behind a fold -- but they
-    # still have to be findable when a parent asks for a copy. Also loaded
-    # on demand, for the same reason as the open list above.
+    # Sent invoices are finished with, so they're in a closed section, but they still
+    # need to be easy to find when a parent asks for a copy. Also only loaded when
+    # opened, like the open list above.
     if not counts["issued_count"]:
         return
     st.markdown(f"#### Issued invoices ({counts['issued_count']})")
-    # Set by "Edit" on the warning above, or by saving a replacement: the
-    # invoice to open, applied before the widgets it fills are drawn.
+    # Set by "Edit" on the warning above, or by saving a replacement: the invoice to
+    # open, set before the widgets it fills are drawn.
     wanted = st.session_state.pop("issued_search_next", None)
     if wanted is not None:
         st.session_state["issued_search"] = wanted
@@ -3090,7 +3085,7 @@ def _issued_lookup_section(counts: dict) -> None:
     if not st.checkbox("Look one up", key="invoice_show_issued"):
         return
     with st.container():
-        # A voided invoice is still one a parent may quote, so it can be found.
+        # A void invoice is still one a parent may quote, so it can be found.
         issued = sorted(
             db.get_invoices(status="Issued") + db.get_invoices(status="Void"),
             key=lambda item: -(item["Number"] or 0),
@@ -3154,9 +3149,9 @@ def _issued_lookup_section(counts: dict) -> None:
 
 
 def _forget_made_files() -> None:
-    """Drop invoice files already made: after a renumbering they show an old number.
+    """Forget invoice files already made: after a renumbering they show the old number.
 
-    Each is made again, with the new one, when it is next asked for.
+    Each is made again, with the new number, next time it's asked for.
     """
     for key in [k for k in st.session_state if k.startswith("invoices_zip_png_")
                 or k in ("invoices_replaced_zip", "month_download_file", "send_issued_file")]:
@@ -3166,9 +3161,9 @@ def _forget_made_files() -> None:
 def _number_changer(detail: dict) -> None:
     """Give one sent invoice another number.
 
-    A number another invoice has is not refused outright: whose it is is
-    shown, with the choice of giving that one another number -- this
-    invoice's old number swaps the two.
+    A number another invoice has isn't just refused: it shows whose it is,
+    with the choice of giving that one another number (this invoice's old
+    number swaps the two).
     """
     key = f"renumber_{detail['ID']}"
     with st.form(f"{key}_form", border=False):
@@ -3235,8 +3230,10 @@ def _renumbered(detail: dict, outcome: str, info) -> None:
 
 
 def _send_copy(detail: dict, key: str) -> None:
-    """The one file to send a parent for this invoice -- made only when asked,
-    because an image means starting a browser."""
+    """Offer the one file to send a parent for this invoice.
+
+    Made only when asked, since an image means starting a browser.
+    """
     fmt = _send_format()
     if fmt == "html":
         return
@@ -3256,7 +3253,7 @@ def _send_copy(detail: dict, key: str) -> None:
 
 
 def _schedule_now_text(line: dict) -> str:
-    """What the calendar says about a class today, beside what the invoice said."""
+    """Return what the calendar says about a lesson today, to show next to what the invoice said."""
     now = line["Now"]
     if now is None:
         return "class no longer on the schedule"
@@ -3272,13 +3269,13 @@ def _schedule_now_text(line: dict) -> str:
 
 
 def _invoice_editor(detail: dict) -> None:
-    """Put a sent invoice right, by hand: it is voided and a replacement issued.
+    """Correct a sent invoice by hand: it's voided and a replacement is issued.
 
-    A sent invoice never changes by itself. This is the one way it does:
-    somebody edits its classes and lines, and saving voids it -- number
-    retired, what it said kept -- and issues a replacement under a new
-    number that says which one it replaces. The credit it settled and any
-    payment recorded move across.
+    A sent invoice never changes by itself; this is the only way it does.
+    Someone edits its lessons and lines, and saving voids it (number retired,
+    what it said kept) and issues a replacement under a new number that says
+    which one it replaces. The credit it settled and any payment recorded
+    move across.
     """
     invoice_id = detail["ID"]
     data = db.get_invoice_for_edit(invoice_id)
@@ -3427,7 +3424,7 @@ def _invoice_editor(detail: dict) -> None:
 
 
 def _replaced_download() -> None:
-    """The invoices just replaced in one go, ready to send -- one file each."""
+    """Offer the invoices just replaced in one go, ready to send, one file each."""
     ids = st.session_state.get("invoices_replaced")
     if not ids:
         return
@@ -3453,10 +3450,10 @@ def _replaced_download() -> None:
 
 
 def _out_of_step_warning() -> None:
-    """Sent invoices the schedule has moved away from, and a way to settle each.
+    """Show sent invoices the schedule has changed since, and a way to deal with each.
 
-    A sent invoice changes only when somebody edits it, so a price, class
-    time or subject name changed afterwards would otherwise go unnoticed.
+    A sent invoice only changes when someone edits it, so a price, time or
+    subject name changed afterwards would otherwise go unnoticed.
     """
     _replaced_download()
     found = db.get_sent_invoices_out_of_step()
@@ -3503,12 +3500,11 @@ def _out_of_step_warning() -> None:
 
 
 def _unpriced_warning(year: int, month: int) -> None:
-    """Catch $0 invoices before they are sent, not after.
+    """Catch invoices with no price before they're sent, not after.
 
-    Prices live in the Teachers tab, but the moment anyone finds out a
-    subject has no price is here, on the way to billing it.  So the fix is
-    offered where the problem shows up rather than in the tab that happens to
-    own rates.
+    Prices are set on the Teachers screen, but this is where anyone finds out
+    a subject has no price, on the way to billing it. So the fix is offered
+    here, where the problem shows up.
     """
     unpriced = db.get_unpriced_classes_for_month(year, month)
     if not unpriced:
@@ -3537,11 +3533,11 @@ def _unpriced_warning(year: int, month: int) -> None:
 
 
 def _month_download(year: int, month: int) -> None:
-    """A month's issued invoices as one zip again, any time, from any browser.
+    """Offer a month's sent invoices as one zip again, any time, from any browser.
 
-    The download offered after issuing lives in the browser that issued them,
-    and only until the next batch: issuing October took September's away, and
-    its 34 files could then only be made one invoice at a time.
+    The download offered after issuing only lasts in the browser that issued
+    them, until the next batch: issuing October removed September's, and its
+    34 files could then only be made one invoice at a time.
     """
     period = f"{calendar.month_name[month]} {year}"
     issued = db.get_issued_invoices_for_month(year, month)
@@ -3571,17 +3567,17 @@ def _month_download(year: int, month: int) -> None:
     elif st.button(f"Make the {len(chosen)} {noun}(s)", key="month_download_make", width="stretch"):
         with st.spinner(f"Making {len(chosen)} {noun}(s)…"):
             details = db.get_invoices_detailed([item["ID"] for item in chosen])
-            # One batch kept at a time: a month of them runs to tens of megabytes.
+            # One batch kept at a time: a month of them can be tens of megabytes.
             st.session_state["month_download_file"] = (wanted, _invoices_zip(details, as_images=True))
         _rerun()
 
 
 def _past_invoices_section(counts: dict, year: int, month: int) -> None:
-    """Everything that is reference rather than workflow, kept out of the way.
+    """Show the reference sections, kept out of the way.
 
-    Looking an old invoice up, browsing what is still accumulating, checking
-    outstanding credit -- all useful, none of it part of "bill this month and
-    send it", which is what the tab is for.
+    Looking up an old invoice, browsing what's still building up, checking
+    outstanding credit: all useful, but none of it is part of "bill this
+    month and send it", which is what this screen is for.
     """
     st.divider()
     if not st.checkbox(
@@ -3596,11 +3592,10 @@ def _past_invoices_section(counts: dict, year: int, month: int) -> None:
     if not open_ones:
         st.caption("Nothing accumulating right now.")
     else:
-        # Each row carries a ready-to-download invoice, and a download
-        # button's file has to be built up front -- every invoice embeds the
-        # letterhead image, so a few hundred rows is several megabytes of
-        # payload and as many widgets, which takes Streamlit a long visible
-        # moment to put on screen.  Hence search, and a cap.
+        # Each row has a ready-to-download invoice, and a download button's file must be
+        # built up front. Every invoice includes the letterhead image, so a few hundred
+        # rows is several megabytes and as many widgets, which takes Streamlit a while to
+        # show. Hence the search and the limit.
         needle = st.text_input(
             "Find a student", key="open_invoice_search",
             placeholder="Type part of a name",
@@ -3614,8 +3609,8 @@ def _past_invoices_section(counts: dict, year: int, month: int) -> None:
                 "to narrow it down."
             )
 
-        # Parent/phone for the printable copy's "Billed to" line -- fetched
-        # once for everyone here rather than re-querying per invoice.
+        # Parent and phone for the printable copy's "Billed to" line, loaded once for
+        # everyone here instead of per invoice.
         contacts = {
             item["ID"]: (item["Parent"], item["Phone"]) for item in db.get_all_students()
         }
@@ -3625,9 +3620,9 @@ def _past_invoices_section(counts: dict, year: int, month: int) -> None:
                 f"{_money(invoice['Total'])}"
             ):
                 _invoice_table(invoice)
-                # No "bill the whole thing" button. An invoice covers one
-                # month, so a draft holding several is billed a month at a
-                # time from the list at the top of this tab, on that month.
+                # No "bill the whole thing" button. An invoice covers one month, so a draft with
+                # several months is billed one month at a time from the list at the top of this
+                # screen.
                 st.caption("Bill it from the month's list at the top of this screen.")
                 columns = st.columns([1.4, 1, 4])
                 with columns[0]:
@@ -3648,12 +3643,12 @@ def _past_invoices_section(counts: dict, year: int, month: int) -> None:
 
 
 def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
-    """Bill the selected students for this month, then image the results.
+    """Bill the ticked students for this month, then make the images to send.
 
-    One action, because that is the whole job -- nobody wants an issued
-    invoice they cannot send.  Billing is committed first and on its own: if
-    the image renderer is missing or fails, the invoices are still properly
-    issued and the panel below offers the other formats.
+    One step, because that's the whole job: nobody wants an invoice they
+    can't send. Billing is saved first, on its own, so if the image maker is
+    missing or fails, the invoices are still issued and the panel below
+    offers the other formats.
     """
     issued_ids = []
     unpriced_count = 0
@@ -3688,13 +3683,13 @@ def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
         _rerun()
     token = "_".join(str(d["ID"]) for d in details)
     zip_key = f"invoices_zip_png_{token}"
-    # A rendered batch runs to tens of megabytes; only the newest is worth
-    # keeping in session state.
+    # A batch of files can be tens of megabytes; only the newest is kept in
+    # session_state.
     for stale in [k for k in st.session_state if k.startswith("invoices_zip_png_")]:
         st.session_state.pop(stale, None)
 
-    # Roughly six tenths of a second per invoice, so a full month is the
-    # better part of a minute -- shown moving, never as a page that has hung.
+    # About 0.6 seconds per invoice, so a full month takes most of a minute. A
+    # progress bar shows it's working, so the page never looks frozen.
     progress = st.progress(0.0, text=f"Rendering {len(details)} {_send_noun()}(s)…")
     try:
         st.session_state[zip_key] = _invoices_zip(
@@ -3703,25 +3698,25 @@ def _send_invoices(invoice_ids: list[int], year: int, month: int) -> None:
                 done / total, text=f"Rendering {_send_noun()} {done} of {total}…"
             ),
         )
-    except Exception as problem:  # noqa: BLE001 - surfaced in the panel below
+    except Exception as problem:  # noqa: BLE001 - shown in the panel below
         st.session_state[f"{zip_key}_error"] = str(problem)
     finally:
         progress.empty()
 
-    # Pre-tick everyone just issued, so the panel below opens with the
-    # download ready rather than asking for the selection all over again.
+    # Tick everyone just issued, so the panel below opens with the download ready
+    # instead of asking who to include again.
     for detail in details:
         st.session_state[f"ji_pick_{year}_{month}_{detail['ID']}"] = True
     _rerun()
 
 
 def _next_number_control() -> None:
-    """The next invoice's number, and a way to choose another.
+    """Show the next invoice's number, and a way to choose another.
 
     For invoices written outside the app, whose numbers the next one here
-    must not repeat. A number an invoice in the app already has is not
-    refused outright: who has it is shown under it, with the choice of giving
-    their invoice another number instead.
+    mustn't repeat. A number an invoice in the app already has isn't just
+    refused: it shows who has it, with the choice of giving their invoice
+    another number instead.
     """
     numbering = db.get_next_invoice_number()
     with st.popover(f"Next invoice number: #{numbering['next']}"):
@@ -3743,14 +3738,14 @@ def _next_number_control() -> None:
                     _flash(f"Numbers below #{detail} are the academy's invoices from before the "
                            "app, which it can't check.", "warning")
                 _rerun()
-        # In the popover, under the number that clashed: a rerun that leaves
-        # the label as it was keeps the popover open, which would cover a
-        # warning placed below it on the page.
+        # Shown in the popover, under the number that clashed: a rerun that leaves the
+        # label the same keeps the popover open, and it would cover a warning shown
+        # below it on the page.
         _number_clash(numbering)
 
 
 def _number_clash(numbering: dict) -> None:
-    """A number chosen that an invoice already has: whose it is, and a way to free it."""
+    """Show who already has the chosen number, and a way to free it."""
     clash = st.session_state.get("number_clash")
     if not clash:
         return
@@ -3795,9 +3790,9 @@ def _number_clash(numbering: dict) -> None:
 
 def invoices_tab() -> None:
 
-    # The month leads and everything below is that month's: an invoice is
-    # always *for* a month of classes, never a running total of everything
-    # the academy has ever billed.
+    # The month comes first and everything below is for that month: an invoice is
+    # always for a month of lessons, never a running total.
+    """Draw the Invoices screen for one month: what to bill, then sent invoices and credits."""
     year, month = _month_picker("invoice_month")
     period = f"{calendar.month_name[month]} {year}"
     summary = db.get_month_invoice_summary(year, month)
@@ -3807,8 +3802,8 @@ def invoices_tab() -> None:
         st.info("No invoices yet — they appear as soon as a schedule is imported.")
         return
 
-    # One line, not a four-metric dashboard: there is only ever one question
-    # on this screen -- how much is there to send this month.
+    # One line, not four metrics: the only question here is how much there is to
+    # send this month.
     st.markdown(
         f"#### {_when(period)} — {summary['to_bill_count']} to bill, "
         f"{_money(summary['to_bill_value'])}"
@@ -3824,9 +3819,8 @@ def invoices_tab() -> None:
     _out_of_step_warning()
 
     month_items = db.get_open_invoice_items_for_month(year, month)
-    # Only warn when something is actually about to go out. A month that is
-    # fully billed already has nothing at stake in its prices, and saying so
-    # every time would just be noise above an empty list.
+    # Only warn when something is about to go out. A month that's fully billed has
+    # nothing riding on its prices, and saying so every time would be clutter.
     if month_items:
         _unpriced_warning(year, month)
         _unnamed_subjects("invoices", year, month)
@@ -3834,8 +3828,8 @@ def invoices_tab() -> None:
     if not month_items:
         st.info(f"Nothing left to bill for {_when(period)}.")
     else:
-        # A form, as on Payments: ticking is instant, and the button is above
-        # the list rather than below every student in it.
+        # A form, as on Payments: ticking is instant, and the button is above the list
+        # instead of below every student.
         with st.form(f"invoice_form_{year}_{month}", border=False):
             send = st.form_submit_button(
                 "Send ticked invoices", type="primary", key="invoice_bulk_issue", width="stretch",
@@ -3857,23 +3851,23 @@ def invoices_tab() -> None:
             else:
                 st.warning("Tick who to bill first.")
 
-    # Sits below the month's figures rather than on top of them, and belongs
-    # to the month it was issued for.
+    # Below the month's figures, not above them, and only for the month it was issued
+    # for.
     _just_issued_panel(year, month)
     _past_invoices_section(counts, year, month)
 
 
 # ---------------------------------------------------------------------------
-# Data
+# Payments, then Data
 # ---------------------------------------------------------------------------
 
 
 def _part_payment_form(unpaid: list[dict], year: int, month: int) -> None:
-    """The rare case: a parent sends less than the invoice asks for.
+    """Record a part payment: a parent paid less than the invoice asks for.
 
-    Kept behind a tick rather than beside every row -- almost every payment
-    is the full amount, and putting an amount box on 80 rows would bury the
-    one button that does the job.
+    Behind a tick instead of on every row: almost every payment is the full
+    amount, and an amount box on 80 rows would hide the one button that's
+    usually needed.
     """
     if not st.checkbox("Someone paid a different amount", key=f"part_pay_{year}_{month}"):
         return
@@ -3910,7 +3904,7 @@ def _part_payment_form(unpaid: list[dict], year: int, month: int) -> None:
 
 
 def _paid_list(paid: list[dict], year: int, month: int) -> None:
-    """Who has already paid, and an undo for the inevitable mis-tick."""
+    """Show who has already paid, with an undo for a wrong tick."""
     st.markdown(f"###### Received ({len(paid)})")
     if not paid:
         st.caption("Nobody yet.")
@@ -3928,8 +3922,8 @@ def _paid_list(paid: list[dict], year: int, month: int) -> None:
     for row in shown[:PAID_ROWS]:
         columns = st.columns([5, 1])
         if row["Paid on"] is None:
-            # Nothing was ever owed: credit for missed classes took the
-            # invoice to $0. There is no payment to show, or to undo.
+            # Nothing was ever owed: credit for missed lessons brought the invoice to $0, so
+            # there's no payment to show or undo.
             columns[0].markdown(
                 f"{_student(row['Student'])} — nothing to pay: credit for missed classes covered it"
             )
@@ -3951,6 +3945,7 @@ def _paid_list(paid: list[dict], year: int, month: int) -> None:
 
 
 def payments_tab() -> None:
+    """Draw the Payments screen for one month: who still owes, then who has paid."""
     year, month = _month_picker("payments_month")
     period = f"{calendar.month_name[month]} {year}"
     data = db.get_invoice_payments(year, month)
@@ -3977,9 +3972,8 @@ def payments_tab() -> None:
     if not unpaid:
         st.success(f"Everyone has paid for {_when(period)}.")
     else:
-        # A form, so ticking is instant: outside one every tick reran the whole
-        # screen, two seconds each on the live app, with the button waiting
-        # below every parent on the list.
+        # A form, so ticking is instant: outside a form every tick reran the whole screen,
+        # two seconds each on the live app, with the button below every parent.
         search = st.text_input(
             "Find", placeholder="Search by student or invoice number",
             key=f"pay_find_{year}_{month}", label_visibility="collapsed",
@@ -4002,8 +3996,8 @@ def payments_tab() -> None:
                     bits.append(f"part paid, {_money(row['Total'])} invoice")
                 bits.append(f"#{row['Number']}")
                 if row.get("Covers"):
-                    # Billed whole rather than a month at a time, so the amount
-                    # beside their name is not only this month's classes.
+                    # Billed all at once, not month by month, so the amount next to their name isn't
+                    # just this month's lessons.
                     bits.append(f"covers {_when(row['Covers'])}")
                 if row["Overdue"]:
                     bits.append(_flag(f"{row['Overdue']} days overdue"))
@@ -4036,15 +4030,16 @@ def payments_tab() -> None:
 
 
 def _level_axis() -> alt.Axis:
-    """An axis of months, or other short labels, written level.
+    """Return an axis for months, or other short labels, written level.
 
-    Vega-Lite stands a category axis's labels on end, so "Jan" to "Sep" read
-    sideways.
+    Vega-Lite turns a category axis's labels on their side, so "Jan" to "Sep"
+    read sideways.
     """
     return alt.Axis(labelAngle=0)
 
 
 def _history_view() -> None:
+    """Draw the Past schedules view: what's saved, and an upload to add more."""
     st.caption("For the charts only — never billed. Adding a workbook again updates it.")
     summary = db.get_lesson_history_summary()
     if summary:
@@ -4084,7 +4079,7 @@ def _history_view() -> None:
     file_bytes = upload.getvalue()
     try:
         sheets = schedule_parser.get_sheet_names(file_bytes)
-    except Exception as error:  # a corrupt or non-Excel file
+    except Exception as error:  # a damaged or non-Excel file
         st.error(f"Could not read that workbook: {error}")
         return
     chosen = st.multiselect(
@@ -4142,7 +4137,7 @@ _COMPARE_MAX = 8
 
 
 def _name_list(names: list[str], most: int = 6) -> str:
-    """"A, B and C", or "A, B, C and 4 more" past ``most``."""
+    """Return "A, B and C", or "A, B, C and 4 more" past `most`."""
     names = list(names)
     if len(names) > most:
         return ", ".join(names[:most]) + f" and {len(names) - most} more"
@@ -4150,12 +4145,12 @@ def _name_list(names: list[str], most: int = 6) -> str:
 
 
 def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
-    """Up to eight teachers to draw side by side; the top of ``ranked`` to start with.
+    """Pick up to eight teachers to chart side by side, starting with the top of `ranked`.
 
-    Picks from another year or month can name a teacher not on this list,
-    which the widget refuses; only the ones it can still show are kept. And
-    Streamlit forgets a widget's value on any run it isn't drawn -- a year
-    with nothing recorded -- so a copy is kept to come back to.
+    Picks made for another year or month can name a teacher not in this
+    list, which the widget refuses, so only the ones it can show are kept.
+    Streamlit also forgets a widget's value on any run where it isn't drawn
+    (a year with nothing recorded), so a copy is kept to restore it.
     """
     kept = st.session_state.get(key, st.session_state.get(f"_{key}_kept"))
     st.session_state[key] = (
@@ -4175,7 +4170,7 @@ def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
 
 @st.cache_data(show_spinner="Reading every lesson…", max_entries=4)
 def _teaching_activity(version: tuple, today: dt.date) -> dict:
-    """Students, lessons and hours by month, for one state of the lessons on record."""
+    """Return students, lessons and hours by month, for one set of lessons on record."""
     sources = db.get_analysis_lessons(today)
     lessons, _ = teaching.combine(sources["app"], sources["history"])
     return teaching.monthly_activity(lessons)
@@ -4185,13 +4180,13 @@ _TEACHING_MEASURES = {"Students": "Students taught", "Hours": "Teaching hours", 
 
 
 def _teaching_view() -> None:
-    """What the academy taught, month by month and teacher by teacher.
+    """Show what the academy taught, month by month and teacher by teacher.
 
-    The Invoiced view can only show money billed through the app, and most
-    teachers came onto it in September 2026 -- before that it is two
+    The Invoiced view only shows money billed through the app, and most
+    teachers joined the app in September 2026; before that it's two
     teachers' takings. The lessons themselves are on record for everyone,
-    from the Schedule and from past schedules, so how many students were
-    taught, and for how many hours, is known for every month.
+    from the Schedule and from past schedules, so the number of students
+    and hours taught is known for every month.
     """
     st.caption("Every lesson taught, from the Schedule and Past schedules. Money is under Invoiced.")
     year, month = _month_picker("data_month")
@@ -4203,15 +4198,15 @@ def _teaching_view() -> None:
         st.info(f"No lessons on record in {year} up to the end of {_when(label)}.")
         return
 
-    # The month picked, against the one before it -- unless the month isn't
-    # over yet, when half a month beside a whole one says nothing.
+    # The chosen month against the one before, unless the month isn't over yet:
+    # half a month next to a whole one tells you nothing.
     so_far = (year, month) == (today.year, today.month)
     before = (year, month - 1) if month > 1 else (year - 1, 12)
     by_month = {(row["Year"], row["Month"]): row for row in activity["by_month"]}
     current, previous = by_month.get((year, month)), by_month.get(before)
-    # Teachers' records begin at different times -- four of the biggest only
-    # in January 2026 -- and a month where some begin isn't comparable with
-    # the one before: the jump is records, not students.
+    # Teachers' records start at different times (four of the biggest only in January
+    # 2026), so a month where some start can't be compared with the one before: the
+    # jump is new records, not new students.
     first_on_record: dict[str, tuple[int, int]] = {}
     for row in activity["by_teacher"]:
         key = (row["Year"], row["Month"])
@@ -4315,14 +4310,17 @@ def _teaching_view() -> None:
 
 
 def _per_hour(invoiced: float, hours: float) -> str:
+    """Return money per hour as text, or a dash if there are no hours."""
     return f"${invoiced / hours:,.0f}" if hours else "—"
 
 
 def _lessons(count: int) -> str:
+    """Return "1 lesson" or "N lessons"."""
     return f"{count} lesson{'' if count == 1 else 's'}"
 
 
 def data_tab() -> None:
+    """Draw the Data screen: the Teaching, Invoiced or Past schedules view."""
     view = st.radio(
         "View",
         ["Teaching", "Invoiced", "Past schedules"],
@@ -4349,7 +4347,7 @@ def data_tab() -> None:
     frame = pd.DataFrame(trend)
     order = [calendar.month_abbr[m] for m in range(1, month + 1)]
 
-    # The academy as a whole first: one bar a month, whoever taught it.
+    # The whole academy first: one bar per month, whoever taught it.
     st.markdown(f"#### Invoiced by month — January to {calendar.month_name[month]} {year}")
     totals = frame.groupby("Month name", as_index=False)[["Invoiced", "Not invoiced", "Hours"]].sum()
     stacked = totals.melt(id_vars=["Month name", "Hours"], value_vars=["Invoiced", "Not invoiced"],
@@ -4373,9 +4371,9 @@ def data_tab() -> None:
         .properties(height=240),
         width="stretch",
     )
-    # Teachers came onto the app at different times -- most in September
-    # 2026 -- and a month before that holds only the few billed through it
-    # then. Unsaid, the jump reads as the academy's takings quadrupling.
+    # Teachers joined the app at different times (most in September 2026), and a
+    # month before that only has the few billed through it then. Without a note, the
+    # jump looks like the academy's takings quadrupled.
     active = frame[(frame["Invoiced"] + frame["Not invoiced"]) > 0]
     per_month = active.groupby("Month")["Teacher"].nunique()
     if len(per_month) > 1:
@@ -4390,13 +4388,12 @@ def data_tab() -> None:
                 "for every teacher's months."
             )
 
-    # Then teachers side by side. A line each for two dozen teachers was a
-    # tangle -- ten colours between them, a key twice the chart's height and
-    # cut off, most lines lying flat at $0 -- so only the teachers picked are
-    # drawn, and at most eight, which is as many colours as stay distinct.
-    # A teacher's month is what was invoiced plus what is still to invoice:
-    # drawing invoices alone showed every teacher not yet billed through the
-    # app as a flat line at $0, whatever they taught.
+    # Then teachers side by side. A line for each of two dozen teachers was a tangle:
+    # ten colours, a key twice the chart's height and cut off, most lines flat at $0.
+    # So only the chosen teachers are drawn, eight at most, which is as many colours
+    # as stay easy to tell apart. A teacher's month is what was invoiced plus what's
+    # still to invoice; invoices alone showed every teacher not yet billed through
+    # the app as flat at $0, whatever they taught.
     frame["Month total"] = frame["Invoiced"] + frame["Not invoiced"]
     by_teacher = frame.groupby("Teacher")["Month total"].sum().sort_values(ascending=False)
     names = sorted(by_teacher.index, key=str.casefold)
@@ -4425,8 +4422,8 @@ def data_tab() -> None:
         )
 
     st.divider()
-    # Both this and the trend price their classes through the same helper, so
-    # the figures below always match the last point on the line above.
+    # This and the trend use the same function to price lessons, so the figures below
+    # always match the last point on the chart above.
     stats = db.get_teacher_month_stats(year, month)
     if not stats:
         st.info(f"Nobody taught in {_when(label)}.")
@@ -4447,9 +4444,9 @@ def data_tab() -> None:
         _per_hour(snapshot["Invoiced"].sum(), snapshot["Invoiced lesson hours"].sum()),
         help="Invoiced ÷ hours of those lessons. A class of six earns six rates an hour.",
     )
-    # Invoiced money only moves when invoices go out, so an import or a new
-    # price changed nothing on this screen. What is still to come, at
-    # today's prices, is the figure that answers to both.
+    # Invoiced money only changes when invoices go out, so an import or a new price
+    # changed nothing on this screen. What's still to come, at today's prices, shows
+    # both.
     unpriced = int(snapshot["Not invoiced unpriced"].sum())
     columns[3].metric(
         "Still to invoice", f"${snapshot['Not invoiced value'].sum():,.2f}",
@@ -4468,10 +4465,9 @@ def data_tab() -> None:
                if unpriced else "")
         )
 
-    # Bars along the ground, longest first, rather than a pie: a name reads
-    # the same whether there are two teachers or forty, where slices become
-    # slivers and a colour key you have to look things up in. Height grows
-    # with the roster so nothing is squeezed.
+    # Bars, longest first, not a pie: names read the same with two teachers or forty,
+    # where pie slices turn into slivers with a colour key to look up. The chart
+    # gets taller with more teachers so nothing is squeezed.
     st.markdown("##### Invoiced")
     invoiced = snapshot[snapshot["Invoiced"] > 0]
     st.altair_chart(
@@ -4513,7 +4509,7 @@ def data_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Payment reminders
+# Create schedule, then Reminders
 # ---------------------------------------------------------------------------
 
 
@@ -4521,13 +4517,14 @@ _PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": [], "Student
 
 
 def _subjects_in(value) -> list:
-    """A Subject cell's names. A pick-list cell, so a list -- one name, unless two were picked."""
+    """Return the names in a Subject cell as a list (a pick-list cell; usually one name)."""
     if isinstance(value, str):
         value = [value]
     return [name.strip() for name in value or [] if isinstance(name, str) and name.strip()]
 
 
 def _as_date(value):
+    """Return a table cell as a date, or None if it's empty."""
     if value is None or value == "" or (isinstance(value, float) and value != value):
         return None
     if isinstance(value, dt.datetime):
@@ -4538,6 +4535,7 @@ def _as_date(value):
 
 
 def _as_clock(value):
+    """Return a table cell as a time, or None if it's empty."""
     if value is None or value == "" or (isinstance(value, float) and value != value):
         return None
     if isinstance(value, dt.datetime):
@@ -4548,10 +4546,10 @@ def _as_clock(value):
 
 
 def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int, int]:
-    """The table's rows as lessons, each weekly one repeated to the month's end.
+    """Turn the table's rows into lessons, repeating each weekly one to the month's end.
 
-    Returns ``(lessons, rows not filled in yet, rows outside the month, rows
-    given more than one subject)`` -- the last taken with their first.
+    Returns (lessons, rows not filled in yet, rows outside the month, rows
+    given more than one subject); the last are used with their first subject.
     """
     last = dt.date(year, month, calendar.monthrange(year, month)[1])
     lessons, unfinished, elsewhere, doubled = [], 0, 0, 0
@@ -4579,7 +4577,7 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
 
 
 def _plan_problems(lessons: list) -> list[str]:
-    """What would make the sheet wrong: a class ending before it starts, or two at once."""
+    """Return what would make the sheet wrong: a class ending before it starts, or two at once."""
     problems = []
     for lesson in lessons:
         if lesson["end"] <= lesson["start"]:
@@ -4597,11 +4595,12 @@ def _plan_problems(lessons: list) -> list[str]:
 
 
 def _student_finder(students: list):
-    """A name as the upload will find it: on file, a spelling on file for them, or the same once cleaned.
+    """Return a lookup from a name to a student id that matches names the way the upload does.
 
-    So "Dami Ryu", the way one teacher writes Ryu Dami, isn't called new --
-    the upload knows her by it -- and her other classes are still checked
-    for clashes.
+    A name matches if it's on file, is a known spelling of a student, or is
+    the same once tidied. So "Dami Ryu", the way one teacher writes Ryu Dami,
+    isn't called new (the upload knows that spelling), and that student's
+    other classes are still checked for clashes.
     """
     exact = {item["Name"]: item["ID"] for item in students}
     known = db.get_student_aliases()
@@ -4611,10 +4610,10 @@ def _student_finder(students: list):
 
 
 def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int) -> list[str]:
-    """Students booked into another teacher's class at the same time, from what is in the app.
+    """Return students booked into another teacher's class at the same time, from what's in the app.
 
     One query for the month. The teacher's own classes in the app are left
-    out: their sheet, once uploaded, replaces them.
+    out: their sheet replaces them once it's uploaded.
     """
     ids = {find(name) for lesson in lessons for name in lesson["students"]} - {None}
     first = dt.date(year, month, 1)
@@ -4635,12 +4634,15 @@ def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int)
 
 
 def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
-    """A sheet's month as table rows -- one exported before, or a teacher's own --
-    and how many Online / Recording / Cancelled marks it had, which the table
-    doesn't hold: those are kept on the sheet itself."""
+    """Turn a sheet's month into table rows (a sheet downloaded before, or a teacher's own).
+
+    Also returns how many Online / Recording / Cancelled marks it had, which
+    the table doesn't hold: those stay on the sheet itself.
+    """
     data = upload.getvalue()
 
     def month_of(name):
+        """Return the month a sheet's name gives, or None."""
         try:
             return schedule_parser.infer_month(name)
         except ValueError:
@@ -4661,22 +4663,21 @@ def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
 
 
 def create_schedule_tab() -> None:
-    """Plan one teacher's month and download it as their schedule sheet.
+    """Draw the Create schedule screen: plan one teacher's month and download it as their sheet.
 
     Nothing here is saved in the app: the sheet is the schedule. It goes to
     the teacher on Google Drive, they mark Online / Recording / Cancelled on
-    it, and it comes back through the upload on Teachers like any workbook --
-    which is when its new teacher and new students are created.
+    it, and it comes back through the upload on Teachers like any workbook,
+    which is when its new teacher and students are created.
     """
     st.caption("Plan a teacher's month and download it as their schedule sheet. Nothing is saved "
                "in the app until the sheet is uploaded on Teachers.")
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
     labels = {item["Name"]: item["ID"] for item in teachers}
-    # A screen not drawn loses its widgets' state, so going to another screen
-    # and back reset the month and teacher under a table still full of the
-    # month planned. What they held is kept beside them and put back. Seeded
-    # through session state, not the widgets' defaults, which Streamlit
-    # refuses to combine.
+    # Widgets on a screen that isn't drawn lose their values, so going to another
+    # screen and back reset the month and teacher while the table still held the
+    # planned month. Their values are kept alongside and put back. They're set
+    # through session_state, not the widgets' defaults, since Streamlit won't take both.
     ahead = dt.date.today().replace(day=1) + dt.timedelta(days=32)
     for key, default in (("plan_year", ahead.year), ("plan_month", ahead.month),
                          ("plan_teacher_mode", "Existing teacher" if teachers else "New teacher"),
@@ -4705,8 +4706,8 @@ def create_schedule_tab() -> None:
 
     students = db.get_all_students()
     lookup = {item["Name"]: item["ID"] for item in students}
-    # The teacher's subjects on file, then any typed into the table: a new
-    # subject typed once is offered on the next row, spelled the same.
+    # The teacher's subjects on file, then any typed into the table, so a new subject
+    # typed once is offered on the next row, spelled the same.
     subjects: dict = {}
     on_file = [item["Class"] for item in db.get_teacher_classes_for_schedule(
         teacher_id, dt.date(year, month, 1))] if teacher_id else []
@@ -4732,9 +4733,9 @@ def create_schedule_tab() -> None:
                     _flash(f"{len(rows)} lessons put in the table.")
                 _rerun()
 
-    # The table keeps its rows across the other screens: a widget's own state
-    # goes when its screen isn't drawn, so the rows are kept beside it and a
-    # fresh table is started from them on the way back.
+    # The table keeps its rows across screens: a widget's own state is lost when its
+    # screen isn't drawn, so the rows are kept alongside and a new table is started
+    # from them on the way back.
     version = st.session_state.get("plan_version", 0)
     table_key = f"plan_table_{version}"
     if table_key not in st.session_state:
@@ -4780,9 +4781,9 @@ def create_schedule_tab() -> None:
                        key=str.casefold)
     if new_names:
         st.info("New students, created when the sheet is uploaded: " + _chips("student", new_names, most=99))
-    # A subject typed rather than picked is a new one -- said so, as for
-    # students, with the one on file it is close to: "G12 Bio" picked by
-    # Enter half-typed would otherwise quietly become a second subject.
+    # A subject typed instead of picked is a new one. Say so, as for students, with
+    # the one on file it's close to: "G12 Bio" picked by pressing Enter half-typed
+    # would otherwise quietly become a second subject.
     known = {name.casefold() for name in on_file}
     new_subjects = sorted({lesson["subject"] for lesson in lessons if lesson["subject"].casefold() not in known},
                           key=str.casefold)
@@ -4796,8 +4797,8 @@ def create_schedule_tab() -> None:
         st.warning("Booked into another class at the same time:  \n" + "  \n".join(clashes[:12])
                    + (f"  \n…and {len(clashes) - 12} more" if len(clashes) > 12 else ""))
 
-    # The sheet is read back the way the upload will read it, so whatever
-    # wouldn't survive is fixed here, not discovered at upload.
+    # The sheet is read back the way the upload will read it, so anything that
+    # wouldn't survive is fixed here, not found at upload.
     data = schedule_writer.write_month(lessons, year, month) if lessons and teacher_name and not problems else b""
     if data:
         for line in schedule_writer.readback_problems(lessons, data, year, month):
@@ -4828,6 +4829,7 @@ def create_schedule_tab() -> None:
 
 
 def reminders_tab() -> None:
+    """Draw the Reminders screen: invoices that fell due this month, and older unpaid ones."""
     st.caption("Due on the 20th of the following month. Record payments on Payments.")
 
     today = dt.date.today()
@@ -4837,6 +4839,7 @@ def reminders_tab() -> None:
         return
 
     def _due_this_month(item: dict) -> bool:
+        """Return True if the invoice fell due this month."""
         return item["Due"].year == today.year and item["Due"].month == today.month
 
     reminders = [item for item in all_reminders if _due_this_month(item)]
@@ -4877,24 +4880,23 @@ def reminders_tab() -> None:
     )
 
 
-# No page title: the browser tab names the app, and the row of screens is
-# the first thing anyone needs. Streamlit's own top padding goes too.
+# No page title: the browser tab already names the app, and the row of screens is
+# the first thing anyone needs. Streamlit's top padding goes too.
 st.markdown(
     "<style>[data-testid='stMainBlockContainer'] { padding-top: 2.5rem; }</style>",
     unsafe_allow_html=True,
 )
-# Above the tabs, so a confirmation from any tab's last action is visible
-# wherever the rerun lands.
+# Above the screens, so the message from the last action shows wherever the rerun
+# lands.
 _show_flash()
 _chip_key()
 _offer_billing()
 _floating_back_to_top()
-# A segmented control rather than st.tabs, for two reasons that both bit
-# this app: st.tabs runs *every* tab's body on every interaction anywhere in
-# the app, so the slowest screen taxed all the others; and any st.rerun()
-# threw you back to the first tab, which made every confirmation land
-# somewhere you were not looking. With the choice held in session state, one
-# screen renders and reruns stay put.
+# A segmented control instead of st.tabs, for two reasons. st.tabs runs every
+# tab's code on every click anywhere in the app, so the slowest screen slowed all
+# the others. And any st.rerun() went back to the first tab, so confirmations
+# landed somewhere you weren't looking. With the choice kept in session_state,
+# only one screen is drawn and reruns stay on it.
 SECTIONS = {
     "Teachers": teachers_tab,
     "Students": students_tab,
@@ -4907,23 +4909,22 @@ SECTIONS = {
     "Reminders": reminders_tab,
 }
 
-# A jump requested by another screen (the "Bill <month>" button after an
-# import) has to land before the selector is created -- Streamlit refuses a
-# write to a widget's key once that widget exists in the same run.
+# A jump asked for by another screen (the "Bill <month>" button after an import)
+# must be applied before the selector is created: Streamlit refuses a write to a
+# widget's key once that widget exists in the same run.
 _pending = st.session_state.pop("goto_section", None)
 if _pending in SECTIONS:
     st.session_state["active_section"] = _pending
 
-# Seeded here rather than through the widget's `default=`: passing a default
-# *and* writing the key from elsewhere (the jump below) is the combination
-# Streamlit warns about, and session state alone does the same job. A new
-# session -- a refresh, or the connection dropping and coming back -- opens
-# the screen the address names, rather than throwing you back to Teachers.
+# Set here instead of through the widget's `default=`: a default plus writing the
+# key from elsewhere (the jump below) makes Streamlit warn, and session_state alone
+# does the job. A new session (a refresh, or the connection dropping and coming
+# back) opens the screen named in the address instead of going back to Teachers.
 if "active_section" not in st.session_state:
     _named = st.query_params.get("screen")
     st.session_state["active_section"] = _named if _named in SECTIONS else next(iter(SECTIONS))
-# A section that has since been renamed must not follow a browser that was
-# open across the change: it lands on the first screen instead.
+# A screen name that has since changed mustn't carry over from a browser left open
+# across the change; it goes to the first screen instead.
 if st.session_state["active_section"] not in SECTIONS:
     st.session_state["active_section"] = next(iter(SECTIONS))
 if st.session_state.get("last_section") not in SECTIONS:
@@ -4935,10 +4936,9 @@ _section = st.segmented_control(
     label_visibility="collapsed",
 )
 if _section is None:
-    # Clicking the already-selected segment deselects it. Bounce back to
-    # where we were rather than showing a blank page -- routed through
-    # goto_section because Streamlit refuses a write to a widget's own key
-    # once that widget has been instantiated this run.
+    # Clicking the selected screen again unselects it. Go back to where we were
+    # instead of showing a blank page, through goto_section, because Streamlit
+    # refuses a write to a widget's own key once it's been created this run.
     st.session_state["goto_section"] = st.session_state.get(
         "last_section", next(iter(SECTIONS))
     )
@@ -4946,7 +4946,7 @@ if _section is None:
 st.session_state["last_section"] = _section
 if _section and st.query_params.get("screen") != _section:
     st.query_params["screen"] = _section
-# `_section or ...` is belt-and-braces: _rerun() above raises under Streamlit
-# so None never reaches here, but indexing by None would be a hard crash if
-# that ever stopped being true.
+# `_section or ...` is an extra guard: _rerun() above stops the run under
+# Streamlit, so None never gets here, but indexing by None would crash if that
+# ever changed.
 SECTIONS[_section or next(iter(SECTIONS))]()
