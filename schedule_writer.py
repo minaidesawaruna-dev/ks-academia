@@ -1,24 +1,23 @@
-"""Write one teacher's month of lessons as a schedule workbook the parser reads back.
+"""Writes one teacher's month of lessons as an Excel sheet in the teachers' own layout.
 
-The layout is the teachers' own, as in Jason's workbook, so a teacher sees
-nothing new and ``schedule_parser`` needs nothing new:
+The sheet looks like the schedules teachers already keep, so the upload on
+the Teachers screen can read it back with no changes:
 
-* One worksheet, named by the month (``Nov``), so it can be copied into a
-  teacher's yearly spreadsheet beside the months already there.
-* Row 1 holds a day label, ``3(TUE)``, over two columns for every day of the
-  month: a class sits in the first column, and the second is left for the
-  teacher to write ``Online`` / ``Recording`` / ``Cancelled`` with names.
-* Column A holds the half-hour time axis, repeated before every Monday so it
-  stays in view across a wide sheet.
-* A class is a coloured block running down its time rows::
+* One worksheet, named after the month (for example "Nov"), so it can be
+  copied into the teacher's yearly file next to the other months.
+* Row 1 has a day label such as "3(TUE)" over two columns for each day.
+  The class goes in the first column; the second is left for the teacher
+  to write Online, Recording or Cancelled and the names.
+* Column A is the half-hour time axis, repeated before every Monday.
+* Each class is a coloured block down its time rows:
 
       G11 Chem HL B
       4pm-6pm
       Nam Jihoon
       Oh Minseok
 
-  The time is written out with am/pm on both ends: it is the written time,
-  not the row, that the parser goes by.
+  The time is written with am/pm on both ends, because the upload reads
+  the written time, not the row the block sits in.
 """
 
 from __future__ import annotations
@@ -37,8 +36,7 @@ from openpyxl.utils import get_column_letter
 import schedule_parser
 
 SLOT_MINUTES = 30
-# Pale enough that black text reads on every one; a subject keeps its colour
-# across the month, as teachers colour theirs by hand.
+# Light colours so black text stays readable. Each subject keeps one colour for the month.
 PALETTE = ["FFF2CC", "E0F7FA", "E8F5E9", "FCE4EC", "EDE7F6",
            "FFF3E0", "E3F2FD", "F1F8E9", "FBE9E7", "E0F2F1"]
 WEEKEND_HEADER = "EEEEEE"
@@ -48,13 +46,14 @@ STATUS_ORDER = ("Online", "Recording", "Cancelled")
 
 
 def month_sheet_name(month: int) -> str:
-    """``Nov`` -- the name the teachers' own sheets use."""
+    """Return the worksheet name for a month, e.g. "Nov"."""
     return calendar.month_abbr[month]
 
 
 def time_label(start: dt.time, end: dt.time) -> str:
-    """``4pm-5.30pm``: am/pm written on both ends, so nothing is left to guess."""
+    """Write a time range like "4pm-5.30pm", with am or pm on both ends."""
     def part(moment: dt.time) -> str:
+        """Write one time, e.g. "4pm" or "5.30pm"."""
         hour = moment.hour % 12 or 12
         minutes = f".{moment.minute:02d}" if moment.minute else ""
         return f"{hour}{minutes}{'am' if moment.hour < 12 else 'pm'}"
@@ -62,12 +61,13 @@ def time_label(start: dt.time, end: dt.time) -> str:
 
 
 def class_text(lesson: dict[str, Any]) -> str:
+    """Return the text of a class block: subject, time range, then one student per line."""
     return "\n".join([lesson["subject"].strip(), time_label(lesson["start"], lesson["end"]),
                       *[name.strip() for name in lesson.get("students") or [] if name.strip()]])
 
 
 def status_text(lesson: dict[str, Any]) -> str:
-    """``Online`` then its students, and so on: what a teacher writes in the next column."""
+    """Return what goes in the column next to a class: "Online" and its students, and so on."""
     by_status: dict[str, list[str]] = defaultdict(list)
     for name, status in (lesson.get("statuses") or {}).items():
         if status in STATUS_ORDER:
@@ -77,17 +77,18 @@ def status_text(lesson: dict[str, Any]) -> str:
 
 
 def _minutes(moment: dt.time) -> int:
+    """Return a time as minutes after midnight."""
     return moment.hour * 60 + moment.minute
 
 
 def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> bytes:
-    """The month as an .xlsx file.
+    """Build the month's sheet and return it as .xlsx bytes.
 
-    ``lessons`` are ``{"date", "start", "end", "subject", "students": [names],
-    "statuses": {name: "Online" | "Recording" | "Cancelled"}}``, ``statuses``
-    optional. Lessons outside the month are left out. Two lessons of one day
-    that would share a half-hour row are stacked, the later one a row down:
-    its written time still says when it is.
+    Each lesson is a dict with date, start, end, subject, students (a list of
+    names) and optionally statuses ({name: "Online" | "Recording" | "Cancelled"}).
+    Lessons outside the month are skipped. If two lessons on one day would land
+    on the same half-hour row, the later one moves down a row; its written time
+    still shows when it really is.
     """
     days_in_month = calendar.monthrange(year, month)[1]
     lessons = sorted(
@@ -99,8 +100,8 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
                                          for lesson in lessons])
     last = max([_minutes(DAY_END)] + [_minutes(lesson["end"]) for lesson in lessons])
 
-    # Rows: one a half hour from `first`; a lesson covers the rows its time
-    # touches, pushed down past the day's previous block if they would share one.
+    # Work out each lesson's rows: one row per half hour from `first`. If a lesson
+    # would overlap the previous block that day, push it down below that block.
     placed: list[tuple[dict[str, Any], int, int]] = []
     by_day: dict[dt.date, int] = {}
     for lesson in lessons:
@@ -112,7 +113,7 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
         placed.append((lesson, top, bottom))
     slots = max([(last - first) // SLOT_MINUTES] + [bottom + 1 for _, _, bottom in placed])
 
-    # Columns: the time axis, then two a day, the axis again before each Monday.
+    # Columns: the time axis, then two columns per day, with the axis repeated before each Monday.
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = month_sheet_name(month)
@@ -176,11 +177,11 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
 
 
 def readback_problems(lessons: list, data: bytes, year: int, month: int) -> list[str]:
-    """Lessons the sheet wouldn't give back as planned, read with the upload's own parser.
+    """Check the sheet reads back exactly as planned, using the upload's own parser.
 
-    A comma in a name reads as two students, a number drops it, and a name
-    starting Online / Rec / Cancel reads as a status: caught here, before
-    the sheet goes to a teacher, rather than at upload a month later.
+    Returns one line per problem. This catches names the upload would misread:
+    a comma splits one name into two, a digit drops the name, and a name that
+    starts with Online, Rec or Cancel is read as a status.
     """
     same = schedule_parser.normalise_name
     back = schedule_parser.parse_workbook(data, [month_sheet_name(month)], year)["sessions"]
