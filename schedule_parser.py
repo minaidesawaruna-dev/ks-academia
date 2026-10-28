@@ -1268,7 +1268,7 @@ _KO_SURNAMES = {
     "소": "so", "마": "ma", "길": "gil kil", "연": "yeon", "표": "pyo", "기": "ki gi",
 }
 # English names written in Hangul, which romanisation can't turn back into English
-# (e.g. 에스더 would read "eseudeo").
+# (e.g. 그레이스 would read "geureiseu").
 _KO_ENGLISH = {
     "에스더": "Esther", "알렉시스": "Alexis", "제임스": "James", "루카스": "Lucas",
     "마이크": "Mike", "마이클": "Michael", "소피아": "Sophia", "이자벨": "Isabel",

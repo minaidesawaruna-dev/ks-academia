@@ -296,7 +296,7 @@ def t_month_labels():
     for text, want in cases.items():
         got = sp.read_month_label(text)
         assert got == want, f"{text!r} -> {got}, wanted {want}"
-    for text in ("adr", "Jane", " ", "5월2일", "15(SAT)", "2026", None, 7):
+    for text in ("adr", "Janet", " ", "5월2일", "15(SAT)", "2026", None, 7):
         assert sp.read_month_label(text) is None, f"{text!r} read as a label"
     return f"{len(cases)} labels read; notes, names and day labels ignored"
 
@@ -827,8 +827,8 @@ def t_absence_notes():
     def fit(note, name):
         return max((sp._answers_to(readings, sp._roster_sounds(name))
                     for _, readings in sp._note_people(note)), default=0)
-    assert fit("태우결석", "Kim Taewoo") and fit("아윤,찬우 캔슬", "Chanwoo Ahn")
-    assert fit("에스더 결석", "Esther Nam"), "an English name written in Hangul"
+    assert fit("태우결석", "Kim Taewoo") and fit("하린,찬우 캔슬", "Chanwoo Ahn")
+    assert fit("그레이스 결석", "Grace Nam"), "an English name written in Hangul"
     assert fit("민이 급한국행", "Min"), "a name with the fond 이 on the end"
     assert fit("홍다혜 여행", "Hong Dahye") == 2 and fit("홍다혜 여행", "Dahye") == 1
     assert not fit("다혜결석", "Dohye"), "다혜 and 도혜 are two different children"
