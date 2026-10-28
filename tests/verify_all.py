@@ -1682,7 +1682,7 @@ print(json.dumps(result, default=str))
 
 
 def t_class_edits():
-    """Deleting a class works on Postgres; students keep their order; double bookings show.
+    """Deleting a class works with foreign keys on; students keep their order; double bookings show.
 
     "Delete for good" deleted the class before its invoice lines, which
     Postgres refuses, so on the live app nothing was ever deleted. A student

@@ -1,4 +1,4 @@
-"""Verify the schedule parser: pure functions, then a real workbook."""
+"""Checks for the schedule parser: the small functions first, then whole workbooks built here."""
 from __future__ import annotations
 
 import datetime as dt
@@ -11,8 +11,8 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 PROJECT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT))
-# The import-matching checks read students from the database: an empty one of
-# their own, never whatever database this machine happens to point at.
+# The name-matching checks read students from a database: give them an empty one
+# of their own, never whatever database this machine points at.
 os.environ["DATABASE_URL"] = "sqlite:///" + Path(tempfile.mkdtemp(), "parser.db").as_posix()
 
 from openpyxl import Workbook  # noqa: E402
@@ -23,6 +23,7 @@ results: list[tuple[str, bool, str]] = []
 
 
 def check(name, fn):
+    """Run one check and record whether it passed, with its message."""
     try:
         results.append((name, True, fn() or ""))
     except Exception as exc:  # noqa: BLE001
@@ -31,6 +32,7 @@ def check(name, fn):
 
 # ----------------------------------------------------------- pure functions
 def t_time_ranges():
+    """Time ranges in the usual formats are read, and nonsense is refused."""
     cases = {
         "9am-11am": (dt.time(9, 0), dt.time(11, 0)),
         "9:30am-11:00am": (dt.time(9, 30), dt.time(11, 0)),
@@ -45,6 +47,7 @@ def t_time_ranges():
 
 
 def t_status_vocabulary():
+    """Status words in English and Korean are read, with cancelled beating online."""
     cases = {
         "Cancelled": sp.CANCELLED,
         "cancelled online class": sp.CANCELLED,   # cancel wins over online
@@ -62,6 +65,7 @@ def t_status_vocabulary():
 
 
 def t_month_year_inference():
+    """Month sheet names give the right month, and the upload's year is used when none is given."""
     for sheet, month in {"Aug": 8, "August": 8, "Sep": 9, "July": 7,
                          "Jan": 1, "Dec": 12}.items():
         got = sp.infer_month(sheet)
@@ -71,14 +75,13 @@ def t_month_year_inference():
 
 
 def t_name_normalising():
+    """Times and status words never end up as student names."""
     a = sp.normalise_name("  Nam   Jihoon ")
     b = sp.normalise_name("Nam Jihoon")
     assert a == b, f"{a!r} != {b!r}"
     assert sp.looks_like_name("Nam Jihoon"), "rejected a real name"
-    # looks_like_name is a low-level predicate: times are removed upstream by
-    # _is_time_line and status words by status_from_line, both of which
-    # parse_cell applies first. Test those real guards, not a contract this
-    # predicate does not claim.
+    # looks_like_name doesn't check for times or status words itself: parse_cell
+    # removes those first, with _is_time_line and status_from_line. So test those.
     assert sp._is_time_line("9am-11am"), "time line not recognised"
     assert not sp._is_time_line("Nam Jihoon"), "name mistaken for a time"
     status, leftover = sp.status_from_line("Recording")
@@ -91,6 +94,7 @@ def t_name_normalising():
 
 
 def t_parse_cell():
+    """A class cell splits into its subject, time and students."""
     cell = sp.parse_cell("G11 Chem HL B\n9am-11am\nNam Jihoon\nOh Minseok")
     assert cell["time_range"] == (dt.time(9, 0), dt.time(11, 0)), cell
     assert cell["class_lines"] == ["G11 Chem HL B"], cell
@@ -102,33 +106,33 @@ def t_parse_cell():
 
 # ------------------------------------------------------------- real workbook
 def build_workbook() -> io.BytesIO:
-    """A calendar-grid sheet in the shape the teachers actually send."""
+    """Return a small workbook laid out the way the teachers' calendar sheets are."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Aug"
 
-    # Header row: a time-axis header, then day labels merged over two columns
-    # (class column + status column), exactly as the docstring describes.
+    # Header row: a time column, then day labels each merged over two columns
+    # (the class column and the status column).
     ws.cell(row=1, column=1, value="Time")
     ws.cell(row=1, column=2, value="3(MON)")
     ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=3)
     ws.cell(row=1, column=4, value="5(WED)")
     ws.merge_cells(start_row=1, start_column=4, end_row=1, end_column=5)
 
-    # 30-minute time axis down column A.
+    # Half-hour time axis down column A.
     times = ["9:00", "9:30", "10:00", "10:30", "11:00", "11:30",
              "12:00", "12:30", "13:00", "13:30"]
     for offset, label in enumerate(times):
         ws.cell(row=2 + offset, column=1, value=label)
 
-    # Monday: one class, with a student marked as a recording watcher.
+    # Monday: one class, with one student watching the recording.
     ws.cell(row=2, column=2,
             value="G11 Chem HL B\n9am-11am\nNam Jihoon\nOh Minseok\nPark Sohee")
     ws.merge_cells(start_row=2, start_column=2, end_row=5, end_column=2)
     ws.cell(row=2, column=3, value="Recording\nPark Sohee")
     ws.merge_cells(start_row=2, start_column=3, end_row=5, end_column=3)
 
-    # Wednesday: a different class, one cancellation and one online student.
+    # Wednesday: another class, with one student cancelled and one online.
     ws.cell(row=6, column=4,
             value="G11 Maths SL\n11am-12:30pm\nSeo Yerin\nChoi Doyun\n수민")
     ws.merge_cells(start_row=6, start_column=4, end_row=8, end_column=4)
@@ -145,12 +149,14 @@ WB = build_workbook().getvalue()
 
 
 def t_sheet_names():
+    """The workbook's sheet names are listed."""
     names = sp.get_sheet_names(io.BytesIO(WB))
     assert names == ["Aug"], names
     return f"{names}"
 
 
 def t_parse_schedule():
+    """The sheet is read into lessons for both subjects."""
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     assert out["month"] == 8, out["month"]
     assert out["session_count"] >= 2, f"only {out['session_count']} sessions"
@@ -163,6 +169,7 @@ def t_parse_schedule():
 
 
 def t_dates_resolved():
+    """Day labels become the right August dates."""
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     dates = sorted({s["date"] for s in out["sessions"] if s.get("date")})
     assert dates, "no dates resolved"
@@ -173,6 +180,7 @@ def t_dates_resolved():
 
 
 def t_times_resolved():
+    """The lesson time is read from the class cell."""
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     chem = [s for s in out["sessions"]
              if "Chem" in str(s.get("class_name") or s.get("subject"))][0]
@@ -182,6 +190,7 @@ def t_times_resolved():
 
 
 def t_statuses_applied():
+    """Recording, online, cancelled and attending go to the right students."""
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     found = {}
     for session in out["sessions"]:
@@ -196,6 +205,7 @@ def t_statuses_applied():
 
 
 def t_korean_student_parsed():
+    """A student name written in Hangul is read from the grid."""
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
     names = {a["student_name"] for s in out["sessions"] for a in s["attendance"]}
     assert "수민" in names, f"Korean student lost: {sorted(names)}"
@@ -203,6 +213,7 @@ def t_korean_student_parsed():
 
 
 def t_parse_workbook_multi():
+    """Several sheets combine, and a missing sheet gives a warning instead of a crash."""
     out = sp.parse_workbook(io.BytesIO(WB), ["Aug"], 2026)
     assert out["session_count"] >= 2, out["session_count"]
     out2 = sp.parse_workbook(io.BytesIO(WB), ["Aug", "Nope"], 2026)
@@ -211,6 +222,7 @@ def t_parse_workbook_multi():
 
 
 def t_backfill_suggestions():
+    """The subject and student suggestions run on a parsed workbook."""
     import schedule_backfill as sb
     sb.db.initialise_database()
     out = sp.parse_schedule(io.BytesIO(WB), "Aug", 2026)
@@ -227,12 +239,12 @@ LESSON = "G10 Math\n9am-11am\nNam Jihoon\nOh Minseok"
 
 
 def _grid(ws, blocks):
-    """Lay month blocks side by side, the way the whole-year sheets do.
+    """Lay month blocks side by side, the way whole-year sheets do.
 
-    ``blocks`` is ``[(label, [(day_label, class_text), ...]), ...]``. Each
-    block is a time-axis column followed by one column per day; the label
-    goes in row 1 above the block, day labels in row 2, and class text on
-    the 9:00 row. A label of ``None`` leaves that month unlabelled.
+    `blocks` is [(label, [(day_label, class_text), ...]), ...]. Each block is
+    a time column followed by one column per day; the label goes in row 1
+    above the block, day labels in row 2, and class text on the 9:00 row. A
+    label of None leaves that month unlabelled.
     """
     column = 1
     for label, days in blocks:
@@ -250,6 +262,7 @@ def _grid(ws, blocks):
 
 
 def _book(*sheets):
+    """Return a workbook, as bytes, with one sheet per (title, blocks) given."""
     wb = Workbook()
     wb.remove(wb.active)
     for title, blocks in sheets:
@@ -260,16 +273,19 @@ def _book(*sheets):
 
 
 def _dates(out):
+    """Return the sorted dates of the lessons read."""
     return sorted({s["date"] for s in out["sessions"]})
 
 
 def _said(out, *words):
+    """Return True if any warning contains all of `words`."""
     texts = [w["message"] for w in out["warnings"]] + [
         w["message"] for s in out["sessions"] for w in s["warnings"]]
     return any(all(word in text for word in words) for text in texts)
 
 
 def t_month_ranges_in_names():
+    """Sheet names covering several months give the first month; "2026" alone gives none."""
     cases = {"Jan- Feb 2026": 1, "FEB-MAR 2026": 2, "May-Aug 2026": 5,
              "2026(1-7월)": 1, "Oct-Dec2022": 10, "2026.Aug": 8, "Sep26": 9,
              "Summary June": 6}
@@ -286,6 +302,7 @@ def t_month_ranges_in_names():
 
 
 def t_month_labels():
+    """Month labels above the day labels are read; notes, names and day labels aren't."""
     cases = {
         "JAN.2026": (1, 2026), " MARCH 2026": (3, 2026), "JUN.2026": (6, 2026),
         "JULY 2026(7/1-11일휴가)": (7, 2026), "AUG(8/26, 8/29~9/2)": (8, None),
@@ -302,6 +319,7 @@ def t_month_labels():
 
 
 def t_whole_year_sheet():
+    """A sheet named "2026" is read by its month labels."""
     book = _book(("2026", [("JAN.2026", [("3(SAT)", LESSON), ("5(MON)", None)]),
                            ("FEB", [("2(MON)", LESSON), ("7(SAT)", None)])]))
     out = sp.parse_workbook(io.BytesIO(book), ["2026"], 2025)
@@ -317,7 +335,7 @@ def t_dates_shown():
     """Every day a sheet has a column for is reported, and which months are its own.
 
     A re-upload makes the calendar match the workbook only on the days it
-    shows, so a September sheet's last columns -- 1 and 2 October -- must not
+    shows, so a September sheet's last columns (1 and 2 October) mustn't
     stand for the whole of October.
     """
     book = _book(("Sep", [(None, [("28(MON)", LESSON), ("29(TUE)", None), ("30(WED)", None),
@@ -339,6 +357,7 @@ def t_dates_shown():
 
 
 def t_unlabelled_first_month():
+    """Columns before the first month label are taken as the month before it."""
     book = _book(("2026", [(None, [("3 SAT", LESSON)]),
                            ("FEB 2026", [("2(MON)", LESSON)]),
                            ("MARCH 2026", [("2(MON)", LESSON)])]))
@@ -350,6 +369,7 @@ def t_unlabelled_first_month():
 
 
 def t_multi_month_sheet_name():
+    """A sheet named "Jan- Feb 2026" starts in January and rolls into February."""
     book = _book(("Jan- Feb 2026", [(None, [("11(SUN)", LESSON),
                                             ("2(MON)", LESSON)])]))
     out = sp.parse_workbook(io.BytesIO(book), ["Jan- Feb 2026"], 2026)
@@ -360,6 +380,7 @@ def t_multi_month_sheet_name():
 
 
 def t_leftover_year_block():
+    """A block left over from another year is skipped, or only flagged if it's mid-sheet."""
     book = _book(("2026", [("Jan 2025", [("4(SAT)", LESSON)]),
                            ("AUG.2026", [("1(SAT)", LESSON)])]),
                  ("2025", [("Jan 2025", [("4(SAT)", LESSON)]),
@@ -370,7 +391,7 @@ def t_leftover_year_block():
     out = sp.parse_workbook(io.BytesIO(book), ["2025"], 2026)
     assert _dates(out) == [dt.date(2025, 11, 1)], _dates(out)
     assert _said(out, "Jan 2025", "skipped as a"), out["warnings"]
-    # Stranded mid-sheet it is only flagged: it may be real.
+    # In the middle of a sheet it's only flagged, since it may be real.
     book = _book(("2024", [("JAN 2024", [("6(SAT)", LESSON)]),
                            ("FEB 2024", [("3(SAT)", LESSON)]),
                            ("NOV 2024", [("2(SAT)", LESSON)])]))
@@ -381,6 +402,7 @@ def t_leftover_year_block():
 
 
 def t_single_month_label_disagrees():
+    """A one-month sheet keeps its name's month; a label only adds a missing year."""
     book = _book(("Aug", [("JULY", [("3(MON)", LESSON)])]),
                  ("Jan", [("Jan 2025", [("5(Sun)", LESSON)])]))
     out = sp.parse_workbook(io.BytesIO(book), ["Aug"], 2026)
@@ -392,6 +414,7 @@ def t_single_month_label_disagrees():
 
 
 def t_not_a_schedule():
+    """A sheet with no month anywhere is skipped with a warning."""
     wb = Workbook()
     wb.active.title = "학생 리스트"
     wb.active["A1"] = "Nam Jihoon"
@@ -406,6 +429,7 @@ def t_not_a_schedule():
 
 
 def t_backwards_time():
+    """A 12-hour slip is fixed from the grid row; one that can't be fixed is refused."""
     wb = Workbook()
     ws = _grid(wb.active, [(None, [("3(MON)", None), ("5(WED)", None)])])
     ws.title = "Aug"
@@ -422,6 +446,7 @@ def t_backwards_time():
 
 
 def t_time_only_cell_skipped():
+    """A cell with only a time and no class or students isn't a lesson."""
     book = _book(("Aug", [(None, [("3(MON)", "13-11")])]))
     out = sp.parse_workbook(io.BytesIO(book), ["Aug"], 2026)
     assert out["session_count"] == 0, out["sessions"]
@@ -431,6 +456,7 @@ def t_time_only_cell_skipped():
 
 def t_year_from_weekdays():
     # 2(SUN) and 4(TUE) fall on those days in February 2025, not 2026.
+    """With no year written, the weekday labels decide the year."""
     book = _book(("Feb", [(None, [("2(SUN)", LESSON), ("4(TUE)", LESSON),
                                   ("6(THU)", None)])]))
     out = sp.parse_workbook(io.BytesIO(book), ["Feb"], 2026)
@@ -445,7 +471,9 @@ def t_year_from_weekdays():
 
 
 def t_roster_lines():
+    """Roster lines: commas split names, and grades and notes come off names."""
     def read(text):
+        """Return a cell's students and notes."""
         cell = sp.parse_cell(text)
         return [(e["name"], e.get("note")) for e in cell["entries"]], cell["notes"]
     got, _ = read("G8 Math\n4.30pm-6pm\nJihoon,yerin")
@@ -473,7 +501,7 @@ def t_roster_lines():
 
 
 def t_standard_rate_by_grade():
-    """The academy charges by the grade in the subject's name."""
+    """The standard price comes from the grade in the subject's name."""
     cases = {"G9 Science": 60.0, "G10 Add Math_A": 60.0, "Y4 ACSI Chemi": 60.0,
              "G11 Econs HL": 65.0, "G12(Y6) Econs SL": 65.0, "Y5 Chemi SL": 65.0,
              "Grade 7 Eng": 60.0, "Basic Eng": None, "Inter-Mid Eng 북클럽": None}
@@ -483,7 +511,9 @@ def t_standard_rate_by_grade():
 
 
 def t_status_stays_with_student():
+    """A status on a student's own line is theirs only; a label line covers those under it."""
     def read(text):
+        """Return a cell's students with their status and note."""
         return [(e["name"], e["status"], e.get("note")) for e in sp.parse_cell(text)["entries"]]
     got = read("G8 Math\n9am-11am\nNam Jihoon(당일취소)\nSeo Yerin\nOh Minseok(ONLINE)\nChoi Doyun")
     assert got == [("Nam Jihoon", sp.CANCELLED, "당일취소"), ("Seo Yerin", None, None),
@@ -502,7 +532,9 @@ def t_status_stays_with_student():
 
 
 def t_class_line_order():
+    """A class written after the time, or a student above it, is put right."""
     def split(text):
+        """Return a cell's class lines and student names."""
         cell = sp.parse_cell(text)
         return cell["class_lines"], [e["name"] for e in cell["entries"]]
     cases = {
@@ -518,6 +550,7 @@ def t_class_line_order():
 
 
 def t_two_classes_one_cell():
+    """A second class after an empty line is held back, not added to the first."""
     cell = sp.parse_cell("P2 DRILL\n11.15am-2.15pm\nNam Jihoon\n\n"
                          "11.15am-1.15pm\nG11 Econs IA\nSeo Yerin")
     assert [e["name"] for e in cell["entries"]] == ["Nam Jihoon"], cell["entries"]
@@ -526,6 +559,7 @@ def t_two_classes_one_cell():
 
 
 def t_not_a_lesson():
+    """Meetings, consultations and staff shifts aren't billed as lessons."""
     book = _book(("Aug", [(None, [("3(MON)", "Meeting with Nam Jihoon's mom\n9am-10am"),
                                   ("4(TUE)", "수학 보조 강사\n9am-12pm"),
                                   ("5(WED)", "consultation\nSeo Yerin\n9am-10am"),
@@ -541,6 +575,7 @@ def t_not_a_lesson():
 
 
 def t_unnamed_grouped():
+    """Unnamed classes get one placeholder per student, or per weekly slot for a group."""
     book = _book(("Aug", [(None, [("3(MON)", "9am-10am\nPark Sohee"),
                                   ("5(WED)", "9am-11am\nPark Sohee"),
                                   ("8(SAT)", "9am-11am\nNam Jihoon\nOh Minseok"),
@@ -553,6 +588,7 @@ def t_unnamed_grouped():
 
 
 def t_time_repairs():
+    """A 14-hour typo and a backwards time range are fixed from the grid."""
     wb = Workbook()
     ws = _grid(wb.active, [(None, [("3(MON)", None), ("5(WED)", None)])])
     ws.title = "Aug"
@@ -569,6 +605,7 @@ def t_time_repairs():
 
 
 def t_generic_sheet_names():
+    """"Sheet2" and "시트3" aren't read as February and March."""
     for name in ("시트3", "Sheet2"):
         try:
             sp.infer_month(name)
@@ -579,8 +616,9 @@ def t_generic_sheet_names():
 
 
 def _suggested(on_file, parsed, aliases=None, taught=None):
-    """What the import would ask about ``parsed`` names, given students ``on_file``
-    and, optionally, which of them this teacher already teaches."""
+    """Return what the import would ask about the `parsed` names, given the students `on_file`
+    and, optionally, which of them this teacher already teaches.
+    """
     import schedule_backfill as sb
     real = sb.db.get_all_students, sb.db.get_student_aliases, sb.db.get_teacher_rosters
     try:
@@ -595,6 +633,7 @@ def _suggested(on_file, parsed, aliases=None, taught=None):
 
 
 def t_grade_prefix_match():
+    """A grade in front of a name still matches the student on file."""
     import schedule_backfill as sb
     for name, want in {"g5 sohee": "sohee", "Grade 7 Nam Jihoon": "Nam Jihoon",
                        "Yerin": "Yerin", "G11": "G11"}.items():
@@ -615,6 +654,7 @@ def t_grade_prefix_match():
 def t_same_name_said_differently():
     # The other word order, and a romanisation split into three, were never
     # close enough letter by letter to be asked about: each came in new.
+    """The same name in another word order or romanisation is found."""
     found = _suggested({1: "Ahn Seojin", 2: "Sohn Taemin", 3: "Park Hana"},
                        ["Seojin Ahn", "Tae Min Sohn", "Hana"])
     assert found == {"Seojin Ahn": (1, True), "Tae Min Sohn": (2, True)}, found
@@ -628,7 +668,9 @@ def t_same_name_said_differently():
 
 
 def t_absence_written_on_the_name():
+    """A student marked "(Absent)", "없었음" or "안옴" is cancelled; the others on the line aren't."""
     def read(line):
+        """Return the students and statuses read from one line under a class."""
         cell = sp.parse_cell("G9 Science\n5pm-7pm\n" + line)
         return [(e["name"], e["status"]) for e in cell["entries"]]
     # Each of these was read as attending, and would have been billed.
@@ -644,7 +686,8 @@ def t_absence_written_on_the_name():
 
 
 def t_grade_tag_is_not_a_nickname():
-    # "(G9)" tells a ninth-grader from the Nam Jihoon on file -- asked, not assumed.
+    # "(G9)" tells a ninth-grader apart from the Nam Jihoon on file: asked, not assumed.
+    """A grade tag or a lone given name is asked about, never matched in advance."""
     found = _suggested({1: "Nam Jihoon"}, ["Nam Jihoon(G9)"])
     assert found == {"Nam Jihoon(G9)": (1, False)}, found
     # A given name alone is asked about too, however alike it sounds.
@@ -654,8 +697,9 @@ def t_grade_tag_is_not_a_nickname():
 
 
 def t_notes_typed_onto_names():
-    # A note on the student's line is the student plus a note -- each of these
-    # made a new student out of the note.
+    # A note on a student's line is the student plus a note. Each of these used to
+    # make a new student out of the note.
+    """Notes typed onto a name come off it; a tag that tells children apart stays."""
     for line, want in {
         "(5pm-7pm KR) Nam Jihoon": ("Nam Jihoon", "5pm-7pm KR"),
         "Oh Minseok(1시간)": ("Oh Minseok", "1시간"),
@@ -674,9 +718,11 @@ def t_notes_typed_onto_names():
 
 
 def t_name_written_in_hangul():
+    """A name written in Hangul matches its English spelling, and is asked about if it fits two."""
     assert sp.hangul_fit("다혜", "Dahye") == 1 and sp.hangul_fit("강다혜", "Kang Dahye") == 2
     assert sp.hangul_fit("다혜", "Jiwoo") == 0 and sp.hangul_fit("다혜", "다혜") == 0
     def session(anchor, names):
+        """Return a lesson at cell `anchor` with these students."""
         return {"coordinate": anchor, "attendance": [{"student_name": n, "source": anchor} for n in names]}
     reviews = sp.canonicalise_names([session("B3", ["Dahye", "Seo Yerin"]), session("C3", ["다혜", "Seo Yerin"])])["reviews"]
     found = {tuple(r["names"]): r["likely_same"] for r in reviews}
@@ -693,7 +739,9 @@ def t_name_written_in_hangul():
 
 
 def t_typo_in_one_class():
+    """A typo in the same class starts on merge; in another class it's asked about."""
     def session(anchor, cls, names):
+        """Return a lesson at cell `anchor` in class `cls` with these students."""
         return {"coordinate": anchor, "class_name": cls,
                 "attendance": [{"student_name": n, "source": anchor} for n in names]}
     reviews = sp.canonicalise_names([
@@ -709,6 +757,7 @@ def t_typo_in_one_class():
 
 
 def t_teachers_own_students():
+    """Short names and added English names match the teacher's own students."""
     on_file = {1: "Park Hana Leong", 2: "Nam Jihoon", 3: "Oh Minseok", 4: "Seo Yerin Choi", 5: "Kim Taewoo"}
     taught = {1, 2, 3, 4}
     found = _suggested(on_file, ["Hana", "Emma Nam Jihoon", "Minseok Oh", "Yerin", "Taewoo"], taught=taught)
@@ -723,8 +772,9 @@ def t_teachers_own_students():
     # Two of theirs fit: asked, not assumed.
     found = _suggested({1: "Park Hana", 2: "Kim Hana"}, ["Hana"], taught={1, 2})
     assert found.get("Hana", (0, False))[1] is False, found
-    # One letter off a short name of theirs -- 86% alike, under the typo check -- is
-    # asked, but not assumed: it could as well be a sibling. Not theirs: not asked.
+    # One letter off a short name of theirs (86% alike, under the typo check) is
+    # asked about but not assumed: it could just as well be a sibling. If it's not
+    # their student, it isn't asked about.
     found = _suggested({1: "Oh Mina", 2: "Nam Jihoon"}, ["Oh Mino", "Oh Mian"], taught={1})
     assert found.get("Oh Mino") == (1, False) and found.get("Oh Mian") == (1, False), found
     assert "Oh Mino" not in _suggested({2: "Oh Mina"}, ["Oh Mino"], taught={1}), "not theirs"
@@ -732,7 +782,9 @@ def t_teachers_own_students():
 
 
 def t_sound_alike_reviews():
+    """Names that sound the same are flagged to merge, unless they share a lesson."""
     def session(anchor, names):
+        """Return a lesson at cell `anchor` with these students."""
         return {"coordinate": anchor, "attendance": [
             {"student_name": n, "source": anchor} for n in names]}
     reviews = sp.canonicalise_names([
@@ -751,7 +803,9 @@ def t_sound_alike_reviews():
 
 
 def t_time_shares_a_line():
+    """A class, students, a status or a room can share the time's line; notes are left alone."""
     def read(text):
+        """Return a cell's class lines, time and students with their status."""
         cell = sp.parse_cell(text)
         return (cell["class_lines"], cell["time_range"],
                 [(e["name"], e["status"]) for e in cell["entries"]])
@@ -779,6 +833,7 @@ def t_time_shares_a_line():
 
 
 def t_late_lesson_below_axis():
+    """A lesson below the time axis is read; notes there are flagged, not attached."""
     wb = Workbook()
     ws = _grid(wb.active, [(None, [("3(MON)", None), ("5(WED)", None)])])
     ws.title = "Aug"
@@ -825,6 +880,7 @@ def t_absence_notes():
     assert all(a["status"] != sp.CANCELLED for a in first["attendance"]), first["attendance"]
 
     def fit(note, name):
+        """Return how well a note fits a student name: 2, 1 or 0."""
         return max((sp._answers_to(readings, sp._roster_sounds(name))
                     for _, readings in sp._note_people(note)), default=0)
     assert fit("태우결석", "Kim Taewoo") and fit("하린,찬우 캔슬", "Chanwoo Ahn")
@@ -846,8 +902,8 @@ def t_absence_notes():
 def t_second_calendar():
     """A second calendar pasted under the month is flagged, and not read into the one above.
 
-    Its day labels sit in other columns, so reading it as part of the top grid
-    filed its lessons under the wrong days -- the 10th's class on the 3rd.
+    Its day labels sit in other columns, so reading it as part of the top
+    grid put its lessons on the wrong days (the 10th's class on the 3rd).
     """
     wb = Workbook()
     ws = _grid(wb.active, [(None, [("3(MON)", LESSON), ("5(WED)", None), ("7(FRI)", None)])])
@@ -885,6 +941,7 @@ def t_subject_spelling_on_file():
 
 
 def t_joined_times():
+    """"6pm7.30pm" and "9.30m - 11am" are read; a room number isn't a time."""
     cell = sp.parse_cell("G9 English\n6pm7.30pm\nSeo Yerin")
     assert cell["time_range"] == (dt.time(18), dt.time(19, 30)), cell
     assert [e["name"] for e in cell["entries"]] == ["Seo Yerin"], cell
@@ -894,6 +951,7 @@ def t_joined_times():
 
 
 def t_online_day_label():
+    """A day marked ONLINE is recognised and its lessons marked online."""
     for text in ("3(Thu)\nONLINE", "5(Mon)   ONLINE", "7(WED) online", "15(SAT)"):
         assert sp.DAY_HEADER_RE.match(text), text
     assert not sp.DAY_HEADER_RE.match("14(THU)-25(MON)")
@@ -909,11 +967,12 @@ def t_online_day_label():
 
 
 def t_written_sheet_reads_back():
-    """A month written by the Create schedule screen parses back exactly as planned.
+    """A month written by the Create schedule screen reads back exactly as planned.
 
-    Times at a quarter past, noon, late evening; two classes sharing a half
-    hour; a class with nobody listed yet; statuses in the column beside;
-    every day of the month shown, so an upload covers the whole month.
+    Covers times at a quarter past, noon and late evening; two classes in the
+    same half hour; a class with nobody listed yet; statuses in the column
+    next to it; and every day of the month shown, so an upload covers the
+    whole month.
     """
     import schedule_writer as sw
 
@@ -948,10 +1007,10 @@ def t_written_sheet_reads_back():
 
 
 def t_readback_catches_names():
-    """The Create schedule screen reads its sheet back first: a name the upload would misread is caught.
+    """Create schedule reads its sheet back first, so a name the upload would misread is caught.
 
     A comma reads as two students, a number drops the name, and a name
-    starting Online / Rec / Cancel reads as a status. A clean month passes.
+    starting with Online / Rec / Cancel reads as a status. A clean month passes.
     """
     import schedule_writer as sw
 
