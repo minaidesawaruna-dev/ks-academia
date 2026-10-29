@@ -4758,6 +4758,19 @@ _CARD_STYLE = "<style>" + " ".join(
 ) + "</style>"
 
 
+# A picked name in each Delete records box shows in the colours its badges use
+# everywhere else, so a teacher looks like a teacher and an invoice like money.
+_PICK_KINDS = {"delete_numbers": "money", "delete_teachers": "teacher", "delete_subjects": "subject",
+               "delete_classes": "when", "delete_students": "student", "delete_invoices": "money",
+               "delete_history": "teacher"}
+_PICK_STYLE = "<style>" + " ".join(
+    f"[class*='st-key-{key}'] span:has(> span[title]) {{ background-color: {_CELL_COLOURS[kind][1]} !important; }} "
+    f"[class*='st-key-{key}'] span:has(> span[title]) * {{ color: {_CELL_COLOURS[kind][0]} !important; "
+    f"fill: {_CELL_COLOURS[kind][0]} !important; }}"
+    for key, kind in _PICK_KINDS.items()
+) + "</style>"
+
+
 def _invoice_row(bill: dict) -> dict:
     """Return one invoice as a table row for Delete records' detail."""
     return {
@@ -4987,6 +5000,8 @@ def delete_records_tab() -> None:
                "with any year and any month, it's deleted outright. Sent invoices too. Can't be undone.")
     # Bumped after a delete, so the boxes start empty again.
     generation = st.session_state.get("delete_gen", 0)
+    # The cards' coloured edges, and picked names in each box in their badge colours.
+    st.markdown(_CARD_STYLE + _PICK_STYLE, unsafe_allow_html=True)
 
     when = st.columns(2)
     today = dt.date.today()
@@ -5066,7 +5081,6 @@ def delete_records_tab() -> None:
 
     plan = db.describe_master_delete(**picked)
     total = sum(row["How many"] for row in plan["Rows"])
-    st.markdown(_CARD_STYLE, unsafe_allow_html=True)
     # The verdict first, so it can be read at a glance: green when only the picks are touched.
     beyond = _beyond_text(plan["Beyond"])
     if beyond:
