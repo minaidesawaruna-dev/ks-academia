@@ -697,6 +697,10 @@ def _import_upload_panel() -> None:
     # Retired teachers aren't offered: a retired teacher shouldn't get a schedule
     # until they're taken back on. They can be brought back from "Rename or retire".
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
+    # Bumped after each import, so the file box and the new teacher's name start empty
+    # for the next workbook. They used to keep the one just saved, and a second click
+    # on Parse read it again, ready to be imported under the next teacher typed in.
+    round_ = st.session_state.get("import_round", 0)
 
     mode = st.radio(
         "Teacher",
@@ -707,7 +711,7 @@ def _import_upload_panel() -> None:
         index=1 if not teachers else 0,
     )
     if mode == "New teacher" or not teachers:
-        teacher_name = st.text_input("Teacher name", key="import_new_teacher_name").strip()
+        teacher_name = st.text_input("Teacher name", key=f"import_new_teacher_name_{round_}").strip()
         teacher_id = None
     else:
         labels = {item["Name"]: item["ID"] for item in teachers}
@@ -726,7 +730,7 @@ def _import_upload_panel() -> None:
     upload = st.file_uploader(
         "Excel schedule (.xlsx) — one worksheet per month, same layout as always",
         type=["xlsx"],
-        key="import_file",
+        key=f"import_file_{round_}",
     )
     if upload is None:
         return
@@ -1052,6 +1056,7 @@ def _import_upload_panel() -> None:
             if months:
                 st.session_state["offer_billing"] = months[-1]
             st.session_state.pop("import_preview", None)
+            st.session_state["import_round"] = round_ + 1
             _rerun()
         else:
             st.warning(f"Nothing imported ({result['status']}).")
