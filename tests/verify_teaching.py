@@ -70,7 +70,9 @@ def t_history_store():
     assert len(history) == 3 and {row["status"] for row in history} == {"Recording", "Attending"}
     assert not db.get_invoices() and not db.get_all_classes() and not db.get_all_students(), \
         "past schedules created something billable"
-    assert db.delete_lesson_history("Teacher A") == 3 and not db.get_lesson_history_summary()
+    removed = db.master_delete(history_names=["Teacher A"])["Rows"]
+    assert removed == [{"What": "Past schedules (student-lessons)", "How many": 3}], removed
+    assert not db.get_lesson_history_summary()
     return "added once, updated not doubled, billed nothing, removable"
 
 

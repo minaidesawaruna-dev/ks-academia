@@ -520,8 +520,10 @@ def t_read_functions_all_run():
         "get_credits": lambda: db.get_credits(),
         "get_student_credit_totals": lambda: db.get_student_credit_totals(
             [s["ID"] for s in db.get_all_students()[:25]]),
-        "get_student_usage_many": lambda: db.get_student_usage_many(
-            [s["ID"] for s in db.get_all_students()[:25]]),
+        "get_invoice_choices": db.get_invoice_choices,
+        "get_lesson_choices": lambda: db.get_lesson_choices(year, month),
+        "describe_master_delete": lambda: db.describe_master_delete(
+            [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }
     broken = []
     for name, fn in calls.items():
@@ -1637,12 +1639,15 @@ open_ = {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_
 db.issue_invoice_for_month(open_["Nam Jihoon"], 2026, 9)
 
 result = {}
-# Delete for good: Nam was invoiced for the 8th, so he is owed it; Oh's open charge simply goes.
-result["deleted"] = list(db.delete_schedule_session(math_8))
+# The 8th deleted on Master delete: it comes off Nam's sent invoice and Oh's draft alike.
+nam = next(i["ID"] for i in db.get_invoices() if i["Student"] == "Nam Jihoon" and i["Status"] == "Issued")
+done = db.master_delete(lesson_ids=[math_8])
+result["deleted"] = [{row["What"]: row["How many"] for row in done["Rows"]}, done["Shortened"]]
 result["gone"] = db.get_schedule_session(math_8) is None
 result["credits"] = sorted([c["Student"], c["Reason"], c["Amount"]] for c in db.get_credits())
 result["oh_open"] = [row["Classes"] for row in db.get_open_invoice_items_for_month(2026, 9) if row["Student"] == "Oh Minseok"]
-result["again"] = list(db.delete_schedule_session(math_8))
+result["nam_lines"] = sorted(str(line["Date"]) for line in db.get_invoice_for_edit(nam)["Lines"])
+result["again"] = db.master_delete(lesson_ids=[math_8])["Rows"]
 
 def roster(session_id):
     return [row["student_name"] for row in db.get_schedule_session(session_id)["Attendance"]]
@@ -1684,9 +1689,10 @@ print(json.dumps(result, default=str))
 def t_class_edits():
     """Deleting a class works with foreign keys on; students keep their order; double bookings show.
 
-    "Delete for good" deleted the class before its invoice lines, which
-    Postgres refuses, so on the live app nothing was ever deleted. A student
-    invoiced for a deleted class is owed it back; an open charge just goes.
+    The old "Delete for good" deleted the class before its invoice lines,
+    which Postgres refuses, so on the live app nothing was ever deleted.
+    Classes are deleted on Master delete now, with links enforced: the class
+    comes off every invoice it was on, sent or draft, and nothing is credited.
     A save keeps students in the order they were added, however the rows
     arrive. A student in two classes at once is found, whoever teaches them,
     until one of the two is cancelled for them.
@@ -1699,10 +1705,12 @@ def t_class_edits():
         result = run(["-c", _CLASS_EDIT_SCRIPT], {"DATABASE_URL": url})
         assert result.returncode == 0, result.stderr[-1200:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
-    assert got["deleted"] == ["deleted", 1] and got["gone"], got["deleted"]
-    assert got["credits"] == [["Nam Jihoon", "Class deleted", 130.0]], got["credits"]
+    assert got["deleted"] == [{"Classes": 1, "Students' places in classes": 2, "Invoice lines": 2}, 1], got["deleted"]
+    assert got["gone"], got
+    assert got["credits"] == [], got["credits"]
     assert got["oh_open"] == [1], got["oh_open"]
-    assert got["again"] == ["missing", 0], got["again"]
+    assert got["nam_lines"] == ["2026-09-01"], got["nam_lines"]
+    assert got["again"] == [], got["again"]
     assert got["before"] == ["Nam Jihoon", "Oh Minseok"], got["before"]
     assert got["added"] == ["Nam Jihoon", "Oh Minseok", "Seo Yuna", "Kang Minji"], got["added"]
     assert got["resaved"] == got["added"], got["resaved"]
@@ -1711,8 +1719,170 @@ def t_class_edits():
     assert got["month"] == [["Seo Yuna", "G11 Test Math", "G11 Test Chem"]], got["month"]
     assert got["after_cancel"] == [0, 0], got["after_cancel"]
     assert got["taken_out"] == ["Nam Jihoon", "Seo Yuna", "Kang Minji"], got["taken_out"]
-    return ("class deleted with links enforced, invoiced student credited; order added kept through "
-            "a save; a double booking across teachers found, gone once cancelled; one taken out")
+    return ("class deleted with links enforced, off the sent invoice and the draft; order added kept "
+            "through a save; a double booking across teachers found, gone once cancelled; one taken out")
+
+
+_MASTER_DELETE_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event, func, select
+
+# Postgres refuses to delete a row others still point at; SQLite only does
+# when asked. Asked here, so this runs as the live database would.
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Demo Teacher")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(month, day, names, subject, start, end):
+    return {"date": dt.date(2026, month, day), "class_name": subject, "start_time": dt.time(start),
+            "end_time": dt.time(end), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sb.backfill({"sessions": [lesson(9, 1, ["Nam Jihoon", "Oh Minseok"], "G11 Test Math", 16, 18),
+                          lesson(9, 8, ["Nam Jihoon", "Oh Minseok"], "G11 Test Math", 16, 18),
+                          lesson(10, 6, ["Oh Minseok"], "G11 Test Math", 16, 18)]}, ids["Teacher A"])
+# A demo class with a real student in it, Nam, whose sent invoice then holds a demo line.
+sb.backfill({"sessions": [lesson(9, 2, ["Seo Yuna", "Nam Jihoon"], "G11 Test Chem", 17, 19),
+                          lesson(9, 9, ["Seo Yuna"], "G11 Test Chem", 17, 19)]}, ids["Demo Teacher"])
+students = {s["Name"]: s["ID"] for s in db.get_all_students()}
+db.update_student(students["Seo Yuna"], "Seo Yuna", "Parent One", "+65 9000 0001")
+db.update_student(students["Nam Jihoon"], "Nam Jihoon", "Parent Two", "+65 9000 0002")
+
+def open_for(month):
+    return {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, month)}
+
+def number(invoice_id):
+    found = db.get_invoice(invoice_id)
+    return found["Number"] if found else None
+
+def counts():
+    with db.engine.connect() as connection:
+        return {table.name: connection.execute(select(func.count()).select_from(table)).scalar()
+                for table in db.Base.metadata.sorted_tables}
+
+def broken_links():
+    with db.engine.connect() as connection:
+        return connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+
+def short(summary):
+    return {"rows": {row["What"]: row["How many"] for row in summary["Rows"]},
+            **{key: summary[key] for key in ("Numbers", "Next before", "Next after", "Shortened", "Reopened", "Unpaid")}}
+
+nam = db.issue_invoice_for_month(open_for(9)["Nam Jihoon"], 2026, 9)[1]
+oh = db.issue_invoice_for_month(open_for(9)["Oh Minseok"], 2026, 9)[1]
+db.mark_invoice_paid(oh)
+eighth = next(line for line in db.get_invoice_for_edit(oh)["Lines"] if line["Date"] == dt.date(2026, 9, 8))
+_, oh_sept, _ = db.replace_invoice(oh, {eighth["ID"]: {"Charged": False}})
+# October's invoice uses up the overpaid credit from correcting September's.
+oh_oct = db.issue_invoice_for_month(open_for(10)["Oh Minseok"], 2026, 10)[1]
+db.set_next_invoice_number(9001)
+seo = db.issue_invoice_for_month(open_for(9)["Seo Yuna"], 2026, 9)[1]
+result = {"numbers": [number(nam), number(oh), number(oh_sept), number(oh_oct), number(seo)],
+          "credits_before": sorted([c["Student"], c["Status"]] for c in db.get_credits())}
+
+# 1. The demo teacher and the demo student, as after a live demo.
+before = counts()
+preview = db.describe_master_delete([ids["Demo Teacher"]], [students["Seo Yuna"]])
+result["describe_changes_nothing"] = counts() == before
+done = db.master_delete([ids["Demo Teacher"]], [students["Seo Yuna"]])
+result["demo"] = short(done)
+result["demo_matches_preview"] = done == {key: preview[key] for key in done}
+result["report"] = {key: preview[key] for key in ("Linked", "Beyond", "Effects")}
+after = counts()
+result["demo_removed"] = {name: before[name] - after[name] for name in before if before[name] != after[name]}
+result["demo_links"] = broken_links()
+result["left"] = [sorted(t["Name"] for t in db.get_all_teachers()), sorted(s["Name"] for s in db.get_all_students()),
+                  sorted(c["Class"] for c in db.get_all_classes())]
+result["nam_kept"] = [number(nam), db.get_invoice(nam)["Status"],
+                      sorted(str(line["Date"]) for line in db.get_invoice_for_edit(nam)["Lines"])]
+result["next_after_demo"] = db.get_next_invoice_number()
+
+# 2. Only Oh's October invoice: the credit it used waits again, its class is unbilled.
+result["october"] = short(db.master_delete(invoice_ids=[oh_oct]))
+result["oh_credits"] = sorted([c["Status"], c["Reason"][:8]] for c in db.get_credits() if c["Student"] == "Oh Minseok")
+
+# 3. Oh's corrected September invoice: the void one it replaced and the overpaid credit go with it.
+result["september"] = short(db.master_delete(invoice_ids=[oh_sept]))
+result["oh_after"] = [db.get_credits(), [number(i) for i in (oh, oh_sept)], db.get_next_invoice_number()]
+result["links"] = broken_links()
+
+# 4. Oh's classes are still on the schedule; billed again, they take a freed number.
+for month in (9, 10):
+    for item in db.get_month_schedule(ids["Teacher A"], 2026, month):
+        db.sync_invoice_items(item["ID"])
+again = db.issue_invoice_for_month(open_for(9)["Oh Minseok"], 2026, 9)[1]
+result["reused"] = number(again)
+print(json.dumps(result, default=str))
+"""
+
+
+def t_master_delete():
+    """Master delete removes what was picked and everything linked, and frees the numbers.
+
+    Run with links enforced, so a row left pointing at a deleted one fails it.
+    A demo teacher and student go with their classes, sent invoices, parent
+    and the demo's chosen number, while a real student's invoice that held a
+    demo line keeps the rest. Deleting one invoice takes every version of
+    it and the credit its correction raised; a credit it used goes back to
+    waiting. The preview changes nothing and matches what is done, names
+    what each pick is linked to, and flags the real student it reaches. A
+    freed number is given out again.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "master.db").replace("\\", "/")
+        result = run(["-c", _MASTER_DELETE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["numbers"] == [7323, 7324, 7325, 7326, 9001], got["numbers"]
+    assert got["describe_changes_nothing"] and got["demo_matches_preview"], got
+    # The preview names what each pick is linked to, and flags the real student it reaches.
+    teacher, student = got["report"]["Linked"]
+    assert [teacher["Name"], [s["Name"] for s in teacher["Subjects"]], teacher["Students"]] == \
+        ["Demo Teacher", ["G11 Test Chem"], ["Nam Jihoon", "Seo Yuna"]], teacher
+    assert [student["Name"], student["Parent"], student["Teachers"],
+            [[i["Number"], i["Status"], i["Amount"]] for i in student["Invoices"]]] == \
+        ["Seo Yuna", "Parent One", ["Demo Teacher"], [[9001, "Issued", 260.0]]], student
+    beyond = got["report"]["Beyond"]
+    assert beyond["Places"] == [{"Student": "Nam Jihoon", "Classes": 1, "None left": False}], beyond
+    assert [[c["Number"], c["Student"], c["Classes"], c["Removed"]] for c in beyond["Changed"]] == \
+        [[7323, "Nam Jihoon", 1, 130.0]], beyond
+    assert beyond["Emptied"] == [] and beyond["Credits"] == [], beyond
+    effects = got["report"]["Effects"]
+    assert [effects["Sent"], effects["Sent amount"], effects["Parents"]] == [[9001], 260.0, ["Parent One"]], effects
+    demo = got["demo"]
+    assert demo["Numbers"] == [9001] and demo["Next before"] == 9002 and demo["Next after"] == 7327, demo
+    assert demo["Shortened"] == 1 and demo["Reopened"] == 0 and demo["Unpaid"] == 0, demo
+    for what, many in {"Teachers": 1, "Students": 1, "Parents": 1, "Subjects": 1, "Classes": 2,
+                       "Students' places in classes": 3, "Invoices": 1, "Invoice lines": 3}.items():
+        assert demo["rows"].get(what) == many, (what, demo["rows"])
+    assert got["demo_removed"].get("settings") == 1 and got["demo_removed"].get("parents") == 1, got["demo_removed"]
+    assert got["demo_links"] == [] and got["links"] == [], [got["demo_links"], got["links"]]
+    assert got["left"] == [["Teacher A"], ["Nam Jihoon", "Oh Minseok"], ["G11 Test Math"]], got["left"]
+    assert got["nam_kept"] == [7323, "Issued", ["2026-09-01", "2026-09-08"]], got["nam_kept"]
+    assert got["next_after_demo"] == {"next": 7327, "top": 7327}, got["next_after_demo"]
+    october = got["october"]
+    assert october["Numbers"] == [7326] and october["Reopened"] == 1 and october["Unpaid"] == 1, october
+    assert october["rows"] == {"Invoices": 1, "Invoice lines": 1}, october["rows"]
+    assert got["oh_credits"] == [["Open", "Overpaid"]], got["oh_credits"]
+    september = got["september"]
+    assert september["Numbers"] == [7324, 7325] and september["Next after"] == 7324, september
+    assert september["rows"] == {"Invoices": 2, "Invoice lines": 2, "Invoice corrections": 1, "Credits": 1}, september
+    assert september["Unpaid"] == 2, september
+    assert got["oh_after"] == [[], [None, None], {"next": 7324, "top": 7324}], got["oh_after"]
+    assert got["reused"] == 7324, got["reused"]
+    return ("demo teacher and student gone with every linked row, a real invoice keeps its other lines; "
+            "every version of a bill and its credit go together; a used credit waits again; "
+            "preview matches, changes nothing and flags the real student reached; freed numbers given "
+            "out again; no broken links")
 
 
 def t_swapped_class_same_slot():
@@ -1770,12 +1940,12 @@ def t_cancelled_classes_credited():
 
 
 def t_student_batch_matches_single():
-    """The Students screen's figures, loaded for a whole screen at once, match the records.
+    """The Students screen's credit figures, loaded for a whole screen at once, match the records.
 
-    Each row's figures used to cost four queries, so a screen of 25 students
-    was a hundred round trips. They're loaded in one pass now, which is only
-    worth it if the result is exactly right, so here they're counted
-    straight from the tables, student by student.
+    Each row's figures used to cost their own queries, so a screen of 25
+    students was a hundred round trips. They're loaded in one pass now,
+    which is only worth it if the result is exactly right, so here they're
+    counted straight from the tables, student by student.
     """
     import db
     from sqlalchemy import func, select
@@ -1783,20 +1953,9 @@ def t_student_batch_matches_single():
     ids = [row["ID"] for row in db.get_all_students()][:30]
     if not ids:
         return "no students to compare"
-    usage = db.get_student_usage_many(ids)
     credits = db.get_student_credit_totals(ids)
     with db.SessionLocal() as session:
-        def count(model, *where):
-            """Return how many rows of `model` match `where`."""
-            return session.scalar(select(func.count()).select_from(model).where(*where)) or 0
         for student_id in ids:
-            expected = {
-                "subjects": count(db.Enrolment, db.Enrolment.student_id == student_id),
-                "classes": count(db.SessionAttendance, db.SessionAttendance.student_id == student_id),
-                "invoices": count(db.Invoice, db.Invoice.student_id == student_id,
-                                  db.Invoice.status == "Issued"),
-            }
-            assert usage.get(student_id) == expected, f"usage differs for student {student_id}"
             owed = session.scalar(
                 select(func.coalesce(func.sum(db.Credit.amount), 0))
                 .where(db.Credit.student_id == student_id, db.Credit.status == "Open")
@@ -1804,7 +1963,7 @@ def t_student_batch_matches_single():
             assert abs(credits.get(student_id, 0.0) - float(owed)) < 0.005, (
                 f"credit differs for student {student_id}"
             )
-    assert db.get_student_usage_many([]) == {} and db.get_student_credit_totals([]) == {}
+    assert db.get_student_credit_totals([]) == {}
     return f"{len(ids)} students' figures match the records"
 
 
@@ -1930,6 +2089,7 @@ for name, fn in [
     ("editing a sent invoice", t_edit_sent_invoice),
     ("choosing the next invoice number", t_next_invoice_number),
     ("deleting a class, order added, double bookings", t_class_edits),
+    ("master delete and freed numbers", t_master_delete),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
