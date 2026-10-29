@@ -4842,11 +4842,16 @@ def _invoice_text(bill: dict) -> str:
     return text
 
 
-def _linked_text(item: dict) -> str:
-    """Return one thing picked on Delete records, and what it's linked to, as a short list."""
+def _linked_text(item: dict, period: str = "") -> str:
+    """Return one thing picked on Delete records, and what it's linked to, as a short list.
+
+    A teacher, subject or student picked for a period says so, since only its
+    records in that time go and the record itself stays.
+    """
     kind = item["Kind"]
+    scope = " · whole record" if item.get("Whole", True) else f" · only {_when(period)}"
     if kind == "Teacher":
-        lines = [f"**Teacher** {_teacher(item['Name'])}"]
+        lines = [f"**Teacher** {_teacher(item['Name'])}{scope}"]
         lines += [f"- {_subject(row['Name'])} · {_plural(row['Classes'], 'class', 'classes')}"
                   + (f" · {_days(row['From'], row['To'])}" if row["From"] else "") for row in item["Subjects"]]
         if not item["Subjects"]:
@@ -4856,7 +4861,7 @@ def _linked_text(item: dict) -> str:
         if item["Past schedules"]:
             lines.append(f"- {item['Past schedules']:,} past student-lessons")
     elif kind == "Subject":
-        lines = [f"**Subject** {_subject(item['Name'])} · {_teacher(item['Teacher'])}",
+        lines = [f"**Subject** {_subject(item['Name'])} · {_teacher(item['Teacher'])}{scope}",
                  f"- {_plural(item['Classes'], 'class', 'classes')}"
                  + (f" · {_days(item['From'], item['To'])}" if item["From"] else "")]
         if item["Students"]:
@@ -4866,7 +4871,7 @@ def _linked_text(item: dict) -> str:
         lines = [f"**Class** {_when(when)} · {_subject(item['Subject'])} · {_teacher(item['Teacher'])}",
                  f"- Students: {_chips('student', item['Students'], most=10)}" if item["Students"] else "- Empty"]
     elif kind == "Student":
-        lines = [f"**Student** {_student(item['Name'])}"]
+        lines = [f"**Student** {_student(item['Name'])}{scope}"]
         if item["Parent"]:
             lines.append(f"- Parent: {_escaped(item['Parent'])}")
         if item["Teachers"]:
@@ -4968,28 +4973,37 @@ def delete_records_tab() -> None:
     """Draw the Delete records screen: remove anything, with everything linked to it.
 
     The app's one place to delete. Records are picked down the two trees they
-    are kept in, for one month or for all time: a teacher, then their
-    subjects, then those subjects' classes; a student, then their invoices.
-    The deepest pick on each branch is what goes, with everything under it:
-    a teacher picked alone goes whole, while picking some of their subjects
-    deletes only those. Sent invoices go too, and their numbers can be used
-    again. Everything that will go is listed first, and the confirmation
-    word must be typed.
+    are kept in: a teacher, then their subjects, then those subjects'
+    classes; a student, then their invoices. The deepest pick on each branch
+    is what goes, with everything under it. A year, a month of any year, or
+    both keep the delete inside that time: a teacher picked for December
+    2026 loses only their December 2026 classes and stays on file. With any
+    year and any month the pick goes whole. Sent invoices go too, and their
+    numbers can be used again. Everything that will go is listed first, and
+    the confirmation word must be typed.
     """
-    st.caption("Pick down either side. The last thing you pick goes, with everything under it, "
-               "sent invoices too. Can't be undone.")
+    st.caption("Pick down either side. The last thing you pick loses its records in the time above; "
+               "with any year and any month, it's deleted outright. Sent invoices too. Can't be undone.")
     # Bumped after a delete, so the boxes start empty again.
     generation = st.session_state.get("delete_gen", 0)
 
     when = st.columns(2)
-    year = when[0].number_input("Year", min_value=2020, max_value=dt.date.today().year + 1,
-                                value=dt.date.today().year, step=1, key=f"delete_year_{generation}")
-    month = when[1].selectbox(
-        "Month", [0] + list(range(1, 13)), index=dt.date.today().month,
-        format_func=lambda value: calendar.month_name[value] if value else "All months",
-        key=f"delete_month_{generation}")
-    choices = db.get_delete_choices(int(year), month) if month else db.get_delete_choices()
-    period = f"{calendar.month_name[month]} {int(year)}" if month else "any month"
+    today = dt.date.today()
+    years = [0] + list(range(today.year + 1, 2019, -1))
+    year = when[0].selectbox("Year", years, index=years.index(today.year),
+                             format_func=lambda value: str(value) if value else "Any year",
+                             key=f"delete_year_{generation}")
+    month = when[1].selectbox("Month", [0] + list(range(1, 13)), index=today.month,
+                              format_func=lambda value: calendar.month_name[value] if value else "Any month",
+                              key=f"delete_month_{generation}")
+    whole = not year and not month
+    choices = db.get_delete_choices(year or None, month or None)
+    if year and month:
+        period = f"{calendar.month_name[month]} {year}"
+    elif month:
+        period = f"{calendar.month_name[month]}, any year"
+    else:
+        period = str(year) if year else "all time"
 
     teacher_names = {row["ID"]: row["Name"] for row in choices["Teachers"]}
     teacher_side, student_side = st.columns(2)
@@ -5001,14 +5015,16 @@ def delete_records_tab() -> None:
                 "Their subjects",
                 {row["ID"]: row["Name"] + ("" if len(teachers) == 1 else f" ({teacher_names[row['Teacher ID']]})")
                  for row in choices["Subjects"] if row["Teacher ID"] in teachers},
-                f"delete_subjects_{generation}", placeholder="None: the whole teacher goes")
+                f"delete_subjects_{generation}",
+                placeholder="None: the whole teacher goes" if whole else f"None: all their classes in {period}")
         if subjects:
             lessons = _pick(
                 "Those subjects' classes",
                 {row["ID"]: f"{row['Date']:%a %d %b} · {row['Start']:%H:%M}"
                  + ("" if len(subjects) == 1 else f" · {row['Subject']}")
                  for row in choices["Classes"] if row["Subject ID"] in subjects},
-                f"delete_classes_{generation}", placeholder="None: the whole subject goes")
+                f"delete_classes_{generation}",
+                placeholder="None: the whole subject goes" if whole else f"None: all its classes in {period}")
     with student_side:
         students = _pick(f"Students ({period})", {row["ID"]: row["Name"] for row in choices["Students"]},
                          f"delete_students_{generation}")
@@ -5019,10 +5035,10 @@ def delete_records_tab() -> None:
                 "Their invoices",
                 {row["ID"]: _invoice_label(row) + ("" if len(students) == 1 else f" · {names[row['Student ID']]}")
                  for row in choices["Invoices"] if row["Student ID"] in students},
-                f"delete_invoices_{generation}", placeholder="None: the whole student goes")
+                f"delete_invoices_{generation}",
+                placeholder="None: the whole student goes" if whole else f"None: all their records in {period}")
     with st.expander("Past schedules (Teaching figures only)"):
-        history = _pick("Teachers' past schedules", {row["Teacher"]: row["Teacher"]
-                                                     for row in db.get_lesson_history_summary()},
+        history = _pick(f"Teachers' past schedules ({period})", {name: name for name in choices["History"]},
                         f"delete_history_{generation}")
 
     # The deepest pick on each branch is what goes.
@@ -5039,6 +5055,7 @@ def delete_records_tab() -> None:
     }
     if not any(picked.values()):
         return
+    picked.update(year=year or None, month=month or None)
 
     plan = db.describe_master_delete(**picked)
     total = sum(row["How many"] for row in plan["Rows"])
@@ -5052,7 +5069,7 @@ def delete_records_tab() -> None:
 
     for index, item in enumerate(plan["Linked"]):
         with st.container(border=True, key=f"card-{_CARD_KINDS[item['Kind']]}-{index}"):
-            st.markdown(_linked_text(item))
+            st.markdown(_linked_text(item, period))
             _linked_detail(item)
     if beyond:
         with st.container(border=True, key="card-flag-beyond"):

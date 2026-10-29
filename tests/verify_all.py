@@ -1686,6 +1686,129 @@ print(json.dumps(result, default=str))
 """
 
 
+_PERIOD_DELETE_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event, select
+
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(day, names):
+    return {"date": day, "class_name": "G11 Test Math", "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sb.backfill({"sessions": [lesson(dt.date(2025, 12, 3), ["Nam Jihoon"]),
+                          lesson(dt.date(2026, 9, 1), ["Nam Jihoon", "Oh Minseok"]),
+                          lesson(dt.date(2026, 9, 8), ["Nam Jihoon", "Oh Minseok"]),
+                          lesson(dt.date(2026, 10, 6), ["Oh Minseok"]),
+                          lesson(dt.date(2026, 12, 2), ["Nam Jihoon"])]}, teacher)
+for year, month in ((2025, 12), (2026, 9), (2026, 10), (2026, 12)):
+    db._record_import(teacher, year, month, 1, 0, 0)
+with db.SessionLocal() as session:
+    for day in (dt.date(2025, 12, 10), dt.date(2026, 9, 15)):
+        session.add(db.LessonHistory(teacher_name="Teacher A", class_name="G11 Test Math", lesson_date=day,
+                                     start_time=dt.time(16), end_time=dt.time(18), student_name="Nam Jihoon",
+                                     status="Attending"))
+    session.commit()
+students = {s["Name"]: s["ID"] for s in db.get_all_students()}
+def open_for(year, month):
+    return {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_for_month(year, month)}
+nam_sep = db.issue_invoice_for_month(open_for(2026, 9)["Nam Jihoon"], 2026, 9)[1]
+oh_sep = db.issue_invoice_for_month(open_for(2026, 9)["Oh Minseok"], 2026, 9)[1]
+oh_oct = db.issue_invoice_for_month(open_for(2026, 10)["Oh Minseok"], 2026, 10)[1]
+
+def left():
+    with db.SessionLocal() as session:
+        days = sorted(str(d) for d in session.scalars(select(db.ClassSession.session_date)))
+        places = sorted(f"{d} {n}" for d, n in session.execute(
+            select(db.ClassSession.session_date, db.Student.full_name)
+            .join(db.SessionAttendance, db.SessionAttendance.session_id == db.ClassSession.id)
+            .join(db.Student, db.Student.id == db.SessionAttendance.student_id)))
+        uploads = sorted(f"{y}-{m}" for y, m in session.execute(select(db.ScheduleImport.year, db.ScheduleImport.month)))
+        history = sorted(str(d) for d in session.scalars(select(db.LessonHistory.lesson_date)))
+        broken = session.connection().exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    numbers = sorted(row["Number"] for row in db.get_invoices() if row["Number"])
+    return {"teachers": [t["Name"] for t in db.get_all_teachers()], "subjects": [c["Class"] for c in db.get_all_classes()],
+            "students": sorted(s["Name"] for s in db.get_all_students()), "days": days, "places": places,
+            "invoices": numbers, "uploads": uploads, "history": history, "broken": broken}
+
+def offered(year=None, month=None):
+    choices = db.get_delete_choices(year, month)
+    return [[t["Name"] for t in choices["Teachers"]], len(choices["Classes"]), [s["Name"] for s in choices["Students"]],
+            choices["History"]]
+
+result = {"start": left(), "numbers": [db.get_invoice(i)["Number"] for i in (nam_sep, oh_sep, oh_oct)],
+          "offered_dec_any_year": offered(month=12), "offered_2026": offered(year=2026),
+          "offered_2025_dec": offered(2025, 12)}
+# 1. Teacher A for September 2026 only: those classes, their invoice lines and upload record.
+preview = db.describe_master_delete(teacher_ids=[teacher], year=2026, month=9)
+result["teacher_card"] = [preview["Linked"][0]["Kind"], preview["Linked"][0]["Whole"],
+                          [row["Classes"] for row in preview["Linked"][0]["Subjects"]]]
+result["sep"] = [db.master_delete(teacher_ids=[teacher], year=2026, month=9)["Numbers"], left()]
+# 2. Oh Minseok for October 2026 only: his place and his October invoice; he and the class stay.
+result["oh_oct"] = [db.master_delete(student_ids=[students["Oh Minseok"]], year=2026, month=10)["Numbers"], left()]
+# 3. Teacher A for every December, any year.
+result["decembers"] = left() if not db.master_delete(teacher_ids=[teacher], month=12) else left()
+# 4. Past schedules of 2025 only.
+db.master_delete(history_names=["Teacher A"], year=2025)
+result["history_2025"] = left()["history"]
+# 5. Teacher A with no time chosen: the whole teacher.
+db.master_delete(teacher_ids=[teacher])
+result["whole"] = left()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_delete_by_period():
+    """Delete records keeps a delete inside the year and month chosen.
+
+    A teacher picked for September 2026 loses only those classes, their
+    invoice lines and that month's upload record, and stays on file. A
+    student picked for October 2026 loses their places and invoice in it,
+    and stays. December with any year takes every December. Past schedules
+    go by year when picked. With no time chosen the teacher goes whole.
+    Links stay intact throughout.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "period.db").replace("\\", "/")
+        result = run(["-c", _PERIOD_DELETE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["numbers"] == [7323, 7324, 7325], got["numbers"]
+    assert got["offered_dec_any_year"] == [["Teacher A"], 2, ["Nam Jihoon"], ["Teacher A"]], got["offered_dec_any_year"]
+    assert got["offered_2026"] == [["Teacher A"], 4, ["Nam Jihoon", "Oh Minseok"], ["Teacher A"]], got["offered_2026"]
+    assert got["offered_2025_dec"] == [["Teacher A"], 1, ["Nam Jihoon"], ["Teacher A"]], got["offered_2025_dec"]
+    assert got["teacher_card"] == ["Teacher", False, [2]], got["teacher_card"]
+    numbers, sep = got["sep"]
+    assert numbers == [7323, 7324], numbers
+    assert sep["teachers"] == ["Teacher A"] and sep["subjects"] == ["G11 Test Math"], sep
+    assert sep["days"] == ["2025-12-03", "2026-10-06", "2026-12-02"], sep["days"]
+    assert sep["invoices"] == [7325] and sep["uploads"] == ["2025-12", "2026-10", "2026-12"], sep
+    numbers, oct_ = got["oh_oct"]
+    assert numbers == [7325] and oct_["invoices"] == [], oct_
+    assert "Oh Minseok" in oct_["students"] and "2026-10-06" in oct_["days"], oct_
+    assert not any(place.endswith("Oh Minseok") for place in oct_["places"]), oct_["places"]
+    assert got["decembers"]["days"] == ["2026-10-06"], got["decembers"]["days"]
+    assert got["decembers"]["uploads"] == ["2026-10"] and got["decembers"]["history"] == ["2025-12-10", "2026-09-15"], got
+    assert got["history_2025"] == ["2026-09-15"], got["history_2025"]
+    whole = got["whole"]
+    assert whole["teachers"] == [] and whole["subjects"] == [] and whole["days"] == [], whole
+    assert whole["history"] == [] and whole["uploads"] == [], whole
+    assert whole["students"] == ["Nam Jihoon", "Oh Minseok"], whole["students"]
+    assert all(step["broken"] == [] for step in (sep, oct_, got["decembers"], whole)), "broken links"
+    return ("a teacher for one month loses only those classes and stays; a student for one month too; "
+            "December of any year; past schedules by year; no time chosen takes the teacher whole")
+
+
 def t_class_edits():
     """Deleting a class works with foreign keys on; students keep their order; double bookings show.
 
@@ -1789,7 +1912,7 @@ result = {"numbers": [number(nam), number(oh), number(oh_sept), number(oh_oct), 
 # What the screen offers: a month narrows each list to what it touched.
 def offered(choices):
     return {kind: sorted(row.get("Name") or row.get("Number") or row["ID"] for row in rows)
-            for kind, rows in choices.items() if kind != "Classes"} | {"Classes": len(choices["Classes"])}
+            for kind, rows in choices.items() if kind not in ("Classes", "History")} | {"Classes": len(choices["Classes"])}
 result["offered_oct"] = offered(db.get_delete_choices(2026, 10))
 result["offered_sep"] = offered(db.get_delete_choices(2026, 9))
 result["offered_all"] = offered(db.get_delete_choices())
@@ -2104,6 +2227,7 @@ for name, fn in [
     ("choosing the next invoice number", t_next_invoice_number),
     ("deleting a class, order added, double bookings", t_class_edits),
     ("Delete records and freed numbers", t_master_delete),
+    ("Delete records inside a year or month", t_delete_by_period),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
