@@ -522,6 +522,7 @@ def t_read_functions_all_run():
             [s["ID"] for s in db.get_all_students()[:25]]),
         "get_delete_choices": lambda: db.get_delete_choices(year, month),
         "get_delete_choices (all months)": db.get_delete_choices,
+        "get_invoice_lookup": db.get_invoice_lookup,
         "describe_master_delete": lambda: db.describe_master_delete(
             [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }

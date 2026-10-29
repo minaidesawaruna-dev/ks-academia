@@ -4974,7 +4974,8 @@ def delete_records_tab() -> None:
 
     The app's one place to delete. Records are picked down the two trees they
     are kept in: a teacher, then their subjects, then those subjects'
-    classes; a student, then their invoices. The deepest pick on each branch
+    classes; a student, then their invoices. An invoice can also be picked
+    straight by its number, from any time. The deepest pick on each branch
     is what goes, with everything under it. A year, a month of any year, or
     both keep the delete inside that time: a teacher picked for December
     2026 loses only their December 2026 classes and stays on file. With any
@@ -5004,6 +5005,12 @@ def delete_records_tab() -> None:
         period = f"{calendar.month_name[month]}, any year"
     else:
         period = str(year) if year else "all time"
+
+    # A shortcut past both trees: any invoice of any time, found by typing its number.
+    lookup = db.get_invoice_lookup()
+    numbers = _pick("Invoice numbers (any time)",
+                    {row["ID"]: f"{_invoice_label(row)} · {row['Student']}" for row in lookup},
+                    f"delete_numbers_{generation}", placeholder="Know the number? Type it, e.g. 9001")
 
     teacher_names = {row["ID"]: row["Name"] for row in choices["Teachers"]}
     teacher_side, student_side = st.columns(2)
@@ -5044,13 +5051,13 @@ def delete_records_tab() -> None:
     # The deepest pick on each branch is what goes.
     teacher_of = {row["ID"]: row["Teacher ID"] for row in choices["Subjects"]}
     subject_of = {row["ID"]: row["Subject ID"] for row in choices["Classes"]}
-    student_of = {row["ID"]: row["Student ID"] for row in choices["Invoices"]}
+    student_of = {row["ID"]: row["Student ID"] for row in lookup}
     picked = {
         "teacher_ids": [key for key in teachers if key not in {teacher_of[s] for s in subjects}],
         "class_ids": [key for key in subjects if key not in {subject_of[c] for c in lessons}],
         "lesson_ids": lessons,
-        "student_ids": [key for key in students if key not in {student_of[i] for i in invoices}],
-        "invoice_ids": invoices,
+        "student_ids": [key for key in students if key not in {student_of[i] for i in invoices + numbers}],
+        "invoice_ids": list(dict.fromkeys(invoices + numbers)),
         "history_names": history,
     }
     if not any(picked.values()):

@@ -5985,6 +5985,20 @@ def master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
         return _master_summary(plan)
 
 
+def get_invoice_lookup() -> list[dict]:
+    """Return every invoice of any time, highest number first and drafts last, to find by number."""
+    with SessionLocal() as session:
+        rows = [
+            {"ID": invoice_id, "Number": number, "Status": status, "Student ID": student_id, "Student": name}
+            for invoice_id, number, status, student_id, name in session.execute(
+                select(Invoice.id, Invoice.invoice_number, Invoice.status, Invoice.student_id, Student.full_name)
+                .join(Student, Student.id == Invoice.student_id)
+            )
+        ]
+    # Sorted here, because Postgres and SQLite put empty numbers at opposite ends.
+    return sorted(rows, key=lambda row: (row["Number"] is None, -(row["Number"] or 0), -row["ID"]))
+
+
 def get_delete_choices(year=None, month=None) -> dict:
     """Return what the Delete records screen offers, for a period or for all time.
 
