@@ -5425,7 +5425,7 @@ def get_analysis_data_version():
 
 
 # ---------------------------------------------------------------------------
-# Master delete
+# Delete records (the screen that deletes anything, with everything linked)
 # ---------------------------------------------------------------------------
 
 # How many ids go into one IN (...) list. SQLite refuses very long ones.
@@ -5456,7 +5456,7 @@ def _delete_ids(session, model, ids) -> None:
 
 
 def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, lesson_ids, history_names) -> dict:
-    """Work out every row a master delete removes or changes.
+    """Work out every row a delete on Delete records removes or changes.
 
     Starts from what was picked and follows every link out from it. A
     teacher takes their subjects, classes, uploads and past schedules. A
@@ -5603,7 +5603,7 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
 
 
 def _master_summary(plan) -> dict:
-    """Return what a master delete removes and changes, in the screen's words."""
+    """Return what a delete removes and changes, in the screen's words."""
     other = plan["other"]
     counts = [
         ("Teachers", plan["teachers"]),
@@ -5645,7 +5645,7 @@ def _lookup(session, id_column, columns, ids) -> dict:
 
 
 def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_names) -> dict:
-    """Explain a master delete for the screen, before it happens.
+    """Explain a delete for the Delete records screen, before it happens.
 
     "Linked" starts at the top: each teacher picked, with their subjects and
     the students in their classes; then subjects, classes, students,
@@ -5910,33 +5910,63 @@ def master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
         return _master_summary(plan)
 
 
-def get_invoice_choices() -> list[dict]:
-    """Return every invoice, highest number first and drafts last, with just enough to pick it."""
-    with SessionLocal() as session:
-        rows = [
-            {"ID": invoice_id, "Number": number, "Status": status, "Student": name, "Issued": issued}
-            for invoice_id, number, status, name, issued in session.execute(
-                select(Invoice.id, Invoice.invoice_number, Invoice.status, Student.full_name, Invoice.issued_on)
-                .join(Student, Student.id == Invoice.student_id)
-            )
-        ]
-    # Sorted here, because Postgres and SQLite put empty numbers at opposite ends.
-    return sorted(rows, key=lambda row: (row["Number"] is None, -(row["Number"] or 0), -row["ID"]))
+def get_delete_choices(year=None, month=None) -> dict:
+    """Return what the Delete records screen offers, for one month or for all time.
 
-
-def get_lesson_choices(year, month) -> list[dict]:
-    """Return every class in a month, by date and time, with just enough to pick it."""
-    first = date(year, month, 1)
-    last = date(year, month, monthrange(year, month)[1])
+    Two trees, the way the records are kept: teachers, each with their
+    subjects, each with its classes; and students, each with their invoices.
+    A month narrows every list to what it touched: teachers and students
+    with a class in it, subjects taught in it, its classes, and invoices with
+    a line in it. With no month, everything is offered.
+    """
     with SessionLocal() as session:
-        return [
-            {"ID": lesson_id, "Date": as_date(day), "Start": as_time(start), "Subject": subject, "Teacher": teacher}
-            for lesson_id, day, start, subject, teacher in session.execute(
-                select(ClassSession.id, ClassSession.session_date, ClassSession.start_time,
-                       AcademyClass.name, Teacher.name)
-                .join(AcademyClass, AcademyClass.id == ClassSession.class_id)
-                .join(Teacher, Teacher.id == ClassSession.teacher_id)
-                .where(ClassSession.session_date >= first, ClassSession.session_date <= last)
-                .order_by(ClassSession.session_date, ClassSession.start_time, Teacher.name)
-            )
-        ]
+        lesson_query = select(ClassSession.id, ClassSession.class_id, ClassSession.teacher_id,
+                              ClassSession.session_date, ClassSession.start_time)
+        if month:
+            first, last = date(year, month, 1), date(year, month, monthrange(year, month)[1])
+            lesson_query = lesson_query.where(ClassSession.session_date >= first, ClassSession.session_date <= last)
+        lessons = session.execute(lesson_query).all()
+        teachers = dict(session.execute(select(Teacher.id, Teacher.name)).all())
+        subjects = {class_id: (name, teacher_id) for class_id, name, teacher_id in session.execute(
+            select(AcademyClass.id, AcademyClass.name, AcademyClass.teacher_id))}
+        students = dict(session.execute(select(Student.id, Student.full_name)).all())
+        invoices = session.execute(
+            select(Invoice.id, Invoice.invoice_number, Invoice.status, Invoice.student_id)).all()
+
+        if month:
+            # Only what the month touched. A draft's lines have no date until issued,
+            # so its month comes from its classes.
+            seated, billed = set(), set()
+            for chunk in _chunks([row[0] for row in lessons]):
+                seated.update(session.scalars(
+                    select(SessionAttendance.student_id).where(SessionAttendance.session_id.in_(chunk))))
+                billed.update(session.scalars(
+                    select(InvoiceItem.invoice_id).where(InvoiceItem.session_id.in_(chunk))))
+            billed.update(session.scalars(select(InvoiceItem.invoice_id).where(
+                InvoiceItem.session_date >= first, InvoiceItem.session_date <= last)))
+            taught = {row[1] for row in lessons}
+            teaching = {row[2] for row in lessons} | {subjects[class_id][1] for class_id in taught}
+            teachers = {key: name for key, name in teachers.items() if key in teaching}
+            subjects = {key: row for key, row in subjects.items() if key in taught}
+            students = {key: name for key, name in students.items() if key in seated}
+            invoices = [row for row in invoices if row[0] in billed]
+
+    def by_name(names):
+        """Sort ids by the name they map to."""
+        return lambda key: str(names[key]).lower()
+
+    return {
+        "Teachers": [{"ID": key, "Name": teachers[key]} for key in sorted(teachers, key=by_name(teachers))],
+        "Subjects": [{"ID": key, "Name": name, "Teacher ID": teacher_id}
+                     for key, (name, teacher_id) in sorted(subjects.items(), key=lambda pair: pair[1][0].lower())],
+        "Classes": [{"ID": lesson_id, "Subject ID": class_id, "Subject": subjects[class_id][0],
+                     "Date": as_date(day), "Start": as_time(start)}
+                    for lesson_id, class_id, _, day, start in sorted(lessons, key=lambda row: (row[3], row[4]))
+                    if class_id in subjects],
+        "Students": [{"ID": key, "Name": students[key]} for key in sorted(students, key=by_name(students))],
+        # Highest number first, drafts last. Sorted here, because Postgres and SQLite
+        # put empty numbers at opposite ends.
+        "Invoices": [{"ID": invoice_id, "Number": number, "Status": status, "Student ID": student_id}
+                     for invoice_id, number, status, student_id in sorted(
+                         invoices, key=lambda row: (row[1] is None, -(row[1] or 0), -row[0]))],
+    }

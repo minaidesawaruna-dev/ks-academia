@@ -520,8 +520,8 @@ def t_read_functions_all_run():
         "get_credits": lambda: db.get_credits(),
         "get_student_credit_totals": lambda: db.get_student_credit_totals(
             [s["ID"] for s in db.get_all_students()[:25]]),
-        "get_invoice_choices": db.get_invoice_choices,
-        "get_lesson_choices": lambda: db.get_lesson_choices(year, month),
+        "get_delete_choices": lambda: db.get_delete_choices(year, month),
+        "get_delete_choices (all months)": db.get_delete_choices,
         "describe_master_delete": lambda: db.describe_master_delete(
             [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }
@@ -1639,7 +1639,7 @@ open_ = {row["Student"]: row["Invoice ID"] for row in db.get_open_invoice_items_
 db.issue_invoice_for_month(open_["Nam Jihoon"], 2026, 9)
 
 result = {}
-# The 8th deleted on Master delete: it comes off Nam's sent invoice and Oh's draft alike.
+# The 8th deleted on Delete records: it comes off Nam's sent invoice and Oh's draft alike.
 nam = next(i["ID"] for i in db.get_invoices() if i["Student"] == "Nam Jihoon" and i["Status"] == "Issued")
 done = db.master_delete(lesson_ids=[math_8])
 result["deleted"] = [{row["What"]: row["How many"] for row in done["Rows"]}, done["Shortened"]]
@@ -1691,7 +1691,7 @@ def t_class_edits():
 
     The old "Delete for good" deleted the class before its invoice lines,
     which Postgres refuses, so on the live app nothing was ever deleted.
-    Classes are deleted on Master delete now, with links enforced: the class
+    Classes are deleted on Delete records now, with links enforced: the class
     comes off every invoice it was on, sent or draft, and nothing is credited.
     A save keeps students in the order they were added, however the rows
     arrive. A student in two classes at once is found, whoever teaches them,
@@ -1786,6 +1786,14 @@ seo = db.issue_invoice_for_month(open_for(9)["Seo Yuna"], 2026, 9)[1]
 result = {"numbers": [number(nam), number(oh), number(oh_sept), number(oh_oct), number(seo)],
           "credits_before": sorted([c["Student"], c["Status"]] for c in db.get_credits())}
 
+# What the screen offers: a month narrows each list to what it touched.
+def offered(choices):
+    return {kind: sorted(row.get("Name") or row.get("Number") or row["ID"] for row in rows)
+            for kind, rows in choices.items() if kind != "Classes"} | {"Classes": len(choices["Classes"])}
+result["offered_oct"] = offered(db.get_delete_choices(2026, 10))
+result["offered_sep"] = offered(db.get_delete_choices(2026, 9))
+result["offered_all"] = offered(db.get_delete_choices())
+
 # 1. The demo teacher and the demo student, as after a live demo.
 before = counts()
 preview = db.describe_master_delete([ids["Demo Teacher"]], [students["Seo Yuna"]])
@@ -1823,7 +1831,7 @@ print(json.dumps(result, default=str))
 
 
 def t_master_delete():
-    """Master delete removes what was picked and everything linked, and frees the numbers.
+    """Delete records removes what was picked and everything linked, and frees the numbers.
 
     Run with links enforced, so a row left pointing at a deleted one fails it.
     A demo teacher and student go with their classes, sent invoices, parent
@@ -1843,6 +1851,12 @@ def t_master_delete():
         assert result.returncode == 0, result.stderr[-1500:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
     assert got["numbers"] == [7323, 7324, 7325, 7326, 9001], got["numbers"]
+    # The month narrows each list to what it touched; with no month, everything.
+    assert got["offered_oct"] == {"Teachers": ["Teacher A"], "Subjects": ["G11 Test Math"], "Students": ["Oh Minseok"],
+                                  "Invoices": [7326], "Classes": 1}, got["offered_oct"]
+    assert got["offered_sep"]["Teachers"] == ["Demo Teacher", "Teacher A"] and got["offered_sep"]["Classes"] == 4, got
+    assert got["offered_sep"]["Invoices"] == [7323, 7325, 9001], got["offered_sep"]
+    assert got["offered_all"]["Invoices"] == [7323, 7324, 7325, 7326, 9001], got["offered_all"]
     assert got["describe_changes_nothing"] and got["demo_matches_preview"], got
     # The preview names what each pick is linked to, and flags the real student it reaches.
     teacher, student = got["report"]["Linked"]
@@ -2089,7 +2103,7 @@ for name, fn in [
     ("editing a sent invoice", t_edit_sent_invoice),
     ("choosing the next invoice number", t_next_invoice_number),
     ("deleting a class, order added, double bookings", t_class_edits),
-    ("master delete and freed numbers", t_master_delete),
+    ("Delete records and freed numbers", t_master_delete),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

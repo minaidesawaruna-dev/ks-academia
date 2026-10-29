@@ -112,12 +112,12 @@ CONDITIONS = [IN_CLASS, "Online", "Recording", "Cancelled"]
 # "A month" of a weekly class is four lessons on the same weekday.
 WEEKS_PER_MONTH = 4
 
-# DELETE_PHRASE is the word typed to confirm a master delete. The row limits say
+# DELETE_PHRASE is the word typed to confirm a delete on Delete records. The row limits say
 # how many open invoices, students and paid invoices to draw at once: each row
 # builds its widgets (and sometimes an invoice file) up front, so these keep the
 # pages quick. The search box reaches the rest.
 DELETE_PHRASE = "delete"
-# How many of each kind Master delete's warning lists by name before it gives a count.
+# How many of each kind Delete records' warning lists by name before it gives a count.
 BEYOND_ROWS = 5
 OPEN_INVOICE_ROWS = 25
 STUDENT_ROWS = 25
@@ -4725,7 +4725,7 @@ def reminders_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Master delete
+# Delete records
 # ---------------------------------------------------------------------------
 
 
@@ -4747,7 +4747,7 @@ def _number_runs(numbers: list[int], most: int = 8) -> str:
     return text + (f" +{rest} more" if rest else "")
 
 
-# Master delete draws each pick in a box with a coloured left edge, in the colour
+# Delete records draws each pick in a box with a coloured left edge, in the colour
 # its badges use: violet teachers, blue students, orange subjects, grey classes,
 # green invoices, red for what reaches students who weren't picked.
 _CARD_KINDS = {"Teacher": "teacher", "Student": "student", "Subject": "subject", "Class": "when",
@@ -4759,7 +4759,7 @@ _CARD_STYLE = "<style>" + " ".join(
 
 
 def _invoice_row(bill: dict) -> dict:
-    """Return one invoice as a table row for Master delete's detail."""
+    """Return one invoice as a table row for Delete records' detail."""
     return {
         "Invoice": f"#{bill['Number']}" if bill["Number"] is not None else "Draft",
         "Student": bill["Student"],
@@ -4779,7 +4779,7 @@ def _detail_table(label: str, rows: list, kinds: dict | None = None) -> None:
 
 
 def _linked_detail(item: dict) -> None:
-    """Show the full detail behind one pick on Master delete, each part in its own expander."""
+    """Show the full detail behind one pick on Delete records, each part in its own expander."""
     names = {"Students": "student", "Paid": "money"}
     if item["Kind"] in ("Teacher", "Subject"):
         _detail_table(f"Show {_plural(len(item['Detail']), 'class', 'classes')}", item["Detail"], names)
@@ -4794,7 +4794,7 @@ def _linked_detail(item: dict) -> None:
 
 
 def _beyond_detail(beyond: dict) -> None:
-    """Show everything a master delete reaches beyond the picks, in full, each kind in an expander."""
+    """Show everything a delete reaches beyond the picks, in full, each kind in an expander."""
     _detail_table(f"Show {_plural(len(beyond['Places']), 'student')}", [
         {"Student": row["Student"], "Classes lost": row["Classes"], "None left": "Yes" if row["None left"] else ""}
         for row in beyond["Places"]])
@@ -4843,7 +4843,7 @@ def _invoice_text(bill: dict) -> str:
 
 
 def _linked_text(item: dict) -> str:
-    """Return one thing picked on Master delete, and what it's linked to, as a short list."""
+    """Return one thing picked on Delete records, and what it's linked to, as a short list."""
     kind = item["Kind"]
     if kind == "Teacher":
         lines = [f"**Teacher** {_teacher(item['Name'])}"]
@@ -4883,7 +4883,7 @@ def _linked_text(item: dict) -> str:
 
 
 def _beyond_text(beyond: dict) -> str:
-    """Return what a master delete does to students who weren't picked, or "" if nothing.
+    """Return what a delete does to students who weren't picked, or "" if nothing.
 
     One line per student, with everything that happens to them. Past
     BEYOND_ROWS students it's counts instead, since a real teacher picked by
@@ -4920,7 +4920,7 @@ def _beyond_text(beyond: dict) -> str:
 
 
 def _effects_text(plan: dict) -> str:
-    """Return what changes once a master delete is done, as a short list."""
+    """Return what changes once a delete is done, as a short list."""
     effects = plan["Effects"]
     lines = []
     if effects["Sent"]:
@@ -4946,54 +4946,97 @@ def _effects_text(plan: dict) -> str:
     return "\n".join(lines) or "- Nothing else"
 
 
-def master_delete_tab() -> None:
-    """Draw the Master delete screen: remove anything, with everything linked to it.
+def _pick(label: str, options: dict, key: str, placeholder: str = "Choose options") -> list:
+    """Draw one picker on Delete records and return what's picked.
 
-    The app's one place to delete: teachers, students, subjects, single
-    classes, invoices (sent ones too, freeing their numbers to be used
-    again) and past schedules. It lists everything that will go before
-    anything does, and needs the confirmation word typed.
+    Picks no longer on offer are dropped first: a teacher unpicked takes their
+    subjects with them, and a different month offers different classes.
     """
-    st.caption("Deletes your picks and everything linked, sent invoices too. Can't be undone.")
+    if key in st.session_state:
+        st.session_state[key] = [value for value in st.session_state[key] if value in options]
+    return st.multiselect(label, list(options), format_func=options.get, key=key, placeholder=placeholder)
+
+
+def _invoice_label(item: dict) -> str:
+    """Return how an invoice is listed on Delete records: "#9001 · sent", "#8000 · void", "Draft"."""
+    if item["Number"] is None:
+        return "Draft (not sent)"
+    return f"#{item['Number']} · {'sent' if item['Status'] == 'Issued' else item['Status'].lower()}"
+
+
+def delete_records_tab() -> None:
+    """Draw the Delete records screen: remove anything, with everything linked to it.
+
+    The app's one place to delete. Records are picked down the two trees they
+    are kept in, for one month or for all time: a teacher, then their
+    subjects, then those subjects' classes; a student, then their invoices.
+    The deepest pick on each branch is what goes, with everything under it:
+    a teacher picked alone goes whole, while picking some of their subjects
+    deletes only those. Sent invoices go too, and their numbers can be used
+    again. Everything that will go is listed first, and the confirmation
+    word must be typed.
+    """
+    st.caption("Pick down either side. The last thing you pick goes, with everything under it, "
+               "sent invoices too. Can't be undone.")
     # Bumped after a delete, so the boxes start empty again.
-    generation = st.session_state.get("master_gen", 0)
+    generation = st.session_state.get("delete_gen", 0)
 
-    teachers = {item["ID"]: item["Name"] for item in db.get_all_teachers()}
-    students = {item["ID"]: item["Name"] for item in db.get_all_students()}
-    subjects = {item["ID"]: f"{item['Class']} ({item['Teacher']})" for item in db.get_all_classes()}
-    invoices = {}
-    for item in db.get_invoice_choices():
-        if item["Number"] is None:
-            invoices[item["ID"]] = f"Draft · {item['Student']}"
-        else:
-            invoices[item["ID"]] = f"#{item['Number']} · {item['Student']}" + (
-                " · void" if item["Status"] == "Void" else "")
+    when = st.columns(2)
+    year = when[0].number_input("Year", min_value=2020, max_value=dt.date.today().year + 1,
+                                value=dt.date.today().year, step=1, key=f"delete_year_{generation}")
+    month = when[1].selectbox(
+        "Month", [0] + list(range(1, 13)), index=dt.date.today().month,
+        format_func=lambda value: calendar.month_name[value] if value else "All months",
+        key=f"delete_month_{generation}")
+    choices = db.get_delete_choices(int(year), month) if month else db.get_delete_choices()
+    period = f"{calendar.month_name[month]} {int(year)}" if month else "any month"
 
-    history = [row["Teacher"] for row in db.get_lesson_history_summary()]
+    teacher_names = {row["ID"]: row["Name"] for row in choices["Teachers"]}
+    teacher_side, student_side = st.columns(2)
+    with teacher_side:
+        teachers = _pick(f"Teachers ({period})", teacher_names, f"delete_teachers_{generation}")
+        subjects, lessons = [], []
+        if teachers:
+            subjects = _pick(
+                "Their subjects",
+                {row["ID"]: row["Name"] + ("" if len(teachers) == 1 else f" ({teacher_names[row['Teacher ID']]})")
+                 for row in choices["Subjects"] if row["Teacher ID"] in teachers},
+                f"delete_subjects_{generation}", placeholder="None: the whole teacher goes")
+        if subjects:
+            lessons = _pick(
+                "Those subjects' classes",
+                {row["ID"]: f"{row['Date']:%a %d %b} · {row['Start']:%H:%M}"
+                 + ("" if len(subjects) == 1 else f" · {row['Subject']}")
+                 for row in choices["Classes"] if row["Subject ID"] in subjects},
+                f"delete_classes_{generation}", placeholder="None: the whole subject goes")
+    with student_side:
+        students = _pick(f"Students ({period})", {row["ID"]: row["Name"] for row in choices["Students"]},
+                         f"delete_students_{generation}")
+        invoices = []
+        if students:
+            names = {row["ID"]: row["Name"] for row in choices["Students"]}
+            invoices = _pick(
+                "Their invoices",
+                {row["ID"]: _invoice_label(row) + ("" if len(students) == 1 else f" · {names[row['Student ID']]}")
+                 for row in choices["Invoices"] if row["Student ID"] in students},
+                f"delete_invoices_{generation}", placeholder="None: the whole student goes")
+    with st.expander("Past schedules (Teaching figures only)"):
+        history = _pick("Teachers' past schedules", {row["Teacher"]: row["Teacher"]
+                                                     for row in db.get_lesson_history_summary()},
+                        f"delete_history_{generation}")
 
-    left, right = st.columns(2)
+    # The deepest pick on each branch is what goes.
+    teacher_of = {row["ID"]: row["Teacher ID"] for row in choices["Subjects"]}
+    subject_of = {row["ID"]: row["Subject ID"] for row in choices["Classes"]}
+    student_of = {row["ID"]: row["Student ID"] for row in choices["Invoices"]}
     picked = {
-        "teacher_ids": left.multiselect("Teachers", list(teachers), format_func=teachers.get,
-                                        key=f"master_teachers_{generation}"),
-        "student_ids": right.multiselect("Students", list(students), format_func=students.get,
-                                         key=f"master_students_{generation}"),
-        "class_ids": left.multiselect("Subjects", list(subjects), format_func=subjects.get,
-                                      key=f"master_subjects_{generation}"),
-        "invoice_ids": right.multiselect("Invoices", list(invoices), format_func=invoices.get,
-                                         key=f"master_invoices_{generation}"),
-        "history_names": left.multiselect("Past schedules", history,
-                                          key=f"master_history_{generation}"),
+        "teacher_ids": [key for key in teachers if key not in {teacher_of[s] for s in subjects}],
+        "class_ids": [key for key in subjects if key not in {subject_of[c] for c in lessons}],
+        "lesson_ids": lessons,
+        "student_ids": [key for key in students if key not in {student_of[i] for i in invoices}],
+        "invoice_ids": invoices,
+        "history_names": history,
     }
-    # Single classes, one month at a time: a list of every class ever would be thousands long.
-    with right:
-        year, month = _month_picker(f"master_month_{generation}")
-    lessons = {
-        item["ID"]: f"{item['Date']:%a %d %b} · {item['Start']:%H:%M} · {item['Subject']} · {item['Teacher']}"
-        for item in db.get_lesson_choices(year, month)
-    }
-    picked["lesson_ids"] = right.multiselect(
-        f"Classes in {calendar.month_name[month]}", list(lessons), format_func=lessons.get,
-        key=f"master_lessons_{generation}_{year}_{month}")
     if not any(picked.values()):
         return
 
@@ -5021,12 +5064,12 @@ def master_delete_tab() -> None:
                       [_invoice_row(bill) for bill in plan["Effects"]["Sent list"]], {"Paid": "money"})
         _detail_table(f"Show all {_plural(total, 'record')}", plan["Rows"])
 
-    typed = st.text_input(f"Type **{DELETE_PHRASE}** to confirm", key=f"master_confirm_{generation}",
+    typed = st.text_input(f"Type **{DELETE_PHRASE}** to confirm", key=f"delete_confirm_{generation}",
                           placeholder=DELETE_PHRASE)
-    if st.button("Delete all", key=f"master_go_{generation}", type="primary",
+    if st.button("Delete all", key=f"delete_go_{generation}", type="primary",
                  disabled=typed.strip().lower() != DELETE_PHRASE.lower()):
         done = db.master_delete(**picked)
-        st.session_state["master_gen"] = generation + 1
+        st.session_state["delete_gen"] = generation + 1
         removed = sum(row["How many"] for row in done["Rows"])
         _flash(f"Deleted {_plural(removed, 'record')}. Next invoice no. #{done['Next after']}.", "warning")
         _rerun()
@@ -5059,7 +5102,7 @@ SECTIONS = {
     "Credits": credits_tab,
     "Data": data_tab,
     "Reminders": reminders_tab,
-    "Master delete": master_delete_tab,
+    "Delete records": delete_records_tab,
 }
 
 # A jump asked for by another screen (the "Bill <month>" button after an import)
