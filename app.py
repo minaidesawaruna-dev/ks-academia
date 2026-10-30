@@ -1,18 +1,20 @@
 """KS Academia: the admin app for schedules, invoices and payments.
 
-Nine screens:
+Ten screens:
 
 * Teachers: upload a teacher's Excel schedule (the main way lessons get
-  into the app), price a month's subjects, and list one subject's lessons.
+  into the app), price a month's subjects, and list or rename one subject.
 * Students: who had a lesson in a month, and what it comes to.
 * Schedule: the month grid, for one-off fixes by hand.
-* Create schedule: plan a teacher's month and download it as their sheet.
+* Create/Edit schedule: plan a teacher's month, or edit one the app has,
+  save it to the app and download it as their sheet.
 * Invoices: bill students for a month's lessons.
 * Payments: record what parents have paid, in full or in part.
 * Credits: lessons invoiced and then missed, which come off the next invoice.
 * Data: what was taught and invoiced, per teacher and month, plus past
   schedules kept for those figures.
 * Reminders: invoices past their due date.
+* Delete records: remove test records, with everything linked to them.
 
 A subject is what a teacher teaches, with its price and colour. A class
 (or lesson) is one dated sitting of a subject, with its own students,
@@ -4376,11 +4378,26 @@ def data_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Create schedule, then Reminders
+# Create/Edit schedule, then Reminders
 # ---------------------------------------------------------------------------
 
 
-_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": [], "Students": [], "Every week": False}
+# The marks a teacher writes beside a student, each a column of the table.
+_PLAN_MARKS = (schedule_parser.ONLINE, schedule_parser.RECORDING, schedule_parser.CANCELLED)
+_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": [], "Students": [],
+               **{mark: [] for mark in _PLAN_MARKS}, "Every week": False}
+
+
+def _rows_from_lessons(lessons: list) -> list:
+    """Turn lessons, from the app or a sheet, into the table's rows: one per class, marks included."""
+    return [
+        {"Date": lesson["date"], "Start": lesson["start"], "End": lesson["end"], "Subject": [lesson["subject"]],
+         "Students": list(lesson["students"]),
+         **{mark: [name for name in lesson["students"] if lesson["statuses"].get(name) == mark]
+            for mark in _PLAN_MARKS},
+         "Every week": False}
+        for lesson in sorted(lessons, key=lambda lesson: (lesson["date"], lesson["start"]))
+    ]
 
 
 def _subjects_in(value) -> list:
@@ -4417,6 +4434,8 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
 
     Returns (lessons, rows not filled in yet, rows outside the month, rows
     given more than one subject); the last are used with their first subject.
+    Each lesson carries its students' marks, and in "wrong" any mark that
+    names someone not in the class or a second mark for one student.
     """
     last = dt.date(year, month, calendar.monthrange(year, month)[1])
     lessons, unfinished, elsewhere, doubled = [], 0, 0, 0
@@ -4431,11 +4450,24 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
         if (when.year, when.month) != (year, month):
             elsewhere += 1
             continue
-        students = [" ".join(name.split()) for name in row.get("Students") or [] if name and name.strip()]
+        students = list(dict.fromkeys(" ".join(name.split()) for name in row.get("Students") or []
+                                      if name and name.strip()))
+        statuses, wrong = {}, []
+        for mark in _PLAN_MARKS:
+            for name in (" ".join(str(name).split()) for name in row.get(mark) or []):
+                if not name:
+                    continue
+                if name not in students:
+                    wrong.append(f"{name} is marked {mark} but isn't in the class")
+                elif name in statuses:
+                    wrong.append(f"{name} has two marks")
+                else:
+                    statuses[name] = mark
         day = when
         while day <= last:
             lessons.append({"date": day, "start": start, "end": end, "subject": subject,
-                             "students": list(dict.fromkeys(students))})
+                            "students": list(students), "statuses": dict(statuses),
+                            "wrong": wrong if day == when else []})
             if not row.get("Every week"):
                 break
             day += dt.timedelta(weeks=1)
@@ -4444,11 +4476,13 @@ def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int,
 
 
 def _plan_problems(lessons: list) -> list[str]:
-    """Return what would make the sheet wrong: a class ending before it starts, or two at once."""
+    """Return what would make the sheet wrong: a class ending before it starts, two at once, or a bad mark."""
     problems = []
     for lesson in lessons:
         if lesson["end"] <= lesson["start"]:
             problems.append(f"{lesson['date']:%a %d %b} {lesson['subject']}: ends before it starts.")
+        for line in lesson.get("wrong") or []:
+            problems.append(f"{lesson['date']:%a %d %b} {lesson['subject']}: {line}.")
     by_day: dict = {}
     for lesson in lessons:
         by_day.setdefault(lesson["date"], []).append(lesson)
@@ -4480,7 +4514,7 @@ def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int)
     """Return students booked into another teacher's class at the same time, from what's in the app.
 
     One query for the month. The teacher's own classes in the app are left
-    out: their sheet replaces them once it's uploaded.
+    out: this table replaces them once it's saved or uploaded.
     """
     ids = {find(name) for lesson in lessons for name in lesson["students"]} - {None}
     first = dt.date(year, month, 1)
@@ -4500,12 +4534,8 @@ def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int)
     return lines
 
 
-def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
-    """Turn a sheet's month into table rows (a sheet downloaded before, or a teacher's own).
-
-    Also returns how many Online / Recording / Cancelled marks it had, which
-    the table doesn't hold: those stay on the sheet itself.
-    """
+def _rows_from_sheet(upload, year: int, month: int) -> list | None:
+    """Turn a sheet's month into table rows (a sheet downloaded before, or a teacher's own), marks included."""
     data = upload.getvalue()
 
     def month_of(name):
@@ -4517,28 +4547,28 @@ def _rows_from_sheet(upload, year: int, month: int) -> tuple[list | None, int]:
 
     chosen = next((name for name in schedule_parser.get_sheet_names(data) if month_of(name) == month), None)
     if chosen is None:
-        return None, 0
+        return None
     preview = schedule_parser.parse_workbook(data, [chosen], year)
-    sessions = [item for item in preview["sessions"] if (item["date"].year, item["date"].month) == (year, month)]
-    marks = sum(entry["status"] != schedule_parser.ATTENDING for item in sessions for entry in item["attendance"])
-    return [
-        {"Date": item["date"], "Start": item["start_time"], "End": item["end_time"],
-         "Subject": [item["class_name"]], "Students": [entry["student_name"] for entry in item["attendance"]],
-         "Every week": False}
-        for item in sorted(sessions, key=lambda item: (item["date"], item["start_time"]))
-    ] or None, marks
+    return _rows_from_lessons([
+        {"date": item["date"], "start": item["start_time"], "end": item["end_time"], "subject": item["class_name"],
+         "students": [entry["student_name"] for entry in item["attendance"]],
+         "statuses": {entry["student_name"]: entry["status"] for entry in item["attendance"]
+                      if entry["status"] in _PLAN_MARKS}}
+        for item in preview["sessions"] if (item["date"].year, item["date"].month) == (year, month)
+    ]) or None
 
 
 def create_schedule_tab() -> None:
-    """Draw the Create schedule screen: plan one teacher's month and download it as their sheet.
+    """Draw the Create/Edit schedule screen: plan or edit one teacher's month, save it, download it.
 
-    Nothing here is saved in the app: the sheet is the schedule. It goes to
-    the teacher on Google Drive, they mark Online / Recording / Cancelled on
-    it, and it comes back through the upload on Teachers like any workbook,
-    which is when its new teacher and students are created.
+    A month the app already has is loaded into the table to edit. Saving is
+    the same as uploading that month's sheet on Teachers: the app's month is
+    made to match the table, with credits for anything already invoiced that
+    changes, and new teachers, students and subjects created. The download
+    is the teacher's sheet for Google Drive, marks included.
     """
-    st.caption("Plan a teacher's month and download it as their schedule sheet. Nothing is saved "
-               "in the app until the sheet is uploaded on Teachers.")
+    st.caption("Plan a teacher's month, or edit one the app has. Save it to the app, and download "
+               "it as their sheet.")
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
     labels = {item["Name"]: item["ID"] for item in teachers}
     # Widgets on a screen that isn't drawn lose their values, so going to another
@@ -4571,6 +4601,20 @@ def create_schedule_tab() -> None:
         if key in st.session_state:
             st.session_state[f"plan_kept_{key}"] = st.session_state[key]
 
+    # The month as the app has it, loaded here to edit. The table remembers which teacher
+    # and month it was loaded from, so it can't be saved over another one.
+    here = (teacher_id, year, month)
+    source = st.session_state.get("plan_source")
+    on_file_lessons = schedule_backfill.lessons_on_file(teacher_id, year, month)
+    if on_file_lessons and source != here:
+        st.info(f"{_teacher(teacher_name)} has {_plural(len(on_file_lessons), 'class', 'classes')} in "
+                f"{_when(period)} in the app.")
+        if st.button("Edit them here", key="plan_edit"):
+            st.session_state["plan_rows"] = _rows_from_lessons(on_file_lessons)
+            st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
+            st.session_state["plan_source"] = here
+            _rerun()
+
     students = db.get_all_students()
     lookup = {item["Name"]: item["ID"] for item in students}
     # The teacher's subjects on file, then any typed into the table, so a new subject
@@ -4586,18 +4630,14 @@ def create_schedule_tab() -> None:
         upload = st.file_uploader(f"A schedule sheet with {calendar.month_name[month]} in it (.xlsx)",
                                   type=["xlsx"], key="plan_upload")
         if upload is not None and st.button("Put its lessons in the table", key="plan_load"):
-            rows, marks = _rows_from_sheet(upload, year, month)
+            rows = _rows_from_sheet(upload, year, month)
             if rows is None:
                 st.warning(f"No lessons for {_when(period)} found in that sheet.")
             else:
                 st.session_state["plan_rows"] = rows
                 st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
-                if marks:
-                    _flash(f"{len(rows)} lessons put in the table. Its {marks} Online / Recording / "
-                           "Cancelled mark(s) stay on that sheet: a sheet downloaded from here starts "
-                           "without them.", "warning")
-                else:
-                    _flash(f"{len(rows)} lessons put in the table.")
+                st.session_state.pop("plan_source", None)
+                _flash(f"{len(rows)} lessons put in the table.")
                 _rerun()
 
     # The table keeps its rows across screens: a widget's own state is lost when its
@@ -4609,6 +4649,9 @@ def create_schedule_tab() -> None:
         st.session_state["plan_base"] = st.session_state.get("plan_rows") or [dict(_PLAN_BLANK)]
     first_day = dt.date(year, month, 1)
     last_day = dt.date(year, month, calendar.monthrange(year, month)[1])
+    # A mark can name anyone in the table, including a new student typed into a class.
+    in_table = {name for row in st.session_state["plan_base"] for name in row.get("Students") or [] if name}
+    mark_options = sorted(set(lookup) | in_table, key=str.casefold)
     st.markdown(f"**Lessons in {period}**")
     edited = st.data_editor(
         st.session_state["plan_base"],
@@ -4627,6 +4670,10 @@ def create_schedule_tab() -> None:
             "Students": st.column_config.MultiselectColumn(
                 options=sorted(lookup, key=str.casefold), accept_new_options=True, width="large",
                 help="Pick students on file, or type a new name."),
+            **{mark: st.column_config.MultiselectColumn(
+                options=mark_options, width="medium",
+                help=f"Students in this class who are {mark.lower()}, as the teacher marks them on the sheet.")
+               for mark in _PLAN_MARKS},
             "Every week": st.column_config.CheckboxColumn(
                 help="Repeats on the same weekday to the end of the month."),
         },
@@ -4647,7 +4694,7 @@ def create_schedule_tab() -> None:
     new_names = sorted({name for lesson in lessons for name in lesson["students"] if find(name) is None},
                        key=str.casefold)
     if new_names:
-        st.info("New students, created when the sheet is uploaded: " + _chips("student", new_names, most=99))
+        st.info("New students, created when saved: " + _chips("student", new_names, most=99))
     # A subject typed instead of picked is a new one. Say so, as for students, with
     # the one on file it's close to: "G12 Bio" picked by pressing Enter half-typed
     # would otherwise quietly become a second subject.
@@ -4655,7 +4702,7 @@ def create_schedule_tab() -> None:
     new_subjects = sorted({lesson["subject"] for lesson in lessons if lesson["subject"].casefold() not in known},
                           key=str.casefold)
     if new_subjects:
-        st.info("New subjects, created when the sheet is uploaded: " + ", ".join(
+        st.info("New subjects, created when saved: " + ", ".join(
             _subject(name) + (f" (close to {_subject(close[0])})" if (close := difflib.get_close_matches(name, on_file, n=1,
                                                                                      cutoff=0.7)) else "")
             for name in new_subjects))
@@ -4675,6 +4722,7 @@ def create_schedule_tab() -> None:
         st.caption(f"{len(lessons)} lessons on {len({lesson['date'] for lesson in lessons})} days, "
                    f"{len({name for lesson in lessons for name in lesson['students']})} students.")
     ready = bool(data) and not problems
+    _save_planned_month(lessons, ready, teacher_id, teacher_name, year, month, on_file_lessons, find)
     st.download_button(
         f"Download {teacher_name or 'the'} sheet for {period} (.xlsx)",
         data=data if ready else b"",
@@ -4692,7 +4740,79 @@ def create_schedule_tab() -> None:
     if st.button("Clear the table", key="plan_clear"):
         st.session_state["plan_rows"] = [dict(_PLAN_BLANK)]
         st.session_state["plan_version"] = version + 1
+        st.session_state.pop("plan_source", None)
         _rerun()
+
+
+def _save_planned_month(lessons, ready, teacher_id, teacher_name, year, month, on_file_lessons, find) -> None:
+    """Show what saving the table changes in the app, and save it.
+
+    Saving is the same as uploading the month's sheet: the app's month is
+    made to match the table. So a month the app already has must be loaded
+    into the table first; otherwise a few planned classes would take the
+    rest of the month off. A table loaded for one teacher and month can't be
+    saved as another.
+    """
+    period = f"{calendar.month_name[month]} {year}"
+    here, source = (teacher_id, year, month), st.session_state.get("plan_source")
+    st.markdown("**Save to the app**")
+    blocked = ""
+    if source is not None and source != here:
+        blocked = "This table was loaded for another teacher or month. Load this one, or clear the table."
+    elif on_file_lessons and source != here:
+        blocked = f"The app already has {period} for this teacher: press Edit them here first."
+    elif not ready:
+        blocked = "Add a teacher and at least one complete lesson, without overlaps."
+    if blocked:
+        st.caption(blocked)
+        st.button("Save to the app", key="plan_save", type="primary", disabled=True)
+        return
+
+    preview = schedule_backfill.preview_from_lessons(lessons, year, month)
+    # The students the screen calls on file are saved as those students, spellings included.
+    matches = {name.casefold(): sid for name in {name for lesson in lessons for name in lesson["students"]}
+               if (sid := find(name))}
+    # Another teacher's subject with the same name gets this teacher's name added, as at upload.
+    renames = schedule_backfill.suggest_class_renames(preview["sessions"], teacher_name)
+    if renames:
+        st.info("Another teacher has the same subject name, so it's saved as: " + ", ".join(
+            f"{_subject(old)} → {_subject(new)}" for old, new in renames.items()))
+    _import_changes(preview, {}, teacher_id, renames, matches)
+    if not st.button("Save to the app", key="plan_save", type="primary"):
+        return
+
+    commit_id = teacher_id
+    if commit_id is None:
+        if not db.create_teacher(teacher_name):
+            st.warning("That teacher is already on file: pick them as an existing teacher.")
+            return
+        commit_id = next(item["ID"] for item in db.get_all_teachers()
+                         if item["Name"].casefold() == teacher_name.casefold())
+    with st.spinner(f"Saving {period} for {teacher_name}…"):
+        result = schedule_backfill.backfill(preview, commit_id, name_overrides=renames, student_matches=matches,
+                                            dates=preview["dates_shown"])
+    if result["status"] != "imported":
+        st.warning(f"Nothing saved ({result['status']}).")
+        return
+    counts = result["created"]
+    message = (f"Saved {_when(period)} for {_teacher(teacher_name)}: {counts.get('sessions_created', 0)} new, "
+               f"{counts.get('sessions_updated', 0)} changed, {counts.get('lessons_removed', 0)} removed, "
+               f"{counts.get('sessions_unchanged', 0)} unchanged.")
+    if counts.get("credits_raised"):
+        message += f" {_plural(counts['credits_raised'], 'credit')} for classes already invoiced."
+    _flash(message)
+    # The table now shows the month as saved, and a new teacher is picked as an existing one.
+    st.session_state["plan_rows"] = _rows_from_lessons(schedule_backfill.lessons_on_file(commit_id, year, month))
+    st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
+    st.session_state["plan_source"] = (commit_id, year, month)
+    if teacher_id is None:
+        st.session_state["plan_kept_plan_teacher_mode"] = "Existing teacher"
+        st.session_state["plan_kept_plan_teacher"] = next(
+            item["Name"] for item in db.get_all_teachers() if item["ID"] == commit_id)
+        for key in ("plan_teacher_mode", "plan_teacher"):
+            st.session_state.pop(key, None)
+    st.session_state["offer_billing"] = (year, month)
+    _rerun()
 
 
 def reminders_tab() -> None:
@@ -4823,6 +4943,9 @@ def _linked_detail(item: dict) -> None:
         _detail_table(f"Show {_plural(len(item['Places']), 'class', 'classes')}", item["Places"])
         _detail_table(f"Show {_plural(len(item['Invoices']), 'invoice')}",
                       [_invoice_row(bill) for bill in item["Invoices"]], names)
+        _detail_table(f"Show {_plural(len(item['Shortened']), 'changed invoice')}", [
+            {**_invoice_row(bill), "Classes lost": bill["Classes"], "Amount lost": f"${bill['Removed']:,.2f}"}
+            for bill in item["Shortened"]], {"Amount lost": "money", "Paid": "money"})
     elif item["Kind"] == "Invoice":
         _detail_table(f"Show {_plural(len(item['Lines']), 'line')}", [
             {**line, "Amount": f"${line['Amount']:,.2f}" if line["Amount"] is not None else ""}
@@ -4907,13 +5030,20 @@ def _linked_text(item: dict, period: str = "") -> str:
         lines = [f"**Class** {_when(when)} · {_subject(item['Subject'])} · {_teacher(item['Teacher'])}",
                  f"- Students: {_chips('student', item['Students'], most=10)}" if item["Students"] else "- Empty"]
     elif kind == "Student":
+        if item["Only"]:
+            # Taken out of some classes only: say which, since the student stays.
+            scope = f" · only from {_chips('subject', item['Only'])}" + (
+                f", {_when(period)}" if period != "all time" else "")
         lines = [f"**Student** {_student(item['Name'])}{scope}"]
         if item["Parent"]:
             lines.append(f"- Parent: {_escaped(item['Parent'])}")
         if item["Teachers"]:
             lines.append(f"- Teachers: {_chips('teacher', item['Teachers'])}")
         if item["Invoices"]:
-            lines.append("- Invoices: " + ", ".join(_invoice_text(bill) for bill in item["Invoices"]))
+            lines.append("- Invoices deleted: " + ", ".join(_invoice_text(bill) for bill in item["Invoices"]))
+        for bill in item["Shortened"]:
+            lines.append(f"- {_invoice_text(bill)} loses {_plural(bill['Classes'], 'class', 'classes')} "
+                         f"· {_money(bill['Removed'])}")
         if item["Credits"]:
             lines.append(f"- Credit: {_money(item['Credits'])}")
     elif kind == "Invoice":
@@ -5100,7 +5230,13 @@ def delete_records_tab() -> None:
     }
     if not any(picked.values()):
         return
-    picked.update(year=year or None, month=month or None)
+    # A student picked with a teacher, subject or class can mean "this student, only there":
+    # a month of one subject they can't make, say, with their other subjects left alone.
+    meet = False
+    if picked["student_ids"] and (picked["teacher_ids"] or picked["class_ids"] or picked["lesson_ids"]):
+        meet = st.checkbox("Only take these students out of these classes", key=f"delete_meet_{generation}",
+                           help="Their other subjects stay, and so do the classes and the students themselves.")
+    picked.update(year=year or None, month=month or None, meet=meet)
 
     plan = db.describe_master_delete(**picked)
     total = sum(row["How many"] for row in plan["Rows"])
@@ -5157,7 +5293,7 @@ SECTIONS = {
     "Teachers": teachers_tab,
     "Students": students_tab,
     "Schedule": schedule_tab,
-    "Create schedule": create_schedule_tab,
+    "Create/Edit schedule": create_schedule_tab,
     "Invoices": invoices_tab,
     "Payments": payments_tab,
     "Credits": credits_tab,

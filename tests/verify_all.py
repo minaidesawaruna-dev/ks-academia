@@ -1810,6 +1810,225 @@ def t_delete_by_period():
             "December of any year; past schedules by year; no time chosen takes the teacher whole")
 
 
+_MEET_DELETE_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event, select
+
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+both = ["Nam Jihoon", "Oh Minseok"]
+
+def lesson(day, subject, hour):
+    return {"date": day, "class_name": subject, "start_time": dt.time(hour), "end_time": dt.time(hour + 2),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in both]}
+
+sb.backfill({"sessions": [lesson(dt.date(2026, 9, d), "G11 Test Math", 16) for d in (7, 14, 21)]
+                         + [lesson(dt.date(2026, 9, d), "G11 Test Chem", 18) for d in (9, 16, 23)]}, teacher)
+db._record_import(teacher, 2026, 9, 6, 0, 0)
+students = {s["Name"]: s["ID"] for s in db.get_all_students()}
+subjects = {c["Class"]: c["ID"] for c in db.get_all_classes()}
+issued = {row["Student"]: db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)[1]
+          for row in db.get_open_invoice_items_for_month(2026, 9)}
+numbers = {name: db.get_invoice(key)["Number"] for name, key in issued.items()}
+
+def left():
+    with db.SessionLocal() as s:
+        places = sorted(f"{n} {c}" for n, c in s.execute(
+            select(db.Student.full_name, db.AcademyClass.name)
+            .join(db.SessionAttendance, db.SessionAttendance.student_id == db.Student.id)
+            .join(db.ClassSession, db.ClassSession.id == db.SessionAttendance.session_id)
+            .join(db.AcademyClass, db.AcademyClass.id == db.ClassSession.class_id)))
+        lines = sorted(f"#{n} {c}" for n, c in s.execute(
+            select(db.Invoice.invoice_number, db.InvoiceItem.class_name)
+            .join(db.InvoiceItem, db.InvoiceItem.invoice_id == db.Invoice.id)))
+        classes = len(list(s.scalars(select(db.ClassSession.id))))
+        uploads = len(list(s.scalars(select(db.ScheduleImport.id))))
+        broken = s.connection().exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    return {"places": places, "lines": lines, "classes": classes, "uploads": uploads, "broken": broken,
+            "subjects": sorted(subjects_now["Class"] for subjects_now in db.get_all_classes()),
+            "teachers": [t["Name"] for t in db.get_all_teachers()],
+            "students": sorted(s["Name"] for s in db.get_all_students())}
+
+def card(plan):
+    student = [item for item in plan["Linked"] if item["Kind"] == "Student"]
+    return {"kinds": [item["Kind"] for item in plan["Linked"]],
+            "only": student[0]["Only"] if student else None,
+            "shortened": [[b["Number"], b["Classes"], b["Removed"]] for b in student[0]["Shortened"]] if student else None,
+            "deleted": [b["Number"] for b in student[0]["Invoices"]] if student else None,
+            "beyond": {k: len(v) for k, v in plan["Beyond"].items()}, "unpaid": plan["Unpaid"],
+            "classes_going": next((r["How many"] for r in plan["Rows"] if r["What"] == "Classes"), 0)}
+
+nam_math = dict(student_ids=[students["Nam Jihoon"]], class_ids=[subjects["G11 Test Math"]], year=2026, month=9)
+result = {"numbers": numbers,
+          "without_meet": card(db.describe_master_delete(**nam_math)),
+          "preview": card(db.describe_master_delete(**nam_math, meet=True))}
+# 1. Nam out of Math for September: his Chemistry and Oh's places stay, his invoice loses the Math lines.
+db.master_delete(**nam_math, meet=True)
+result["nam_math"] = left()
+# 2. Nam out of Chemistry too: his invoice has nothing left on it, so it goes.
+result["nam_chem_preview"] = card(db.describe_master_delete(
+    student_ids=[students["Nam Jihoon"]], class_ids=[subjects["G11 Test Chem"]], year=2026, month=9, meet=True))
+db.master_delete(student_ids=[students["Nam Jihoon"]], class_ids=[subjects["G11 Test Chem"]], year=2026, month=9,
+                 meet=True)
+result["nam_chem"] = left()
+# 3. Oh out of everything Teacher A teaches, any time: the teacher and the upload record stay.
+db.master_delete(teacher_ids=[teacher], student_ids=[students["Oh Minseok"]], meet=True)
+result["oh_teacher"] = left()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_delete_where_they_meet():
+    """Delete records can take a student out of only the classes picked with them.
+
+    Picked with a subject for a month, the student loses only their places
+    in its classes that month, the invoice lines billing them and their
+    credits. Their other subjects, the classes, the subject, other students
+    and the student stay. A sent invoice that keeps other lines is
+    shortened and shown on the student's card, not as reaching someone
+    else; one left with nothing goes. Without the option the same picks
+    take the subject's classes too. Links stay intact.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "meet.db").replace("\\", "/")
+        result = run(["-c", _MEET_DELETE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    nam, oh = got["numbers"]["Nam Jihoon"], got["numbers"]["Oh Minseok"]
+    assert got["without_meet"]["classes_going"] == 3, got["without_meet"]
+    preview = got["preview"]
+    assert preview["kinds"] == ["Student"] and preview["only"] == ["G11 Test Math"], preview
+    assert preview["shortened"] == [[nam, 3, 390.0]] and preview["deleted"] == [], preview
+    assert preview["beyond"] == {"Places": 0, "Changed": 0, "Emptied": 0, "Credits": 0}, preview["beyond"]
+    assert preview["unpaid"] == 0 and preview["classes_going"] == 0, preview
+    first = got["nam_math"]
+    assert first["classes"] == 6 and first["subjects"] == ["G11 Test Chem", "G11 Test Math"], first
+    assert first["places"] == (["Nam Jihoon G11 Test Chem"] * 3 + ["Oh Minseok G11 Test Chem"] * 3
+                               + ["Oh Minseok G11 Test Math"] * 3), first["places"]
+    assert first["lines"] == sorted([f"#{nam} G11 Test Chem"] * 3 + [f"#{oh} G11 Test Chem"] * 3
+                                    + [f"#{oh} G11 Test Math"] * 3), first["lines"]
+    assert got["nam_chem_preview"]["deleted"] == [nam] and got["nam_chem_preview"]["shortened"] == [], got
+    second = got["nam_chem"]
+    assert not any(place.startswith("Nam") for place in second["places"]), second["places"]
+    assert all(line.startswith(f"#{oh} ") for line in second["lines"]) and len(second["lines"]) == 6, second
+    assert "Nam Jihoon" in second["students"] and second["classes"] == 6, second
+    third = got["oh_teacher"]
+    assert third["places"] == [] and third["lines"] == [] and third["classes"] == 6, third
+    assert third["teachers"] == ["Teacher A"] and third["uploads"] == 1, third
+    assert third["students"] == ["Nam Jihoon", "Oh Minseok"], third
+    assert all(step["broken"] == [] for step in (first, second, third)), "broken links"
+    return ("a student out of one subject for a month: other subjects, classes and classmates kept, their "
+            "invoice shortened on their own card; emptied invoice deleted; out of a whole teacher too")
+
+
+_EDIT_MONTH_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event, select
+
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+both = ["Nam Jihoon", "Oh Minseok"]
+
+def lesson(day, names, subject="G11 Test Math", marks=None):
+    return {"date": day, "class_name": subject, "start_time": dt.time(16), "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": n, "status": (marks or {}).get(n, "Attending")} for n in names]}
+
+sept = lambda d: dt.date(2026, 9, d)
+sb.backfill({"sessions": [lesson(sept(7), both), lesson(sept(14), both, marks={"Oh Minseok": "Online"}),
+                          lesson(sept(21), both), lesson(sept(28), both), lesson(dt.date(2026, 10, 5), both)]}, teacher)
+nam_invoice = next(row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, 9) if row["Student"] == "Nam Jihoon")
+db.issue_invoice_for_month(nam_invoice, 2026, 9)
+# A class cancelled as a whole on the Schedule screen.
+with db.SessionLocal() as s:
+    s.query(db.ClassSession).filter(db.ClassSession.session_date == dt.date(2026, 10, 5)).update({"status": "Cancelled"})
+    s.commit()
+
+def shown(lessons):
+    return [[str(l["date"]), l["subject"], l["students"], l["statuses"]] for l in lessons]
+
+def counts(plan):
+    return [sum(m[k] for m in plan.values()) for k in ("new", "changed", "removed", "unchanged")]
+
+def save(lessons, year, month):
+    preview = sb.preview_from_lessons(lessons, year, month)
+    planned = counts(sb.plan_import(preview, teacher, dates=preview["dates_shown"]))
+    c = sb.backfill(preview, teacher, dates=preview["dates_shown"])["created"]
+    return [planned, [c.get("sessions_created", 0), c.get("sessions_updated", 0), c.get("lessons_removed", 0),
+                      c.get("sessions_unchanged", 0)]]
+
+loaded = sb.lessons_on_file(teacher, 2026, 9)
+result = {"loaded": shown(loaded), "october": shown(sb.lessons_on_file(teacher, 2026, 10)),
+          "as_is": save(loaded, 2026, 9)}
+# The edits made in the table: Nam cancelled on the 21st, the 28th taken out, Seo Yerin
+# added on the 14th and a new Chemistry class on the 30th.
+edited = [l for l in sb.lessons_on_file(teacher, 2026, 9) if l["date"] != sept(28)]
+edited[1]["students"].append("Seo Yerin")
+edited[2]["statuses"]["Nam Jihoon"] = "Cancelled"
+edited.append({"date": sept(30), "start": dt.time(16), "end": dt.time(18), "subject": "G11 Test Chem",
+               "students": ["Oh Minseok"], "statuses": {}})
+result["edited"] = save(edited, 2026, 9)
+result["after"] = shown(sb.lessons_on_file(teacher, 2026, 9))
+result["credits"] = sorted([c["Student"], str(c["Class date"]), c["Amount"]] for c in db.get_credits())
+result["again"] = save(sb.lessons_on_file(teacher, 2026, 9), 2026, 9)
+with db.SessionLocal() as s:
+    result["broken"] = s.connection().exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_edit_month_in_app():
+    """A month the app has loads into Create/Edit schedule and saves back like an upload.
+
+    Loaded, each class keeps its students in order and their marks; a class
+    cancelled as a whole marks everyone Cancelled. Saved unchanged, nothing
+    changes. Edits save as an upload would: a billed student cancelled and a
+    billed class taken out are credited, a new student and class are added,
+    and the forecast matches what is saved. Loading again shows the edits.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "edit.db").replace("\\", "/")
+        result = run(["-c", _EDIT_MONTH_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    pair = ["Nam Jihoon", "Oh Minseok"]
+    assert got["loaded"] == [["2026-09-07", "G11 Test Math", pair, {}],
+                             ["2026-09-14", "G11 Test Math", pair, {"Oh Minseok": "Online"}],
+                             ["2026-09-21", "G11 Test Math", pair, {}],
+                             ["2026-09-28", "G11 Test Math", pair, {}]], got["loaded"]
+    assert got["october"] == [["2026-10-05", "G11 Test Math", pair,
+                               {"Nam Jihoon": "Cancelled", "Oh Minseok": "Cancelled"}]], got["october"]
+    assert got["as_is"] == [[0, 0, 0, 4], [0, 0, 0, 4]], f"saving it unchanged changed something: {got['as_is']}"
+    planned, done = got["edited"]
+    assert planned == done == [1, 2, 1, 1], got["edited"]
+    assert got["after"] == [["2026-09-07", "G11 Test Math", pair, {}],
+                            ["2026-09-14", "G11 Test Math", pair + ["Seo Yerin"], {"Oh Minseok": "Online"}],
+                            ["2026-09-21", "G11 Test Math", pair, {"Nam Jihoon": "Cancelled"}],
+                            ["2026-09-30", "G11 Test Chem", ["Oh Minseok"], {}]], got["after"]
+    assert got["credits"] == [["Nam Jihoon", "2026-09-21", 130.0], ["Nam Jihoon", "2026-09-28", 130.0]], got["credits"]
+    assert got["again"] == [[0, 0, 0, 4], [0, 0, 0, 4]], got["again"]
+    assert got["broken"] == [], "broken links"
+    return ("loaded with order and marks (a whole-class cancel marks everyone); unchanged saves nothing; edits "
+            "save like an upload, billed changes credited, forecast matched; reloads as saved")
+
+
 _RENAME_SUBJECT_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from sqlalchemy import event, select
@@ -2338,7 +2557,9 @@ for name, fn in [
     ("deleting a class, order added, double bookings", t_class_edits),
     ("Delete records and freed numbers", t_master_delete),
     ("Delete records inside a year or month", t_delete_by_period),
+    ("Delete records where a student and classes meet", t_delete_where_they_meet),
     ("renaming a subject", t_rename_subject),
+    ("editing a month on Create/Edit schedule", t_edit_month_in_app),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

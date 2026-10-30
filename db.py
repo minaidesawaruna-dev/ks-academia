@@ -5570,7 +5570,7 @@ def _in_period(column, year=None, month=None) -> list:
 
 
 def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, lesson_ids, history_names,
-                 year=None, month=None) -> dict:
+                 year=None, month=None, meet=False) -> dict:
     """Work out every row a delete on Delete records removes or changes.
 
     Starts from what was picked and follows every link out from it. A
@@ -5589,6 +5589,11 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
     student themselves stay, and so do past schedules unless picked on
     their own. With no year and no month, they go whole.
 
+    With `meet`, a student picked alongside a teacher, subject or class only
+    comes out of those classes (in the period, if one is chosen): their
+    places in them, the invoice lines billing those places and the credits
+    for them. Their other subjects, the classes and everyone else stay.
+
     Two things are changed instead of deleted. A credit that was used up on
     a deleted invoice goes back to waiting, because that invoice no longer
     exists. And a class that stays but was on a deleted invoice is no longer
@@ -5600,7 +5605,28 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
     picked_classes = _ids_where(session, AcademyClass.id, AcademyClass.id, class_ids)
     lessons = _ids_where(session, ClassSession.id, ClassSession.id, lesson_ids)
     own_places, own_credits = set(), set()
-    if whole:
+    meet = bool(meet and picked_students and (picked_teachers or picked_classes or lessons))
+    if meet:
+        # Nothing goes whole: only where the picked students and the picked classes meet.
+        teachers, students, classes = set(), set(), set()
+        subjects_of = (picked_classes
+                       | _ids_where(session, AcademyClass.id, AcademyClass.teacher_id, picked_teachers))
+        reach = [ClassSession.id.in_(list(lessons))] if lessons else []
+        if subjects_of or picked_teachers:
+            reach.append(and_(*_in_period(ClassSession.session_date, year, month),
+                              or_(ClassSession.class_id.in_(list(subjects_of)),
+                                  ClassSession.teacher_id.in_(list(picked_teachers)))))
+        scope = select(ClassSession.id).where(or_(*reach))
+        lessons = set()
+        own_places = set(session.scalars(select(SessionAttendance.id).where(
+            SessionAttendance.student_id.in_(list(picked_students)), SessionAttendance.session_id.in_(scope))))
+        items = set(session.scalars(
+            select(InvoiceItem.id).join(Invoice, Invoice.id == InvoiceItem.invoice_id).where(
+                Invoice.student_id.in_(list(picked_students)), InvoiceItem.session_id.in_(scope))))
+        own_credits = set(session.scalars(select(Credit.id).where(
+            Credit.student_id.in_(list(picked_students)), Credit.session_id.in_(scope))))
+        invoices = _ids_where(session, Invoice.id, Invoice.id, invoice_ids)
+    elif whole:
         teachers, students = picked_teachers, picked_students
         classes = picked_classes | _ids_where(session, AcademyClass.id, AcademyClass.teacher_id, teachers)
         lessons |= (_ids_where(session, ClassSession.id, ClassSession.class_id, classes)
@@ -5701,6 +5727,11 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
 
     attendance = (_ids_where(session, SessionAttendance.id, SessionAttendance.session_id, lessons)
                   | _ids_where(session, SessionAttendance.id, SessionAttendance.student_id, students) | own_places)
+    # A student's own places that go, so they aren't also counted as unbilled below.
+    gone_places = set()
+    for chunk in _chunks(own_places):
+        gone_places.update((student_id, lesson_id) for student_id, lesson_id in session.execute(
+            select(SessionAttendance.student_id, SessionAttendance.session_id).where(SessionAttendance.id.in_(chunk))))
     # Classes that stay but were billed on a deleted invoice: no longer paid for.
     unpaid = defaultdict(set)
     for chunk in _chunks(invoices):
@@ -5709,7 +5740,7 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
             .join(Invoice, Invoice.id == InvoiceItem.invoice_id)
             .where(InvoiceItem.invoice_id.in_(chunk), InvoiceItem.session_id.is_not(None))
         ):
-            if student_id not in students and lesson_id not in lessons:
+            if student_id not in students and lesson_id not in lessons and (student_id, lesson_id) not in gone_places:
                 unpaid[student_id].add(lesson_id)
 
     parents = _ids_where(session, Student.parent_id, Student.id, students)
@@ -5725,7 +5756,7 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
             LessonHistory.teacher_name.in_(list(names)), *_in_period(LessonHistory.lesson_date, year, month))))
     # Upload records are kept per teacher and month, so a period takes the matching months.
     uploads = _ids_where(session, ScheduleImport.id, ScheduleImport.teacher_id, teachers)
-    if not whole and picked_teachers:
+    if not whole and picked_teachers and not meet:
         uploads = set(session.scalars(select(ScheduleImport.id).where(
             ScheduleImport.teacher_id.in_(list(picked_teachers)),
             *([ScheduleImport.year == int(year)] if year else []),
@@ -5764,8 +5795,8 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
         "reopened": reopened, "unpaid": unpaid, "numbers": sorted(gone_numbers),
         "shortened": shortened, "emptied": emptied, "drop_choice": drop_choice,
         "next": (_next_invoice_number(session), after),
-        "whole": whole, "picked_teachers": picked_teachers, "picked_students": picked_students,
-        "picked_classes": picked_classes,
+        "whole": whole and not meet, "meet": meet, "picked_teachers": picked_teachers,
+        "picked_students": picked_students, "picked_classes": picked_classes,
     }
 
 
@@ -5901,8 +5932,25 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
         """Sort ids by the name they map to."""
         return lambda key: str(names.get(key, "")).lower()
 
+    # Sent invoices that stay but lose lines: how many classes, and how much comes off.
+    changed = defaultdict(lambda: [0, 0.0])
+    for chunk in _chunks(plan["items"]):
+        for invoice_id, amount in session.execute(
+            select(InvoiceItem.invoice_id, InvoiceItem.amount).where(InvoiceItem.id.in_(chunk))
+        ):
+            if invoice_id in plan["shortened"]:
+                changed[invoice_id][0] += 1
+                changed[invoice_id][1] += float(amount or 0)
+
+    def shortened(invoice_id) -> dict:
+        """Return a sent invoice that loses lines, with how many and how much."""
+        return {**bill(invoice_id), "Classes": changed[invoice_id][0], "Removed": round(changed[invoice_id][1], 2)}
+
+    # Where students only come out of some classes, the teachers, subjects and classes
+    # picked stay, so they get no card of their own: the students' cards say it all.
+    shown_teachers = set() if plan["meet"] else teachers
     linked = []
-    for teacher_id in sorted(teachers, key=by_name(teacher_names)):
+    for teacher_id in sorted(shown_teachers, key=by_name(teacher_names)):
         theirs = [lesson_id for lesson_id, row in lessons.items()
                   if row[1] == teacher_id or subjects[row[0]][1] == teacher_id]
         # Their subjects with classes going, and any subject going that has none.
@@ -5916,7 +5964,7 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
             "Past schedules": history.get(teacher_names[teacher_id], 0),
             "Detail": class_rows(theirs),
         })
-    picked_subjects = plan["picked_classes"]
+    picked_subjects = set() if plan["meet"] else plan["picked_classes"]
     for class_id in sorted(picked_subjects, key=lambda key: subjects[key][0].lower()):
         if subjects[class_id][1] not in teachers:
             linked.append({"Kind": "Subject", "Whole": plan["whole"], **subject(class_id)})
@@ -5950,9 +5998,12 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
         waiting = sum(float(row[1]) for row in credits.values() if row[0] == student_id and row[2] == "Open")
         places = sorted(places_of[student_id], key=lambda row: (row["Date"], row["Time"]))
         linked.append({"Kind": "Student", "Name": student_names[student_id], "Whole": plan["whole"],
+                       "Only": sorted({row["Subject"] for row in places}, key=str.lower) if plan["meet"] else [],
                        "Parent": parent_of.get(student_id, "") if plan["whole"] else "",
                        "Teachers": sorted({row["Teacher"] for row in places}, key=str.lower),
                        "Invoices": [bill(key) for key in owned], "Credits": round(waiting, 2),
+                       "Shortened": [shortened(key) for key in sorted(plan["shortened"], key=lambda key: bills[key][0] or 0)
+                                     if bills[key][2] == student_id],
                        "Places": places})
     direct = [key for key in sorted(set(invoice_ids) & plan["invoices"], key=lambda key: bills[key][0] or 0)
               if bills[key][2] not in students]
@@ -5972,7 +6023,7 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
     for invoice_id in direct:
         linked.append({"Kind": "Invoice", **bill(invoice_id),
                        "Lines": sorted(lines_of[invoice_id], key=lambda row: (row["Date"] is None, row["Date"] or date.min))})
-    for name in sorted(set(history_names) - {teacher_names[key] for key in teachers}, key=str.lower):
+    for name in sorted(set(history_names) - {teacher_names[key] for key in shown_teachers}, key=str.lower):
         if history.get(name):
             linked.append({"Kind": "Past schedules", "Name": name, "Rows": history[name]})
 
@@ -5982,14 +6033,6 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
         attended.update(session.execute(
             select(SessionAttendance.student_id, func.count()).where(SessionAttendance.student_id.in_(chunk))
             .group_by(SessionAttendance.student_id)).all())
-    changed = defaultdict(lambda: [0, 0.0])
-    for chunk in _chunks(plan["items"]):
-        for invoice_id, amount in session.execute(
-            select(InvoiceItem.invoice_id, InvoiceItem.amount).where(InvoiceItem.id.in_(chunk))
-        ):
-            if invoice_id in plan["shortened"]:
-                changed[invoice_id][0] += 1
-                changed[invoice_id][1] += float(amount or 0)
     other_credits = defaultdict(float)
     for student_id, amount, _ in credits.values():
         if student_id not in students:
@@ -5997,8 +6040,8 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
     beyond = {
         "Places": [{"Student": student_names[key], "Classes": lost[key], "None left": attended[key] == lost[key]}
                    for key in sorted(lost, key=by_name(student_names))],
-        "Changed": [{**bill(key), "Classes": changed[key][0], "Removed": round(changed[key][1], 2)}
-                    for key in sorted(plan["shortened"], key=lambda key: bills[key][0] or 0)],
+        "Changed": [shortened(key) for key in sorted(plan["shortened"], key=lambda key: bills[key][0] or 0)
+                    if bills[key][2] not in students],
         "Emptied": [bill(key) for key in sorted(plan["emptied"], key=lambda key: bills[key][0] or 0)
                     if bills[key][2] not in students],
         "Credits": [{"Student": student_names[key], "Amount": round(amount, 2)}
@@ -6021,7 +6064,7 @@ def _master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_na
 
 
 def describe_master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
-                           lesson_ids=(), history_names=(), year=None, month=None) -> dict:
+                           lesson_ids=(), history_names=(), year=None, month=None, meet=False) -> dict:
     """Return what master_delete would remove and change, and what it's all linked to.
 
     Changes nothing. Has the same keys as master_delete's summary, plus
@@ -6029,18 +6072,20 @@ def describe_master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice
     """
     with SessionLocal() as session:
         plan = _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, lesson_ids, history_names,
-                            year, month)
+                            year, month, meet)
         return {**_master_summary(plan),
                 **_master_report(session, plan, class_ids, lesson_ids, invoice_ids, history_names)}
 
 
 def master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
-                  lesson_ids=(), history_names=(), year=None, month=None) -> dict:
+                  lesson_ids=(), history_names=(), year=None, month=None, meet=False) -> dict:
     """Delete what was picked and everything linked to it, sent invoices included.
 
     `class_ids` are subjects and `lesson_ids` single dated classes;
     `history_names` are teachers whose past schedules go. A `year`, a
-    `month` or both keep it inside that time (see _master_plan). All in one
+    `month` or both keep it inside that time, and `meet` takes the picked
+    students out of only the picked teachers', subjects' or classes'
+    lessons (see _master_plan). All in one
     transaction, so either all of it goes or none of it does. The freed
     invoice numbers can be used again: the next number is worked out from
     the invoices left. Returns the same summary as describe_master_delete.
@@ -6048,7 +6093,7 @@ def master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
     with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
         _lock_numbers(session)
         plan = _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids,
-                            lesson_ids, history_names, year, month)
+                            lesson_ids, history_names, year, month, meet)
         quiet = {"synchronize_session": False}
 
         for chunk in _chunks(plan["pointing"]):
