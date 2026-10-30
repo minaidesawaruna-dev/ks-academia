@@ -1810,6 +1810,115 @@ def t_delete_by_period():
             "December of any year; past schedules by year; no time chosen takes the teacher whole")
 
 
+_RENAME_SUBJECT_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from sqlalchemy import event, select
+
+@event.listens_for(db.engine, "connect")
+def _links_enforced(connection, _):
+    connection.execute("PRAGMA foreign_keys=ON")
+db.engine.dispose()
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, names):
+    return {"date": day, "class_name": subject, "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sept = [dt.date(2026, 9, d) for d in (7, 14, 21)]
+sheet = [lesson(day, "G9 Test Englsh", ["Nam Jihoon", "Oh Minseok"]) for day in sept]
+sb.backfill({"sessions": sheet}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(dt.date(2026, 9, 8), "G10 Test Math", ["Seo Yerin"])]}, ids["Teacher B"])
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+english = next(c["ID"] for c in db.get_all_classes() if c["Class"] == "G9 Test Englsh")
+
+def subjects():
+    return sorted(c["Class"] for c in db.get_all_classes())
+
+def lines():
+    with db.SessionLocal() as s:
+        return sorted(set(s.scalars(select(db.InvoiceItem.class_name).where(db.InvoiceItem.session_id.is_not(None)))))
+
+def amounts():
+    with db.SessionLocal() as s:
+        return sorted(float(a) for a in s.scalars(select(db.InvoiceItem.amount)))
+
+result = {"before": [subjects(), lines(), len(db.get_sent_invoices_out_of_step()), amounts()]}
+result["refused"] = [db.rename_subject(english, " ")["result"], db.rename_subject(english, "g10 test math")["result"],
+                     db.rename_subject(english, "G9 Test Englsh")["result"]]
+done = db.rename_subject(english, "  G9 Test   English ")
+result["renamed"] = [done, subjects(), lines(), len(db.get_sent_invoices_out_of_step()), amounts(),
+                     db.get_subject_spellings(ids["Teacher A"]), db.get_subject_spellings(ids["Teacher B"])]
+# The teacher's sheet still says the old name: the same subject, nothing added, removed or credited.
+planned = sb.plan_import({"sessions": sheet}, ids["Teacher A"], dates=sept)
+got = sb.backfill({"sessions": sheet}, ids["Teacher A"], dates=sept)["created"]
+result["upload"] = [[sum(m[k] for m in planned.values()) for k in ("new", "unchanged", "removed")],
+                    [got.get("sessions_created", 0), got.get("sessions_unchanged", 0), got.get("lessons_removed", 0)],
+                    subjects(), len(db.get_credits())]
+# Another teacher's sheet with that old name isn't theirs to swap.
+result["other_teacher"] = [s["class_name"] for s in
+                           sb.use_subject_spellings({"sessions": sheet[:1]}, ids["Teacher B"])["sessions"]]
+# The Schedule screen's subject box renames the same way; then back to the first name.
+db.update_scheduling_class(english, "G9 Test English Lang", 60.0, db.get_class_student_ids(english),
+                           "#FFF2CC", sept[0])
+result["schedule_box"] = [subjects(), lines(), db.get_subject_spellings(ids["Teacher A"])]
+db.rename_subject(english, "G9 Test Englsh")
+result["back"] = db.get_subject_spellings(ids["Teacher A"])
+# Delete records takes the old names with the subject.
+summary = db.master_delete(class_ids=[english])
+with db.SessionLocal() as s:
+    left = list(s.scalars(select(db.SubjectSpelling.spelling)))
+    broken = s.connection().exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+result["deleted"] = [[r["How many"] for r in summary["Rows"] if r["What"] == "Old subject names"], left, broken,
+                     subjects()]
+print(json.dumps(result, default=str))
+"""
+
+
+def t_rename_subject():
+    """Renaming a subject relabels its invoices, and an upload with the old name still lands on it.
+
+    Sent invoice lines take the new name with amounts unchanged, so none is
+    listed as changed since it went out. A name another subject has is
+    refused, ignoring capitals. The teacher's sheet with the old name uploads
+    as unchanged: no new subject, nothing removed or credited. Another
+    teacher's sheet isn't swapped. The Schedule screen's box renames the same
+    way. Delete records takes the old names with the subject, links intact.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "rename.db").replace("\\", "/")
+        result = run(["-c", _RENAME_SUBJECT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    subjects, lines, out_of_step, amounts = got["before"]
+    assert subjects == ["G10 Test Math", "G9 Test Englsh"] and lines == subjects and out_of_step == 0, got["before"]
+    assert got["refused"] == ["invalid", "duplicate", "unchanged"], got["refused"]
+    done, subjects, lines, out_of_step, after, spellings, other = got["renamed"]
+    assert done == {"result": "renamed", "name": "G9 Test English", "relabelled": 6}, done
+    assert subjects == ["G10 Test Math", "G9 Test English"] and lines == subjects, got["renamed"]
+    assert out_of_step == 0 and after == amounts, f"invoices changed: {out_of_step} out of step, {after} vs {amounts}"
+    assert spellings == {"g9 test englsh": "G9 Test English"} and other == {}, (spellings, other)
+    planned, done_upload, subjects, credits = got["upload"]
+    assert planned == done_upload == [0, 3, 0], got["upload"]
+    assert subjects == ["G10 Test Math", "G9 Test English"] and credits == 0, got["upload"]
+    assert got["other_teacher"] == ["G9 Test Englsh"], got["other_teacher"]
+    subjects, lines, spellings = got["schedule_box"]
+    assert subjects == ["G10 Test Math", "G9 Test English Lang"] and lines == subjects, got["schedule_box"]
+    assert spellings == {"g9 test englsh": "G9 Test English Lang", "g9 test english": "G9 Test English Lang"}, spellings
+    assert got["back"] == {"g9 test english": "G9 Test Englsh", "g9 test english lang": "G9 Test Englsh"}, got["back"]
+    count, left, broken, subjects = got["deleted"]
+    assert count == [2] and left == [] and broken == [] and subjects == ["G10 Test Math"], got["deleted"]
+    return ("sent lines relabelled, amounts unchanged, none out of step; taken names refused; the old "
+            "spelling re-uploads unchanged; other teachers unaffected; Schedule box too; deleted with the subject")
+
+
 def t_class_edits():
     """Deleting a class works with foreign keys on; students keep their order; double bookings show.
 
@@ -2229,6 +2338,7 @@ for name, fn in [
     ("deleting a class, order added, double bookings", t_class_edits),
     ("Delete records and freed numbers", t_master_delete),
     ("Delete records inside a year or month", t_delete_by_period),
+    ("renaming a subject", t_rename_subject),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

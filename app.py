@@ -818,6 +818,8 @@ def _import_upload_panel() -> None:
     preview = schedule_backfill.restrict_to_months(
         preview, [tuple(map(int, key.split("-"))) for key in chosen_months]
     )
+    # A subject renamed in the app still has its old name in the teacher's sheet.
+    preview = schedule_backfill.use_subject_spellings(preview, teacher_id)
     preview["name_reviews"] = schedule_backfill.mark_names_on_file(preview["name_reviews"])
     # The questions below are numbered within the chosen months, so their answers
     # mustn't carry over to a different choice of months.
@@ -1394,12 +1396,33 @@ def _teacher_drilldown(teachers: list[dict]) -> None:
     # Pricing is all in the section above, which already lists every subject with
     # its price and where it came from. This part used to repeat it, badly, showing
     # the $1 import placeholder as if someone had chosen it. What's left here is the
-    # one thing that section can't do: list one subject's lessons.
-    st.markdown("###### Or list one subject's classes")
+    # one thing that section can't do: list one subject's lessons. And rename it.
+    st.markdown("###### One subject: its classes, or rename it")
+    # After a rename the list shows the new name, so the pick moves to it before the
+    # list is drawn (a widget's value can't be changed once it's on the page).
+    if "teacher_drill_subject_next" in st.session_state:
+        st.session_state["teacher_drill_subject"] = st.session_state.pop("teacher_drill_subject_next")
     subject_choice = st.selectbox("Subject", list(subject_labels), key="teacher_drill_subject")
     class_id = subject_labels[subject_choice]
     class_lessons = sorted(by_class[class_id], key=lambda item: (item["Date"], item["Start"]))
     class_name = class_lessons[0]["Class"]
+
+    # For a typo in the name. Classes, prices and students stay; sent invoices show the
+    # new name; the teacher's sheet can keep the old one, since uploads still match it.
+    rename = st.columns([4, 1], vertical_alignment="bottom")
+    new_name = rename[0].text_input("Rename to", value=class_name, key=f"subject_rename_{class_id}")
+    if rename[1].button("Rename", key=f"subject_rename_go_{class_id}", width="stretch",
+                        disabled=" ".join(new_name.split()) in ("", class_name)):
+        done = db.rename_subject(class_id, new_name)
+        if done["result"] == "renamed":
+            st.session_state["teacher_drill_subject_next"] = f"{done['name']} ({len(class_lessons)} session(s))"
+            _flash(f"Renamed {_subject(class_name)} to {_subject(done['name'])}. Sent invoices show the new "
+                   "name; uploads with the old one still match.")
+            _rerun()
+        elif done["result"] == "duplicate":
+            st.warning("Another subject already has that name.")
+        else:
+            st.warning("Enter a subject name.")
 
     st.markdown(f"###### {_subject(class_name)} — {_when(f'{calendar.month_name[month]} {year}')}")
     # One query for the month's rosters, not two per lesson listed. The Schedule

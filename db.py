@@ -483,6 +483,24 @@ class StudentAlias(Base):
     )
 
 
+class SubjectSpelling(Base):
+    """An old name of a subject, kept when the subject is renamed.
+
+    The teacher's sheet keeps the name it always had. Once "G9 Englsh" is
+    renamed "G9 English", the next upload saying "G9 Englsh" means that
+    subject, not a new one.
+    """
+
+    __tablename__ = "subject_spellings"
+
+    id = Column(Integer, primary_key=True)
+    class_id = Column(Integer, ForeignKey("classes.id"), nullable=False)
+    spelling = Column(String(150), nullable=False)
+    created_at = Column(
+        DateTime, nullable=False, server_default=func.current_timestamp()
+    )
+
+
 class DistinctStudents(Base):
     """Two students the admin said are different children, however alike their names.
 
@@ -1549,7 +1567,7 @@ def update_scheduling_class(
         if duplicate:
             return "duplicate"
 
-        academy_class.name = cleaned_name
+        _apply_subject_name(session, academy_class, cleaned_name)
         academy_class.display_color = display_color.upper()
 
         old_enrolments = session.scalars(
@@ -2337,6 +2355,87 @@ def name_subjects(names):
             outcome[class_id] = ("named", cleaned)
         session.commit()
     return {"outcome": outcome, "relabelled": relabelled}
+
+
+def _apply_subject_name(session, academy_class, new_name) -> int:
+    """Give a subject a new name, keeping the old one for uploads. Returns invoice lines relabelled.
+
+    Invoice lines and credits that carry the old name take the new one, so a
+    copy sent again reads properly and the invoice isn't listed as changed
+    since it went out. Only that label changes, never an amount, date or
+    price. The caller checks the name is free and commits.
+    """
+    from schedule_parser import UNNAMED_CLASS
+
+    old = academy_class.name
+    if old == new_name:
+        return 0
+    spellings = session.scalars(
+        select(SubjectSpelling).where(SubjectSpelling.class_id == academy_class.id)).all()
+    # Going back to an old name makes it the subject's own again, not an old spelling.
+    for row in spellings:
+        if _alias_key(row.spelling) == _alias_key(new_name):
+            session.delete(row)
+    # A placeholder for a class the sheet never named isn't worth keeping: the upload
+    # asks for those names each time. Nor is a change of capitals only, since uploads
+    # ignore capitals anyway.
+    if (not old.startswith(UNNAMED_CLASS) and _alias_key(old) != _alias_key(new_name)
+            and not any(_alias_key(row.spelling) == _alias_key(old) for row in spellings)):
+        session.add(SubjectSpelling(class_id=academy_class.id, spelling=_fit(old, SubjectSpelling.spelling)))
+    academy_class.name = new_name
+
+    lessons = select(ClassSession.id).where(ClassSession.class_id == academy_class.id)
+    items = session.scalars(select(InvoiceItem).where(
+        InvoiceItem.session_id.in_(lessons), InvoiceItem.class_name == _fit(old, InvoiceItem.class_name))).all()
+    for item in items:
+        item.class_name = _fit(new_name, InvoiceItem.class_name)
+    for credit in session.scalars(select(Credit).where(
+            Credit.session_id.in_(lessons), Credit.class_name == _fit(old, Credit.class_name))).all():
+        credit.class_name = _fit(new_name, Credit.class_name)
+    return len(items)
+
+
+def rename_subject(class_id, new_name) -> dict:
+    """Rename a subject everywhere it shows. Returns {"result", "name", "relabelled"}.
+
+    Its classes, prices and students stay as they are. Sent invoices show
+    the new name, amounts unchanged. The old name is kept, so the teacher's
+    sheet that still says it lands on this subject at the next upload. Names
+    are unique across the academy, ignoring capitals. The result is
+    "renamed", "unchanged", "duplicate", "invalid" or "not_found".
+    """
+    from schedule_parser import UNNAMED_CLASS
+
+    cleaned = _fit(" ".join(str(new_name or "").split()), AcademyClass.name)
+    with SessionLocal() as session:
+        academy_class = session.get(AcademyClass, int(class_id))
+        if academy_class is None:
+            return {"result": "not_found"}
+        if not cleaned or cleaned.startswith(UNNAMED_CLASS):
+            return {"result": "invalid"}
+        if cleaned == academy_class.name:
+            return {"result": "unchanged", "name": cleaned, "relabelled": 0}
+        if session.scalar(select(AcademyClass.id).where(
+                func.lower(AcademyClass.name) == cleaned.lower(), AcademyClass.id != academy_class.id)):
+            return {"result": "duplicate"}
+        relabelled = _apply_subject_name(session, academy_class, cleaned)
+        session.commit()
+        return {"result": "renamed", "name": cleaned, "relabelled": relabelled}
+
+
+def get_subject_spellings(teacher_id) -> dict[str, str]:
+    """Return a teacher's subjects' old names: {old name in lower case: the subject's name now}."""
+    if not teacher_id:
+        return {}
+    with SessionLocal() as session:
+        return {
+            _alias_key(spelling): name
+            for spelling, name in session.execute(
+                select(SubjectSpelling.spelling, AcademyClass.name)
+                .join(AcademyClass, AcademyClass.id == SubjectSpelling.class_id)
+                .where(AcademyClass.teacher_id == int(teacher_id))
+            ).all()
+        }
 
 
 def find_duplicate_students():
@@ -5636,6 +5735,7 @@ def _master_plan(session, teacher_ids, student_ids, class_ids, invoice_ids, less
                     | _ids_where(session, Enrolment.id, Enrolment.student_id, students)),
         ClassSchedule: _ids_where(session, ClassSchedule.id, ClassSchedule.class_id, classes),
         ClassRate: _ids_where(session, ClassRate.id, ClassRate.class_id, classes),
+        SubjectSpelling: _ids_where(session, SubjectSpelling.id, SubjectSpelling.class_id, classes),
         ScheduleImport: uploads,
         LessonHistory: history,
         StudentAlias: _ids_where(session, StudentAlias.id, StudentAlias.student_id, students),
@@ -5682,6 +5782,7 @@ def _master_summary(plan) -> dict:
         ("Enrolments", other[Enrolment]),
         ("Weekly times", other[ClassSchedule]),
         ("Subject prices", other[ClassRate]),
+        ("Old subject names", other[SubjectSpelling]),
         ("Upload records", other[ScheduleImport]),
         ("Past schedules (student-lessons)", other[LessonHistory]),
         ("Other spellings of names", other[StudentAlias]),
@@ -5969,7 +6070,7 @@ def master_delete(teacher_ids=(), student_ids=(), class_ids=(), invoice_ids=(),
         _delete_ids(session, InvoiceItem, plan["items"])
         _delete_ids(session, Invoice, plan["invoices"])
         _delete_ids(session, SessionAttendance, plan["attendance"])
-        for model in (Enrolment, ClassSchedule, ClassRate):
+        for model in (Enrolment, ClassSchedule, ClassRate, SubjectSpelling):
             _delete_ids(session, model, plan["other"][model])
         _delete_ids(session, ClassSession, plan["lessons"])
         _delete_ids(session, AcademyClass, plan["classes"])

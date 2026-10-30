@@ -110,6 +110,31 @@ def teacher_subjects(teacher_id: int | None) -> set[str]:
     return set(_teacher_classes(teacher)) if teacher else set()
 
 
+def use_subject_spellings(preview: dict[str, Any], teacher_id: int | None) -> dict[str, Any]:
+    """Return the upload with a renamed subject's old name swapped for its name now.
+
+    The teacher's sheet still says "G9 Englsh" after the subject was renamed
+    "G9 English". Left alone, the upload would make "G9 Englsh" a new subject
+    and take those classes off the renamed one. A name that is one of the
+    teacher's subjects now is left as it is.
+    """
+    spellings = db.get_subject_spellings(teacher_id)
+    if not spellings:
+        return preview
+    current = teacher_subjects(teacher_id)
+
+    def now(name: str) -> str:
+        if name.casefold() in current:
+            return name
+        return spellings.get(" ".join(name.split()).casefold(), name)
+
+    return {**preview, "sessions": [
+        session if now(session["class_name"]) == session["class_name"]
+        else {**session, "class_name": now(session["class_name"])}
+        for session in preview.get("sessions") or []
+    ]}
+
+
 def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[dict[str, Any]]:
     """Find subjects in one workbook that are the same class typed two ways.
 
@@ -576,6 +601,7 @@ def backfill(
 
 def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches, dates):
     """Do the import for backfill(), which holds the lock. Returns what was created and changed."""
+    preview = use_subject_spellings(preview, teacher_id)
     sessions = preview.get("sessions") or []
     if not sessions:
         return {"status": "empty"}
@@ -882,6 +908,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     has a class then) and skipped (another teacher's subject has that name).
     """
     today = today or dt.date.today()
+    preview = use_subject_spellings(preview, teacher_id)
     sessions, _ = _final_sessions(preview.get("sessions") or [], name_overrides or {})
     counts: dict[tuple[int, int], Counter] = defaultdict(Counter)
     teacher = next((t for t in db.get_all_teachers() if t["ID"] == teacher_id), None)
