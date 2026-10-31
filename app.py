@@ -914,7 +914,8 @@ def _import_upload_panel() -> None:
             }.get(candidate["reason"], "similar spelling")
             choice = st.radio(
                 f"{_student(candidate['parsed_name'])} — {reason_text} to existing "
-                f"student {_student(candidate['existing_name'])}",
+                f"student {_student(candidate['existing_name'])}"
+                + (" — they're in the same class in this sheet" if candidate.get("together") else ""),
                 ["New / different person", f"Same as {_student(candidate['existing_name'])}"],
                 index=1 if candidate.get("likely_same") else 0,
                 horizontal=True,

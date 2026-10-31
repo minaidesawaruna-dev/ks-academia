@@ -290,10 +290,25 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
 
     Each one becomes a question for the admin, instead of quietly merging or
     quietly creating a second student. A name that matches a student exactly
-    (ignoring case) isn't asked about.
+    (ignoring case) isn't asked about. Two names written in one class cell of
+    this upload are two children, so that question always starts on "new" and
+    is marked "together". A name in the marks column beside the class doesn't
+    count: "Yerin" in the class and "Seo Yerin" beside it is one child.
     """
     existing = db.get_all_students()
-    exact = {item["Name"].casefold() for item in existing} | set(db.get_student_aliases())
+    aliases = db.get_student_aliases()
+    exact = {item["Name"].casefold() for item in existing} | set(aliases)
+    spellings: dict[int, set[str]] = defaultdict(set)
+    for item in existing:
+        spellings[item["ID"]].add(item["Name"].casefold())
+    for alias, student_id in aliases.items():
+        spellings[student_id].add(alias)
+    classmates: dict[str, set[str]] = defaultdict(set)
+    for session in sessions:
+        here = {entry["student_name"].casefold() for entry in session["attendance"]
+                if entry.get("source") == session.get("coordinate")}
+        for key in here:
+            classmates[key] |= here - {key}
     # The teacher's own students, for names they shorten: their "Hana" means their
     # Park Hana, not every Hana in the academy.
     rosters = db.get_teacher_rosters(teacher_id) if teacher_id else {}
@@ -420,6 +435,10 @@ def suggest_student_matches(sessions: list[dict[str, Any]], teacher_id: int | No
             )
             candidates.append(best)
 
+    for item in candidates:
+        if classmates[item["parsed_name"].casefold()] & spellings[item["existing_id"]]:
+            item["likely_same"] = False
+            item["together"] = True
     candidates.sort(key=lambda item: -item["similarity"])
     return candidates
 

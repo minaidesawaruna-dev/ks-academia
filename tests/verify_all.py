@@ -2309,6 +2309,65 @@ def t_delete_all_time():
     return "one click to any year and month; a student with no classes shows"
 
 
+_SAME_LESSON_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(day, names):
+    return {"date": dt.date(2026, 9, day), "class_name": "G9 Test Eng", "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+def ask(sessions):
+    return [[c["parsed_name"], c["existing_name"], c["likely_same"], c.get("together", False)]
+            for c in sb.suggest_student_matches(sessions, teacher)]
+
+sb.backfill({"sessions": [lesson(7, ["Hayun Kim", "Seo Yerin"])]}, teacher)
+hayun = next(s["ID"] for s in db.get_all_students() if s["Name"] == "Hayun Kim")
+db.remember_student_aliases([(hayun, "H Y Kim")])
+print(json.dumps({
+    "apart": ask([lesson(14, ["Kim Hayun"])]),
+    "together": ask([lesson(14, ["Hayun Kim", "Kim Hayun"])]),
+    "short": ask([lesson(14, ["Yerin", "Seo Yerin"])]),
+    # Written in full only in the marks column beside the class: one child, marked.
+    "marks_column": ask([dict(lesson(14, ["Yerin"]), coordinate="B3",
+                              attendance=[{"student_name": "Yerin", "status": "Attending", "source": "B3"},
+                                          {"student_name": "Seo Yerin", "status": "Cancelled", "source": "C3"}])]),
+    "by_old_spelling": ask([lesson(14, ["H Y Kim", "Kim Hayun"])]),
+    "other_lesson": ask([lesson(14, ["Kim Hayun"]), lesson(21, ["Hayun Kim"])]),
+}))
+"""
+
+
+def t_same_lesson_not_same_child():
+    """Two names written in one class cell are two children, so the upload never starts on "same".
+
+    Whole-workbook name questions and the merge search already knew this. The
+    question against students on file didn't, and agreeing to it would drop
+    one child from the class. A student's old spelling counts too. A name in
+    the marks column beside the class doesn't: that's usually the same child
+    written in full, as is a name in different lessons, so those start as before.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "lesson.db").replace("\\", "/")
+        result = run(["-c", _SAME_LESSON_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["apart"] == [["Kim Hayun", "Hayun Kim", True, False]], got["apart"]
+    assert got["together"] == [["Kim Hayun", "Hayun Kim", False, True]], got["together"]
+    assert got["short"] == [["Yerin", "Seo Yerin", False, True]], got["short"]
+    assert got["marks_column"] == [["Yerin", "Seo Yerin", True, False]], got["marks_column"]
+    assert got["by_old_spelling"] == [["Kim Hayun", "Hayun Kim", False, True]], got["by_old_spelling"]
+    assert got["other_lesson"] == [["Kim Hayun", "Hayun Kim", True, False]], got["other_lesson"]
+    return "two names in one class cell start on new, old spellings too; marks column and other lessons unchanged"
+
+
 _RENAME_SUBJECT_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from sqlalchemy import event, select
@@ -2841,6 +2900,7 @@ for name, fn in [
     ("renaming a subject", t_rename_subject),
     ("classes not added name their cells", t_not_added_names_cells),
     ("Delete records: all time in one click", t_delete_all_time),
+    ("two names in one lesson aren't one child", t_same_lesson_not_same_child),
     ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),
     ("editing a month on Create/Edit schedule", t_edit_month_in_app),
