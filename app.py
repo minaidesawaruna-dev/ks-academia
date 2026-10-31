@@ -5215,16 +5215,27 @@ def delete_records_tab() -> None:
     # The cards' coloured edges, and picked names in each box in their badge colours.
     st.markdown(_CARD_STYLE + _PICK_STYLE, unsafe_allow_html=True)
 
-    when = st.columns(2)
+    when = st.columns([2, 2, 1], vertical_alignment="bottom")
     today = dt.date.today()
     years = [0] + list(range(today.year + 1, 2019, -1))
-    year = when[0].selectbox("Year", years, index=years.index(today.year),
-                             format_func=lambda value: str(value) if value else "Any year",
-                             key=f"delete_year_{generation}")
-    month = when[1].selectbox("Month", [0] + list(range(1, 13)), index=today.month,
+    year_key, month_key = f"delete_year_{generation}", f"delete_month_{generation}"
+    # Set here, not as the boxes' defaults: the All time button changes them.
+    st.session_state.setdefault(year_key, today.year)
+    st.session_state.setdefault(month_key, today.month)
+
+    def all_time() -> None:
+        """Set the year and month to any, leaving the picks as they are."""
+        st.session_state[year_key] = 0
+        st.session_state[month_key] = 0
+
+    year = when[0].selectbox("Year", years, format_func=lambda value: str(value) if value else "Any year",
+                             key=year_key)
+    month = when[1].selectbox("Month", [0] + list(range(1, 13)),
                               format_func=lambda value: calendar.month_name[value] if value else "Any month",
-                              key=f"delete_month_{generation}")
+                              key=month_key)
     whole = not year and not month
+    when[2].button("All time", key=f"delete_all_time_{generation}", on_click=all_time, disabled=whole,
+                   width="stretch")
     choices = db.get_delete_choices(year or None, month or None)
     if year and month:
         period = f"{calendar.month_name[month]} {year}"

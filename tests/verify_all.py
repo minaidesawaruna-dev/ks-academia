@@ -2246,6 +2246,69 @@ def t_database_check_covers_columns():
     return "skipped on ordinary clicks; runs again for a new column without a restart"
 
 
+_DELETE_ALL_TIME_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+sb.backfill({"sessions": [{"date": dt.date(2024, 3, 4), "class_name": "G9 Test Eng", "start_time": dt.time(16),
+                           "end_time": dt.time(18), "warnings": [],
+                           "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}]}, teacher)
+db.create_student("Demo Student")
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Delete records"
+at.run()
+today = dt.date.today()
+
+def shown():
+    return {"year": at.session_state["delete_year_0"], "month": at.session_state["delete_month_0"],
+            "students": sorted(at.multiselect(key="delete_students_0").options),
+            "button_off": at.button(key="delete_all_time_0").disabled}
+
+result = {"start": shown(), "today": [today.year, today.month]}
+at.button(key="delete_all_time_0").click().run()
+result["after"] = shown()
+result["errors"] = [e.value for e in at.exception]
+result["warnings"] = [w.value for w in at.warning if "default value" in w.value]
+print(json.dumps(result))
+"""
+
+
+def t_delete_all_time():
+    """All time on Delete records clears the year and month in one click.
+
+    A student with no classes is in no period, so they only show with any
+    year and any month. The button sets both and then turns off, with no
+    warning about the boxes' defaults.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "alltime.db").replace("\\", "/")
+        result = run(["-c", _DELETE_ALL_TIME_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [] and got["warnings"] == [], got
+    start, after = got["start"], got["after"]
+    assert [start["year"], start["month"]] == got["today"] and not start["button_off"], start
+    assert not any("Demo Student" in name for name in start["students"]), start["students"]
+    assert after["year"] == 0 and after["month"] == 0 and after["button_off"], after
+    assert any("Demo Student" in name for name in after["students"]), after["students"]
+    return "one click to any year and month; a student with no classes shows"
+
+
 _RENAME_SUBJECT_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from sqlalchemy import event, select
@@ -2777,6 +2840,7 @@ for name, fn in [
     ("Delete records where a student and classes meet", t_delete_where_they_meet),
     ("renaming a subject", t_rename_subject),
     ("classes not added name their cells", t_not_added_names_cells),
+    ("Delete records: all time in one click", t_delete_all_time),
     ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),
     ("editing a month on Create/Edit schedule", t_edit_month_in_app),
