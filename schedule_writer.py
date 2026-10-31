@@ -8,7 +8,8 @@ the Teachers screen can read it back with no changes:
 * Row 1 has a day label such as "3(TUE)" over two columns for each day.
   The class goes in the first column; the second is left for the teacher
   to write Online, Recording or Cancelled and the names.
-* Column A is the half-hour time axis, repeated before every Monday.
+* Column A is the half-hour time axis, repeated before every Monday. It
+  runs from the month's first lesson to the end of its last.
 * Each class is a coloured block down its time rows:
 
       G11 Chem HL B
@@ -36,6 +37,8 @@ from openpyxl.utils import get_column_letter
 import schedule_parser
 
 SLOT_MINUTES = 30
+# The upload only takes a column for the time axis if it holds at least three times.
+MIN_SLOTS = 3
 # Light colours so black text stays readable. Each subject keeps one colour for the month.
 PALETTE = ["FFF2CC", "E0F7FA", "E8F5E9", "FCE4EC", "EDE7F6",
            "FFF3E0", "E3F2FD", "F1F8E9", "FBE9E7", "E0F2F1"]
@@ -96,9 +99,11 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
          if lesson["date"].year == year and lesson["date"].month == month and lesson["start"] < lesson["end"]),
         key=lambda lesson: (lesson["date"], lesson["start"], lesson["end"], lesson["subject"]),
     )
-    first = min([_minutes(DAY_START)] + [_minutes(lesson["start"]) // SLOT_MINUTES * SLOT_MINUTES
-                                         for lesson in lessons])
-    last = max([_minutes(DAY_END)] + [_minutes(lesson["end"]) for lesson in lessons])
+    # The rows run from the month's first lesson to the end of its last, so a month of
+    # evening classes doesn't open on a screen of empty mornings.
+    first = min((_minutes(lesson["start"]) // SLOT_MINUTES * SLOT_MINUTES for lesson in lessons),
+                default=_minutes(DAY_START))
+    last = max((_minutes(lesson["end"]) for lesson in lessons), default=_minutes(DAY_END))
 
     # Work out each lesson's rows: one row per half hour from `first`. If a lesson
     # would overlap the previous block that day, push it down below that block.
@@ -111,7 +116,7 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
         bottom = max(bottom, top)
         by_day[lesson["date"]] = bottom
         placed.append((lesson, top, bottom))
-    slots = max([(last - first) // SLOT_MINUTES] + [bottom + 1 for _, _, bottom in placed])
+    slots = max([MIN_SLOTS, (last - first) // SLOT_MINUTES] + [bottom + 1 for _, _, bottom in placed])
 
     # Columns: the time axis, then two columns per day, with the axis repeated before each Monday.
     workbook = Workbook()

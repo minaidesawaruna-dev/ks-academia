@@ -1997,13 +1997,26 @@ def update_schedule_session(
     return "updated"
 
 
+def get_credited_places(lesson_ids):
+    """Return (lesson id, student id) for every credit on these lessons."""
+    if not lesson_ids:
+        return set()
+    with SessionLocal() as session:
+        return {(lesson_id, student_id) for lesson_id, student_id in session.execute(
+            select(Credit.session_id, Credit.student_id).where(Credit.session_id.in_(list(lesson_ids)))
+        )}
+
+
 def add_students_to_lessons(lesson_ids, student_ids):
     """Put students on each of these lessons they aren't on yet.
 
     Everyone already there keeps their marks, note and paid tick. Each lesson
-    saves the usual way, so open invoices pick the new students up. Returns
-    (places added, lessons that couldn't be saved).
+    saves the usual way, so open invoices pick the new students up. A student
+    with a credit for a lesson was taken off it after billing, so they stay
+    off: putting them back would cancel the credit. Returns (places added,
+    lessons that couldn't be saved).
     """
+    credited = get_credited_places(lesson_ids)
     added, refused = 0, 0
     for lesson_id in lesson_ids:
         detail = get_schedule_session(lesson_id)
@@ -2012,7 +2025,8 @@ def add_students_to_lessons(lesson_ids, student_ids):
             continue
         rows = detail.get("Attendance", [])
         on_lesson = {row["student_id"] for row in rows}
-        new = [student_id for student_id in student_ids if student_id not in on_lesson]
+        new = [student_id for student_id in student_ids
+               if student_id not in on_lesson and (lesson_id, student_id) not in credited]
         if not new:
             continue
         outcome = update_schedule_session(

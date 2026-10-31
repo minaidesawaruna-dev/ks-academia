@@ -2026,9 +2026,14 @@ sent = next(row["Invoice ID"] for row in db.get_open_invoice_items_for_month(202
 db.issue_invoice_for_month(sent, 2026, 9)
 before = db.get_invoice(sent)["Total"]
 
+# Taken off a billed class: credited, so Repeat must leave them off it.
+last = db.get_schedule_session(english[2])
+kept = [row for row in last["Attendance"] if row["student_id"] != ids["Oh Minseok"]]
+assert db.update_schedule_session(english[2], last["Date"], last["Start"], last["End"], last["Status"], "", kept) == "updated"
+
 result = {"first": db.add_students_to_lessons(english, [ids["Oh Minseok"]]), "rosters": rosters(),
           "new_lines": lines("Oh Minseok"), "sent_same": db.get_invoice(sent)["Total"] == before,
-          "credits": len(db.get_credits())}
+          "credits": [[c["Student"], str(c["Class date"])] for c in db.get_credits()]}
 result["again"] = db.add_students_to_lessons(english, [ids["Oh Minseok"]])
 print(json.dumps(result))
 """
@@ -2039,7 +2044,8 @@ def t_repeat_students():
 
     The student goes in where they're missing, after those already there, whose
     marks stay. Other subjects aren't touched. A sent invoice doesn't change: the
-    classes added go on the next one. Repeating again adds nothing.
+    classes added go on the next one. A class they were taken off after billing
+    stays that way, or their credit would be cancelled. Repeating again adds nothing.
     """
     import json
     import tempfile
@@ -2054,11 +2060,11 @@ def t_repeat_students():
         ["2026-09-07", "G9 Test Eng", [["Nam Jihoon", False], ["Oh Minseok", False]]],
         ["2026-09-09", "G9 Test Math", [["Seo Yerin", False]]],
         ["2026-09-14", "G9 Test Eng", [["Nam Jihoon", True], ["Oh Minseok", False]]],
-        ["2026-09-21", "G9 Test Eng", [["Nam Jihoon", False], ["Oh Minseok", False]]],
+        ["2026-09-21", "G9 Test Eng", [["Nam Jihoon", False]]],
         ["2026-09-22", "G9 Test Math", [["Seo Yerin", False]]]], got["rosters"]
     assert got["new_lines"] == ["2026-09-07", "2026-09-14"], got["new_lines"]
-    assert got["sent_same"] and got["credits"] == 0, got
-    return "filled in where missing, marks kept, other subjects untouched, sent invoice unchanged, new classes on the next"
+    assert got["sent_same"] and got["credits"] == [["Oh Minseok", "2026-09-21"]], got
+    return "filled in where missing, marks kept, other subjects untouched, sent invoice and credits intact"
 
 
 _UNNAMED_ROWS_SCRIPT = r"""
@@ -2398,6 +2404,79 @@ def t_same_lesson_not_same_child():
     assert got["by_old_spelling"] == [["Kim Hayun", "Hayun Kim", False, True]], got["by_old_spelling"]
     assert got["other_lesson"] == [["Kim Hayun", "Hayun Kim", True, False]], got["other_lesson"]
     return "two names in one class cell start on new, old spellings too; marks column and other lessons unchanged"
+
+
+_INVOICE_SEARCH_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+today = dt.date.today()
+sb.backfill({"sessions": [{"date": today, "class_name": "G9 Test Eng", "start_time": dt.time(16), "end_time": dt.time(18),
+                           "warnings": [], "attendance": [{"student_name": n, "status": "Attending"}
+                                                          for n in ("Nam Jihoon", "Oh Minseok", "Seo Yerin")]}]}, teacher)
+sent = next(r["Invoice ID"] for r in db.get_open_invoice_items_for_month(today.year, today.month) if r["Student"] == "Oh Minseok")
+db.issue_invoice_for_month(sent, today.year, today.month)
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Invoices"
+at.run()
+
+def ticks():
+    return sorted(box.label.split("]")[0].split("[")[-1] for box in at.checkbox if box.key.startswith("inv_pick_"))
+
+def all_box():
+    return next(box.label for box in at.checkbox if box.key == "invoice_select_all")
+
+result = {"everyone": ticks(), "everyone_all": all_box()}
+at.text_input(key="invoice_find").set_value("  SEO ").run()
+result["one"] = ticks()
+result["one_all"] = all_box()
+at.text_input(key="invoice_find").set_value("oh").run()
+result["sent_only"] = ticks()
+result["button"] = [b.label for b in at.button if b.key == "invoice_find_sent"]
+at.button(key="invoice_find_sent").click().run()
+result["opened"] = [at.session_state["invoice_reference_open"], at.session_state["issued_search"],
+                    at.session_state["invoice_show_issued"]]
+at.text_input(key="invoice_find").set_value("zzz").run()
+result["nobody"] = [ticks(), any("matches that name" in c.value for c in at.caption)]
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_invoice_search():
+    """Typing a name on Invoices narrows the month's list, and finds an invoice already sent.
+
+    Capitals and stray spaces don't matter. "All" counts only who's showing,
+    so it can't send anyone hidden. A name with nothing left to bill offers a
+    button that opens their sent invoices.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "search.db").replace("\\", "/")
+        result = run(["-c", _INVOICE_SEARCH_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["everyone"] == ["Nam Jihoon", "Seo Yerin"] and got["everyone_all"] == "All 2", got
+    assert got["one"] == ["Seo Yerin"] and got["one_all"] == "All 1", got
+    assert got["sent_only"] == [] and got["button"] == ["Show 1 sent invoice(s)"], got
+    assert got["opened"] == [True, "oh", True], got["opened"]
+    assert got["nobody"] == [[], True], got["nobody"]
+    return "narrows the month's list, All counts only who's showing, sent invoices one click away"
 
 
 _RENAME_SUBJECT_SCRIPT = r"""
@@ -2937,6 +3016,7 @@ for name, fn in [
     ("rows of subjects with no name", t_unnamed_subject_rows),
     ("a month exported from Schedule", t_month_export),
     ("Repeat fills a student across the month", t_repeat_students),
+    ("finding a student on Invoices", t_invoice_search),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),

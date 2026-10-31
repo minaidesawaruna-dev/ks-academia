@@ -2193,14 +2193,17 @@ def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) ->
 def _repeat_row(lesson_id: int, detail: dict, month_lessons: list) -> None:
     """Offer to fill students on this class into every class of its subject that month.
 
-    Cancelled classes are left out. Someone just added here starts picked, so
-    adding a student and repeating them is one more click.
+    Cancelled classes are left out, and so is a class a student has a credit
+    for: they were taken off it after billing. Someone just added here starts
+    picked, so adding a student and repeating them is one more click.
     """
     day = db.as_date(detail["Date"])
     others = [item for item in month_lessons
               if item["Class ID"] == detail["Class ID"] and item["ID"] != lesson_id
               and item["Status"] != "Cancelled"]
-    seated = {item["ID"]: {row["student_id"] for row in item["Attendance"]} for item in others}
+    credited = db.get_credited_places([item["ID"] for item in others])
+    seated = {item["ID"]: {row["student_id"] for row in item["Attendance"]}
+              | {student_id for lesson, student_id in credited if lesson == item["ID"]} for item in others}
     missing = {row["student_id"]: row["student_name"] for row in detail.get("Attendance", [])
                if any(row["student_id"] not in seated[item["ID"]] for item in others)}
     if not missing:
@@ -2213,6 +2216,10 @@ def _repeat_row(lesson_id: int, detail: dict, month_lessons: list) -> None:
                      key=lambda item: db.as_date(item["Date"]))
     if chosen:
         st.caption("Fills in: " + _chips("when", [f"{db.as_date(item['Date']):%d %b}" for item in targets], most=12))
+        kept_off = [f"{db.as_date(item['Date']):%d %b}" for item in others
+                    if any((item["ID"], key) in credited for key in chosen)]
+        if kept_off:
+            st.caption("Left out, already credited: " + _chips("when", kept_off, most=12))
         booked = [
             clash for item in targets
             for clash in db.find_student_clashes(
@@ -2780,7 +2787,25 @@ def _invoice_table(invoice: dict) -> None:
     )
 
 
-def _just_issued_panel(year: int, month: int) -> None:
+def _invoice_search() -> str:
+    """Ask which student to find, and return what was typed in lower case.
+
+    It narrows this month's lists. Someone already billed isn't on those, so
+    a button goes straight to their sent invoices, further down the screen.
+    """
+    needle = st.text_input("Find a student", key="invoice_find",
+                           placeholder="Type part of a name").strip().casefold()
+    if needle:
+        sent = sum(needle in item["Student"].casefold() for item in db.get_invoices(status="Issued"))
+        if sent and st.button(f"Show {sent} sent invoice(s)", key="invoice_find_sent"):
+            st.session_state["invoice_reference_open"] = True
+            st.session_state["issued_search_next"] = needle
+            st.session_state["invoice_jump_to_lookup"] = True
+            _rerun()
+    return needle
+
+
+def _just_issued_panel(year: int, month: int, needle: str = "") -> None:
     """Show what was just issued, and a way to send those invoices to parents.
 
     It sits at the bottom of the screen, not the top: issuing makes a long
@@ -2796,7 +2821,7 @@ def _just_issued_panel(year: int, month: int) -> None:
     if not batch or tuple(batch.get("period", ())) != (year, month):
         return
     ids = batch.get("ids") or []
-    details = db.get_invoices_detailed(ids)
+    details = [item for item in db.get_invoices_detailed(ids) if needle in item["Student"].casefold()]
     if not details:
         return
 
@@ -3077,6 +3102,7 @@ def _issued_lookup_section(counts: dict) -> None:
     # opened, like the open list above.
     if not counts["issued_count"]:
         return
+    _anchor("issued-lookup")
     st.markdown(f"#### Issued invoices ({counts['issued_count']})")
     # Set by "Edit" on the warning above, or by saving a replacement: the invoice to
     # open, set before the widgets it fills are drawn.
@@ -3087,6 +3113,8 @@ def _issued_lookup_section(counts: dict) -> None:
         st.session_state.pop("issued_pick", None)
     if not st.checkbox("Look one up", key="invoice_show_issued"):
         return
+    if st.session_state.pop("invoice_jump_to_lookup", False):
+        _scroll_to("issued-lookup", st.session_state.get("issued_search", ""))
     with st.container():
         # A void invoice is still one a parent may quote, so it can be found.
         issued = sorted(
@@ -3811,6 +3839,7 @@ def invoices_tab() -> None:
     st.caption(trail)
     _next_number_control()
     _out_of_step_warning()
+    needle = _invoice_search()
 
     month_items = db.get_open_invoice_items_for_month(year, month)
     # Only warn when something is about to go out. A month that's fully billed has
@@ -3819,8 +3848,11 @@ def invoices_tab() -> None:
         _unpriced_warning(year, month)
         _unnamed_subjects("invoices", year, month)
 
+    shown_items = [row for row in month_items if needle in row["Student"].casefold()]
     if not month_items:
         st.info(f"Nothing left to bill for {_when(period)}.")
+    elif not shown_items:
+        st.caption(f"Nobody to bill for {_when(period)} matches that name.")
     else:
         # A form, as on Payments: ticking is instant, and the button is above the list
         # instead of below every student.
@@ -3829,16 +3861,16 @@ def invoices_tab() -> None:
                 "Send ticked invoices", type="primary", key="invoice_bulk_issue", width="stretch",
                 help="Bills this month only, then makes one image per student to send on KakaoTalk.",
             )
-            every = st.checkbox(f"All {len(month_items)}", key="invoice_select_all")
+            every = st.checkbox(f"All {len(shown_items)}", key="invoice_select_all")
             ticked = {
                 row["Invoice ID"]: st.checkbox(
                     f"{_student(row['Student'])} — {row['Classes']} class(es), {_money(row['Month Amount'])}",
                     key=f"inv_pick_{row['Invoice ID']}",
                 )
-                for row in month_items
+                for row in shown_items
             }
         if send:
-            selected_ids = [row["Invoice ID"] for row in month_items
+            selected_ids = [row["Invoice ID"] for row in shown_items
                             if every or ticked.get(row["Invoice ID"])]
             if selected_ids:
                 _send_invoices(selected_ids, year, month)
@@ -3847,7 +3879,7 @@ def invoices_tab() -> None:
 
     # Below the month's figures, not above them, and only for the month it was issued
     # for.
-    _just_issued_panel(year, month)
+    _just_issued_panel(year, month, needle)
     _past_invoices_section(counts, year, month)
 
 

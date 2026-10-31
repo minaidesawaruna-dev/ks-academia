@@ -510,6 +510,34 @@ def t_standard_rate_by_grade():
     return "Grade 10 and below $60/h, above $65/h, no grade no price"
 
 
+def t_export_fits_the_lessons():
+    """An exported sheet runs from the first lesson to the last, and still reads back cleanly."""
+    import schedule_writer as sw
+    from openpyxl import load_workbook
+
+    def lesson(day, start, end):
+        """Return one November lesson as the writer takes it."""
+        return {"date": dt.date(2026, 11, day), "start": start, "end": end, "subject": "G9 Test Eng",
+                "students": ["Seo Yerin"], "statuses": {}}
+
+    def rows_of(lessons):
+        """Write a month, then return column A's first and last times and the warnings on reading it."""
+        data = sw.write_month(lessons, 2026, 11)
+        times = [row[0].value for row in load_workbook(io.BytesIO(data)).active.iter_rows(min_row=2, max_col=1)
+                 if row[0].value is not None]
+        assert sw.readback_problems(lessons, data, 2026, 11) == [], lessons
+        return times[0], times[-1], sp.parse_workbook(data, ["Nov"], 2026)["warning_count"]
+
+    assert rows_of([lesson(9, dt.time(19), dt.time(20, 30))]) == (dt.time(19), dt.time(20), 0)
+    assert rows_of([lesson(9, dt.time(9), dt.time(10)), lesson(16, dt.time(19), dt.time(21))])[:2] == (
+        dt.time(9), dt.time(20, 30))
+    assert rows_of([lesson(9, dt.time(19, 15), dt.time(20, 45))])[0] == dt.time(19)
+    # Too few times and the upload wouldn't take column A for the time axis.
+    assert rows_of([lesson(9, dt.time(19), dt.time(19, 30))]) == (dt.time(19), dt.time(20), 0)
+    assert rows_of([]) == (dt.time(9), dt.time(20, 30), 0)
+    return "starts at the first lesson, ends at the last; a short month keeps three rows; an empty one a full day"
+
+
 def t_status_stays_with_student():
     """A status on a student's own line is theirs only; a label line covers those under it."""
     def read(text):
@@ -1068,6 +1096,7 @@ for name, fn in [
     ("class times resolved", t_times_resolved),
     ("attendance statuses applied", t_statuses_applied),
     ("a status with nobody under it", t_label_with_nobody_under_it),
+    ("an export fits its lessons", t_export_fits_the_lessons),
     ("Korean student parsed", t_korean_student_parsed),
     ("multi-sheet + missing sheet", t_parse_workbook_multi),
     ("backfill suggestions run", t_backfill_suggestions),
