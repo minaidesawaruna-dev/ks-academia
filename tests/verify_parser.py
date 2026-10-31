@@ -531,6 +531,33 @@ def t_status_stays_with_student():
     return "a status on a student's line is theirs; a label line covers those under it"
 
 
+def t_label_with_nobody_under_it():
+    """A status with no student under it, or written with the class, covers the whole lesson."""
+    def read(text):
+        """Return a cell's class lines, and its students with their status and note."""
+        cell = sp.parse_cell(text)
+        return cell["class_lines"], [(e["name"], e["status"], e.get("note")) for e in cell["entries"]]
+    # At the end of the cell, for one student or several.
+    assert read("G9 Math 1:1\n9am-11am\nSeo Yerin\nONLINE")[1] == [("Seo Yerin", sp.ONLINE, None)]
+    assert read("G9 Econs\n4pm-6pm\nSohee\nYerin\nONLINE")[1] == [("Sohee", sp.ONLINE, None),
+                                                                  ("Yerin", sp.ONLINE, None)]
+    # A note after the label doesn't count as a student under it.
+    got = read("G9 Bio\n9am-11am\nSohee\nONLINE\n(10.30 KR time)")[1]
+    assert got == [("Sohee", sp.ONLINE, "10.30 KR time")], got
+    # A student's own status stays, and a label with students under it is left to them.
+    got = read("G9 Bio\n9am-11am\nNam Jihoon(당일취소)\nSohee\nONLINE")[1]
+    assert got == [("Nam Jihoon", sp.CANCELLED, "당일취소"), ("Sohee", sp.ONLINE, None)], got
+    got = read("G9 Bio\n9am-11am\nSohee\nONLINE\nYerin")[1]
+    assert got == [("Sohee", None, None), ("Yerin", sp.ONLINE, None)], got
+    # Written with the class: the lesson is online, and the class name keeps its word.
+    lines, got = read("G12 Chem\nONLINE\n9am-11am\nSohee\nYerin")
+    assert lines == ["G12 Chem", "ONLINE"], lines
+    assert got == [("Sohee", sp.ONLINE, None), ("Yerin", sp.ONLINE, None)], got
+    lines, got = read("Math 1:1(Online)\n9am-11am\nSohee")
+    assert lines == ["Math 1:1(Online)"] and got == [("Sohee", sp.ONLINE, None)], (lines, got)
+    return "a status with nobody under it, or with the class, covers the whole lesson"
+
+
 def t_class_line_order():
     """A class written after the time, or a student above it, is put right."""
     def split(text):
@@ -1040,6 +1067,7 @@ for name, fn in [
     ("day labels -> real dates", t_dates_resolved),
     ("class times resolved", t_times_resolved),
     ("attendance statuses applied", t_statuses_applied),
+    ("a status with nobody under it", t_label_with_nobody_under_it),
     ("Korean student parsed", t_korean_student_parsed),
     ("multi-sheet + missing sheet", t_parse_workbook_multi),
     ("backfill suggestions run", t_backfill_suggestions),

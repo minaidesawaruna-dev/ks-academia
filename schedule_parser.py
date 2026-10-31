@@ -998,9 +998,15 @@ def parse_cell(text: str) -> dict[str, Any]:
             body = class_lines[1:]
             class_lines = class_lines[:1]
 
+    # "G12 Chem / ONLINE / 9am-11am" or "Math 1:1(Online)": the whole lesson was online.
+    # The word stays in the class name, so the subject still matches the one on file.
+    if trailer_status is None and any(status_from_line(line)[0] == ONLINE for line in class_lines):
+        trailer_status = ONLINE
+
     entries: list[dict[str, Any]] = []
     notes: list[str] = []
     current_status: str | None = trailer_status
+    label_at: int | None = None
 
     for line in body:
         if _is_time_line(line):
@@ -1013,6 +1019,7 @@ def parse_cell(text: str) -> dict[str, Any]:
             if not leftover:
                 # A status label on its own line ("Online") applies to the students under it.
                 current_status = status
+                label_at = len(entries)
                 continue
             # Several students on one line: a status word after one of them belongs to that
             # student only ("Minseok 결석, Yerin": only Minseok was absent). A status word at the
@@ -1044,6 +1051,11 @@ def parse_cell(text: str) -> dict[str, Any]:
         for name, note, own_status in _roster_names(line, notes):
             entries.append({"name": name, "status": own_status or current_status,
                             "note": note})
+
+    # A label with no student under it ("Sohee / Yerin / ONLINE") covers the whole lesson.
+    if label_at == len(entries):
+        for entry in entries:
+            entry["status"] = entry["status"] or current_status
 
     return {
         "class_lines": class_lines,
