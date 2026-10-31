@@ -1997,6 +1997,40 @@ def update_schedule_session(
     return "updated"
 
 
+def add_students_to_lessons(lesson_ids, student_ids):
+    """Put students on each of these lessons they aren't on yet.
+
+    Everyone already there keeps their marks, note and paid tick. Each lesson
+    saves the usual way, so open invoices pick the new students up. Returns
+    (places added, lessons that couldn't be saved).
+    """
+    added, refused = 0, 0
+    for lesson_id in lesson_ids:
+        detail = get_schedule_session(lesson_id)
+        if not detail:
+            refused += 1
+            continue
+        rows = detail.get("Attendance", [])
+        on_lesson = {row["student_id"] for row in rows}
+        new = [student_id for student_id in student_ids if student_id not in on_lesson]
+        if not new:
+            continue
+        outcome = update_schedule_session(
+            session_id=lesson_id,
+            session_date=as_date(detail["Date"]),
+            start_time=as_time(detail["Start"]),
+            end_time=as_time(detail["End"]),
+            status=detail["Status"],
+            note=detail.get("Note") or "",
+            attendance_rows=rows + [{"student_id": student_id} for student_id in new],
+        )
+        if outcome == "updated":
+            added += len(new)
+        else:
+            refused += 1
+    return added, refused
+
+
 def _clash_entry(lesson, academy_class, teacher, student) -> dict:
     """Return one side of a clash as a row for the clash table."""
     return {

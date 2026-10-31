@@ -27,7 +27,7 @@ from typing import Any
 
 import db
 from schedule_parser import (
-    ATTENDING, CANCELLED, GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, ONLINE, RECORDING, _bare, _close_spelling,
+    CANCELLED, GRADE_TAG, JUNIOR_RATE, MERGE_THRESHOLD, ONLINE, RECORDING, _bare, _close_spelling,
     _one_letter_apart, _shortened, _suffix, hangul_fit, name_sound, rate_for_grade, standard_rate, without_brackets,
 )
 
@@ -43,7 +43,6 @@ __all__ = [
     "restrict_to_months",
     "plan_import",
     "lessons_on_file",
-    "preview_from_lessons",
 ]
 
 # The price an imported subject gets until someone sets a real one (db rejects $0).
@@ -934,7 +933,7 @@ def mark_names_on_file(reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def lessons_on_file(teacher_id: int | None, year: int, month: int) -> list[dict[str, Any]]:
-    """Return a teacher's month as the app has it, as lessons for Create/Edit schedule.
+    """Return a teacher's month as the app has it, as lessons for their exported sheet.
 
     One per class in date order: date, start, end, subject, the students in
     the order they were added, and each one's mark if they have one
@@ -959,26 +958,6 @@ def lessons_on_file(teacher_id: int | None, year: int, month: int) -> list[dict[
                         "end": db.as_time(lesson["End"]), "subject": lesson["Class"],
                         "students": [row["student_name"] for row in roster], "statuses": statuses})
     return lessons
-
-
-def preview_from_lessons(lessons: list[dict[str, Any]], year: int, month: int) -> dict[str, Any]:
-    """Return planned lessons as an upload that shows every day of the month.
-
-    Saving it is the same as uploading a sheet of that month: the app's month
-    is made to match, a class no longer listed is taken off (credited if
-    invoiced), and everything else is matched as any upload is.
-    """
-    days = calendar.monthrange(year, month)[1]
-    return {
-        "sessions": [
-            {"date": lesson["date"], "class_name": lesson["subject"], "start_time": lesson["start"],
-             "end_time": lesson["end"], "warnings": [],
-             "attendance": [{"student_name": name, "status": (lesson.get("statuses") or {}).get(name, ATTENDING)}
-                            for name in lesson["students"]]}
-            for lesson in lessons
-        ],
-        "dates_shown": [dt.date(year, month, day) for day in range(1, days + 1)],
-    }
 
 
 def plan_import(preview: dict[str, Any], teacher_id: int | None,

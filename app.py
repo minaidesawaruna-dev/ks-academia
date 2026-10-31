@@ -1,13 +1,12 @@
 """KS Academia: the admin app for schedules, invoices and payments.
 
-Ten screens:
+Nine screens:
 
 * Teachers: upload a teacher's Excel schedule (the main way lessons get
   into the app), price a month's subjects, and list or rename one subject.
 * Students: who had a lesson in a month, and what it comes to.
-* Schedule: the month grid, for one-off fixes by hand.
-* Create/Edit schedule: plan a teacher's month, or edit one the app has,
-  save it to the app and download it as their sheet.
+* Schedule: the month grid: add and edit classes by hand, and export a
+  month as the teacher's sheet.
 * Invoices: bill students for a month's lessons.
 * Payments: record what parents have paid, in full or in part.
 * Credits: lessons invoiced and then missed, which come off the next invoice.
@@ -27,7 +26,6 @@ from __future__ import annotations
 
 import calendar
 import copy
-import difflib
 import datetime as dt
 import io
 import os
@@ -710,8 +708,7 @@ def _not_added_panel(lessons: list[dict]) -> None:
         st.dataframe(
             _coloured([
                 {
-                    # A month planned in the app has no workbook behind it, so no cell.
-                    **({"Cell": item["cell"]} if item.get("cell") else {}),
+                    "Cell": item.get("cell") or "",
                     "Date": f"{item['date']:%a %d %b %Y}",
                     "Time": f"{item['start_time']:%H:%M}–{item['end_time']:%H:%M}",
                     "Subject": item["class_name"],
@@ -2193,7 +2190,48 @@ def _run_dates(teacher_id: int, class_id: int, start: dt.time, base: dt.date) ->
     return sorted(set(found))
 
 
-def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
+def _repeat_row(lesson_id: int, detail: dict, month_lessons: list) -> None:
+    """Offer to fill students on this class into every class of its subject that month.
+
+    Cancelled classes are left out. Someone just added here starts picked, so
+    adding a student and repeating them is one more click.
+    """
+    day = db.as_date(detail["Date"])
+    others = [item for item in month_lessons
+              if item["Class ID"] == detail["Class ID"] and item["ID"] != lesson_id
+              and item["Status"] != "Cancelled"]
+    seated = {item["ID"]: {row["student_id"] for row in item["Attendance"]} for item in others}
+    missing = {row["student_id"]: row["student_name"] for row in detail.get("Attendance", [])
+               if any(row["student_id"] not in seated[item["ID"]] for item in others)}
+    if not missing:
+        return
+    columns = st.columns([4, 1], vertical_alignment="bottom")
+    with columns[0]:
+        chosen = _pick(f"Repeat in every {detail['Class']} class in {day:%B}", missing,
+                       f"repeat_{lesson_id}", placeholder="Pick who to fill in")
+    targets = sorted((item for item in others if any(key not in seated[item["ID"]] for key in chosen)),
+                     key=lambda item: db.as_date(item["Date"]))
+    if chosen:
+        st.caption("Fills in: " + _chips("when", [f"{db.as_date(item['Date']):%d %b}" for item in targets], most=12))
+        booked = [
+            clash for item in targets
+            for clash in db.find_student_clashes(
+                chosen, [db.as_date(item["Date"])], db.as_time(item["Start"]), db.as_time(item["End"]),
+                excluded_session_id=item["ID"])
+        ]
+        if booked:
+            st.warning("Booked into another class at this time:  \n" + _clash_lines(booked, dated=True))
+    if columns[1].button(f"Repeat in {day:%b}", key=f"repeat_go_{lesson_id}", width="stretch",
+                         disabled=not chosen):
+        added, refused = db.add_students_to_lessons([item["ID"] for item in targets], chosen)
+        st.session_state.pop(f"repeat_{lesson_id}", None)
+        _flash(f"Filled in {added} place(s) across {len(targets)} class(es)."
+               + (f" {refused} class(es) couldn't be saved." if refused else ""),
+               "warning" if refused else "success")
+        _rerun()
+
+
+def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None:
     """Show everything about one class, then everything about its subject.
 
     Both are in expanders so the screen reads as two decisions instead of a
@@ -2276,10 +2314,13 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 attendance_rows=existing,
             )
             if outcome in ("updated", "success", True):
+                st.session_state[f"repeat_{lesson_id}"] = [lookup[name] for name in adding]
                 _saved_message(f"Added {len(adding)} student(s).", lesson_id)
                 _rerun()
             else:
                 st.warning(_explain(str(outcome)))
+
+        _repeat_row(lesson_id, detail, month_lessons)
 
         # Taking a student out had no button of its own: you could delete a row in the
         # table and save, which nobody found, and the "Delete" below, which people tried
@@ -2423,7 +2464,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int) -> None:
                 # Repeating from the middle would land on dates the run already has, so point to
                 # the class that can extend it.
                 st.button(
-                    "Repeat", disabled=True, width="stretch",
+                    "+1 month", disabled=True, width="stretch",
                     key=f"repdis_{lesson_id}",
                     help=f"Only the last class of a run can be repeated. "
                          f"This run already reaches {max(run):%d %b} — open that "
@@ -2537,7 +2578,7 @@ def schedule_tab() -> None:
         st.info("Add a teacher first — a schedule belongs to one.")
         return
 
-    top = st.columns([2, 6])
+    top = st.columns([2, 4, 2], vertical_alignment="bottom")
     teacher_name = top[0].selectbox(
         "Teacher", [item["Name"] for item in teachers], key="tt_teacher"
     )
@@ -2555,6 +2596,19 @@ def schedule_tab() -> None:
     ]
 
     if lessons:
+        # Made when pressed, not on every click on this screen.
+        top[2].download_button(
+            "Export to Excel",
+            data=lambda: schedule_writer.write_month(
+                schedule_backfill.lessons_on_file(teacher_id, year, month), year, month),
+            file_name=f"{teacher_name} Schedule {calendar.month_abbr[month]} {year}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"schedule_export_{teacher_id}_{year}_{month}",
+            on_click="ignore",
+            width="stretch",
+            help=f"{teacher_name}'s {calendar.month_name[month]} as their sheet, for Google Drive. "
+                 f"The worksheet is named {calendar.month_abbr[month]}, ready to copy into their yearly sheet.",
+        )
         strip = st.columns(5)
         strip[0].metric("Classes", len(lessons))
         strip[1].metric("Teaching days", len({db.as_date(i["Date"]) for i in lessons}))
@@ -2599,7 +2653,7 @@ def schedule_tab() -> None:
         return  # the grid's own legend says to click a class
 
     _anchor("class-editor")
-    _lesson_editor(selected, teacher_id)
+    _lesson_editor(selected, teacher_id, lessons)
     _back_to_grid_button()
     if st.session_state.pop("jump_to_editor", False):
         _scroll_to("class-editor", st.session_state.get("grid_click", ""))
@@ -4438,441 +4492,8 @@ def data_tab() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Create/Edit schedule, then Reminders
+# Reminders
 # ---------------------------------------------------------------------------
-
-
-# The marks a teacher writes beside a student, each a column of the table.
-_PLAN_MARKS = (schedule_parser.ONLINE, schedule_parser.RECORDING, schedule_parser.CANCELLED)
-_PLAN_BLANK = {"Date": None, "Start": None, "End": None, "Subject": [], "Students": [],
-               **{mark: [] for mark in _PLAN_MARKS}, "Every week": False}
-
-
-def _rows_from_lessons(lessons: list) -> list:
-    """Turn lessons, from the app or a sheet, into the table's rows: one per class, marks included."""
-    return [
-        {"Date": lesson["date"], "Start": lesson["start"], "End": lesson["end"], "Subject": [lesson["subject"]],
-         "Students": list(lesson["students"]),
-         **{mark: [name for name in lesson["students"] if lesson["statuses"].get(name) == mark]
-            for mark in _PLAN_MARKS},
-         "Every week": False}
-        for lesson in sorted(lessons, key=lambda lesson: (lesson["date"], lesson["start"]))
-    ]
-
-
-def _subjects_in(value) -> list:
-    """Return the names in a Subject cell as a list (a pick-list cell; usually one name)."""
-    if isinstance(value, str):
-        value = [value]
-    return [name.strip() for name in value or [] if isinstance(name, str) and name.strip()]
-
-
-def _as_date(value):
-    """Return a table cell as a date, or None if it's empty."""
-    if value is None or value == "" or (isinstance(value, float) and value != value):
-        return None
-    if isinstance(value, dt.datetime):
-        return value.date()
-    if isinstance(value, dt.date):
-        return value
-    return dt.date.fromisoformat(str(value)[:10])
-
-
-def _as_clock(value):
-    """Return a table cell as a time, or None if it's empty."""
-    if value is None or value == "" or (isinstance(value, float) and value != value):
-        return None
-    if isinstance(value, dt.datetime):
-        return value.time()
-    if isinstance(value, dt.time):
-        return value
-    return dt.time.fromisoformat(str(value)[:8])
-
-
-def _planned_lessons(rows: list, year: int, month: int) -> tuple[list, int, int, int]:
-    """Turn the table's rows into lessons, repeating each weekly one to the month's end.
-
-    Returns (lessons, rows not filled in yet, rows outside the month, rows
-    given more than one subject); the last are used with their first subject.
-    Each lesson carries its students' marks, and in "wrong" any mark that
-    names someone not in the class or a second mark for one student.
-    """
-    last = dt.date(year, month, calendar.monthrange(year, month)[1])
-    lessons, unfinished, elsewhere, doubled = [], 0, 0, 0
-    for row in rows:
-        when, start, end = _as_date(row.get("Date")), _as_clock(row.get("Start")), _as_clock(row.get("End"))
-        subjects = _subjects_in(row.get("Subject"))
-        subject = " ".join(subjects[0].split()) if subjects else ""
-        doubled += len(subjects) > 1
-        if not (when and start and end and subject):
-            unfinished += any([when, start, end, subject, row.get("Students")])
-            continue
-        if (when.year, when.month) != (year, month):
-            elsewhere += 1
-            continue
-        students = list(dict.fromkeys(" ".join(name.split()) for name in row.get("Students") or []
-                                      if name and name.strip()))
-        statuses, wrong = {}, []
-        for mark in _PLAN_MARKS:
-            for name in (" ".join(str(name).split()) for name in row.get(mark) or []):
-                if not name:
-                    continue
-                if name not in students:
-                    wrong.append(f"{name} is marked {mark} but isn't in the class")
-                elif name in statuses:
-                    wrong.append(f"{name} has two marks")
-                else:
-                    statuses[name] = mark
-        day = when
-        while day <= last:
-            lessons.append({"date": day, "start": start, "end": end, "subject": subject,
-                            "students": list(students), "statuses": dict(statuses),
-                            "wrong": wrong if day == when else []})
-            if not row.get("Every week"):
-                break
-            day += dt.timedelta(weeks=1)
-    lessons.sort(key=lambda lesson: (lesson["date"], lesson["start"]))
-    return lessons, unfinished, elsewhere, doubled
-
-
-def _plan_problems(lessons: list) -> list[str]:
-    """Return what would make the sheet wrong: a class ending before it starts, two at once, or a bad mark."""
-    problems = []
-    for lesson in lessons:
-        if lesson["end"] <= lesson["start"]:
-            problems.append(f"{lesson['date']:%a %d %b} {lesson['subject']}: ends before it starts.")
-        for line in lesson.get("wrong") or []:
-            problems.append(f"{lesson['date']:%a %d %b} {lesson['subject']}: {line}.")
-    by_day: dict = {}
-    for lesson in lessons:
-        by_day.setdefault(lesson["date"], []).append(lesson)
-    for day, items in by_day.items():
-        for index, first in enumerate(items):
-            for second in items[index + 1:]:
-                if second["start"] < first["end"] and second["end"] > first["start"]:
-                    problems.append(f"{day:%a %d %b}: {first['subject']} and {second['subject']} overlap "
-                                    "— a teacher can only take one class at a time.")
-    return problems
-
-
-def _student_finder(students: list):
-    """Return a lookup from a name to a student id that matches names the way the upload does.
-
-    A name matches if it's on file, is a known spelling of a student, or is
-    the same once tidied. So "Dami Ryu", the way one teacher writes Ryu Dami,
-    isn't called new (the upload knows that spelling), and that student's
-    other classes are still checked for clashes.
-    """
-    exact = {item["Name"]: item["ID"] for item in students}
-    known = db.get_student_aliases()
-    cleaned = {schedule_parser.normalise_name(name): sid for name, sid in exact.items()}
-    return lambda name: (exact.get(name) or known.get(name.casefold())
-                         or cleaned.get(schedule_parser.normalise_name(name)))
-
-
-def _plan_clashes(lessons: list, teacher_name: str, find, year: int, month: int) -> list[str]:
-    """Return students booked into another teacher's class at the same time, from what's in the app.
-
-    One query for the month. The teacher's own classes in the app are left
-    out: this table replaces them once it's saved or uploaded.
-    """
-    ids = {find(name) for lesson in lessons for name in lesson["students"]} - {None}
-    first = dt.date(year, month, 1)
-    booked = [item for item in db.get_student_bookings(ids, first, dt.date(year, month,
-                                                       calendar.monthrange(year, month)[1]))
-              if item["Teacher"].casefold() != teacher_name.casefold()]
-    lines = []
-    for lesson in lessons:
-        here = {find(name) for name in lesson["students"]}
-        for item in booked:
-            if (item["Student ID"] in here and db.as_date(item["Date"]) == lesson["date"]
-                    and db.as_time(item["Start"]) < lesson["end"] and db.as_time(item["End"]) > lesson["start"]):
-                lines.append(f"{_student(item['Student'])} · {_when(lesson['date'].strftime('%a %d %b'))} "
-                             f"{_subject(lesson['subject'])} — also in "
-                             f"{_subject(item['Class'])} with {_teacher(item['Teacher'])}, "
-                             + _when(f"{db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}"))
-    return lines
-
-
-def _rows_from_sheet(upload, year: int, month: int) -> list | None:
-    """Turn a sheet's month into table rows (a sheet downloaded before, or a teacher's own), marks included."""
-    data = upload.getvalue()
-
-    def month_of(name):
-        """Return the month a sheet's name gives, or None."""
-        try:
-            return schedule_parser.infer_month(name)
-        except ValueError:
-            return None
-
-    chosen = next((name for name in schedule_parser.get_sheet_names(data) if month_of(name) == month), None)
-    if chosen is None:
-        return None
-    preview = schedule_parser.parse_workbook(data, [chosen], year)
-    return _rows_from_lessons([
-        {"date": item["date"], "start": item["start_time"], "end": item["end_time"], "subject": item["class_name"],
-         "students": [entry["student_name"] for entry in item["attendance"]],
-         "statuses": {entry["student_name"]: entry["status"] for entry in item["attendance"]
-                      if entry["status"] in _PLAN_MARKS}}
-        for item in preview["sessions"] if (item["date"].year, item["date"].month) == (year, month)
-    ]) or None
-
-
-def create_schedule_tab() -> None:
-    """Draw the Create/Edit schedule screen: plan or edit one teacher's month, save it, download it.
-
-    A month the app already has is loaded into the table to edit. Saving is
-    the same as uploading that month's sheet on Teachers: the app's month is
-    made to match the table, with credits for anything already invoiced that
-    changes, and new teachers, students and subjects created. The download
-    is the teacher's sheet for Google Drive, marks included.
-    """
-    st.caption("Plan a teacher's month, or edit one the app has. Save it to the app, and download "
-               "it as their sheet.")
-    teachers = [item for item in db.get_all_teachers() if item["Active"]]
-    labels = {item["Name"]: item["ID"] for item in teachers}
-    # Widgets on a screen that isn't drawn lose their values, so going to another
-    # screen and back reset the month and teacher while the table still held the
-    # planned month. Their values are kept alongside and put back. They're set
-    # through session_state, not the widgets' defaults, since Streamlit won't take both.
-    ahead = dt.date.today().replace(day=1) + dt.timedelta(days=32)
-    for key, default in (("plan_year", ahead.year), ("plan_month", ahead.month),
-                         ("plan_teacher_mode", "Existing teacher" if teachers else "New teacher"),
-                         ("plan_teacher", next(iter(labels), None)), ("plan_new_teacher", "")):
-        if key not in st.session_state:
-            kept = st.session_state.get(f"plan_kept_{key}", default)
-            if key != "plan_teacher" or kept in labels:
-                st.session_state[key] = kept
-    columns = st.columns(2)
-    year = int(columns[0].number_input("Year", min_value=2020, max_value=dt.date.today().year + 1,
-                                       step=1, key="plan_year"))
-    month = int(columns[1].selectbox("Month", options=list(range(1, 13)),
-                                     format_func=lambda value: calendar.month_name[value], key="plan_month"))
-    period = f"{calendar.month_name[month]} {year}"
-    mode = st.radio("Teacher", ["Existing teacher", "New teacher"], horizontal=True,
-                    key="plan_teacher_mode", label_visibility="collapsed")
-    teacher_id = None
-    if mode == "New teacher" or not teachers:
-        teacher_name = st.text_input("Teacher name", key="plan_new_teacher").strip()
-    else:
-        teacher_name = st.selectbox("Teacher", list(labels), key="plan_teacher")
-        teacher_id = labels[teacher_name]
-    for key in ("plan_year", "plan_month", "plan_teacher_mode", "plan_teacher", "plan_new_teacher"):
-        if key in st.session_state:
-            st.session_state[f"plan_kept_{key}"] = st.session_state[key]
-
-    # The month as the app has it, loaded here to edit. The table remembers which teacher
-    # and month it was loaded from, so it can't be saved over another one.
-    here = (teacher_id, year, month)
-    source = st.session_state.get("plan_source")
-    on_file_lessons = schedule_backfill.lessons_on_file(teacher_id, year, month)
-    if on_file_lessons and source != here:
-        st.info(f"{_teacher(teacher_name)} has {_plural(len(on_file_lessons), 'class', 'classes')} in "
-                f"{_when(period)} in the app.")
-        if st.button("Edit them here", key="plan_edit"):
-            st.session_state["plan_rows"] = _rows_from_lessons(on_file_lessons)
-            st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
-            st.session_state["plan_source"] = here
-            _rerun()
-
-    students = db.get_all_students()
-    lookup = {item["Name"]: item["ID"] for item in students}
-    # The teacher's subjects on file, then any typed into the table, so a new subject
-    # typed once is offered on the next row, spelled the same.
-    subjects: dict = {}
-    on_file = [item["Class"] for item in db.get_teacher_classes_for_schedule(
-        teacher_id, dt.date(year, month, 1))] if teacher_id else []
-    for name in sorted(on_file, key=str.casefold) + [name for row in st.session_state.get("plan_rows") or []
-                                                     for name in _subjects_in(row.get("Subject"))]:
-        subjects.setdefault(name.casefold(), name)
-
-    with st.expander("Start from a sheet"):
-        upload = st.file_uploader(f"A schedule sheet with {calendar.month_name[month]} in it (.xlsx)",
-                                  type=["xlsx"], key="plan_upload")
-        if upload is not None and st.button("Put its lessons in the table", key="plan_load"):
-            rows = _rows_from_sheet(upload, year, month)
-            if rows is None:
-                st.warning(f"No lessons for {_when(period)} found in that sheet.")
-            else:
-                st.session_state["plan_rows"] = rows
-                st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
-                st.session_state.pop("plan_source", None)
-                _flash(f"{len(rows)} lessons put in the table.")
-                _rerun()
-
-    # The table keeps its rows across screens: a widget's own state is lost when its
-    # screen isn't drawn, so the rows are kept alongside and a new table is started
-    # from them on the way back.
-    version = st.session_state.get("plan_version", 0)
-    table_key = f"plan_table_{version}"
-    if table_key not in st.session_state:
-        st.session_state["plan_base"] = st.session_state.get("plan_rows") or [dict(_PLAN_BLANK)]
-    first_day = dt.date(year, month, 1)
-    last_day = dt.date(year, month, calendar.monthrange(year, month)[1])
-    # A mark can name anyone in the table, including a new student typed into a class.
-    in_table = {name for row in st.session_state["plan_base"] for name in row.get("Students") or [] if name}
-    mark_options = sorted(set(lookup) | in_table, key=str.casefold)
-    st.markdown(f"**Lessons in {period}**")
-    edited = st.data_editor(
-        st.session_state["plan_base"],
-        num_rows="dynamic",
-        key=table_key,
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Date": st.column_config.DateColumn(min_value=first_day, max_value=last_day,
-                                                format="ddd D MMM", required=True),
-            "Start": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
-            "End": st.column_config.TimeColumn(format="h:mm a", step=dt.timedelta(minutes=15)),
-            "Subject": st.column_config.MultiselectColumn(
-                options=list(subjects.values()), accept_new_options=True, width="medium",
-                help="Pick one of the teacher's subjects, or type a new one. One per lesson."),
-            "Students": st.column_config.MultiselectColumn(
-                options=sorted(lookup, key=str.casefold), accept_new_options=True, width="large",
-                help="Pick students on file, or type a new name."),
-            **{mark: st.column_config.MultiselectColumn(
-                options=mark_options, width="medium",
-                help=f"Students in this class who are {mark.lower()}, as the teacher marks them on the sheet.")
-               for mark in _PLAN_MARKS},
-            "Every week": st.column_config.CheckboxColumn(
-                help="Repeats on the same weekday to the end of the month."),
-        },
-    )
-    st.session_state["plan_rows"] = edited
-
-    lessons, unfinished, elsewhere, doubled = _planned_lessons(edited, year, month)
-    if unfinished:
-        st.caption(f"{unfinished} row(s) not filled in yet (date, times and subject) — left out.")
-    if elsewhere:
-        st.warning(f"{elsewhere} row(s) fall outside {_when(period)} — left out.")
-    problems = _plan_problems(lessons)
-    if doubled:
-        problems.insert(0, f"{doubled} lesson(s) have more than one subject — one per lesson.")
-    for problem in problems:
-        st.error(problem)
-    find = _student_finder(students)
-    new_names = sorted({name for lesson in lessons for name in lesson["students"] if find(name) is None},
-                       key=str.casefold)
-    if new_names:
-        st.info("New students, created when saved: " + _chips("student", new_names, most=99))
-    # A subject typed instead of picked is a new one. Say so, as for students, with
-    # the one on file it's close to: "G12 Bio" picked by pressing Enter half-typed
-    # would otherwise quietly become a second subject.
-    known = {name.casefold() for name in on_file}
-    new_subjects = sorted({lesson["subject"] for lesson in lessons if lesson["subject"].casefold() not in known},
-                          key=str.casefold)
-    if new_subjects:
-        st.info("New subjects, created when saved: " + ", ".join(
-            _subject(name) + (f" (close to {_subject(close[0])})" if (close := difflib.get_close_matches(name, on_file, n=1,
-                                                                                     cutoff=0.7)) else "")
-            for name in new_subjects))
-    clashes = _plan_clashes(lessons, teacher_name, find, year, month) if lessons and teacher_name else []
-    if clashes:
-        st.warning("Booked into another class at the same time:  \n" + "  \n".join(clashes[:12])
-                   + (f"  \n…and {len(clashes) - 12} more" if len(clashes) > 12 else ""))
-
-    # The sheet is read back the way the upload will read it, so anything that
-    # wouldn't survive is fixed here, not found at upload.
-    data = schedule_writer.write_month(lessons, year, month) if lessons and teacher_name and not problems else b""
-    if data:
-        for line in schedule_writer.readback_problems(lessons, data, year, month):
-            problems.append(line)
-            st.error(line)
-    if lessons:
-        st.caption(f"{len(lessons)} lessons on {len({lesson['date'] for lesson in lessons})} days, "
-                   f"{len({name for lesson in lessons for name in lesson['students']})} students.")
-    ready = bool(data) and not problems
-    _save_planned_month(lessons, ready, teacher_id, teacher_name, year, month, on_file_lessons, find)
-    st.download_button(
-        f"Download {teacher_name or 'the'} sheet for {period} (.xlsx)",
-        data=data if ready else b"",
-        file_name=f"{teacher_name} Schedule {calendar.month_abbr[month]} {year}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary", disabled=not ready, key="plan_download",
-        help=None if ready else "Add a teacher and at least one complete lesson, without overlaps.",
-    )
-    st.caption(
-        "Upload it to Google Drive and open it with Google Sheets; the worksheet is named "
-        f"{calendar.month_abbr[month]}, ready to copy into the teacher's yearly sheet. Teachers write "
-        "Online, Recording or Cancelled, then the names, in the column to the right of a class. To bring "
-        "it into the app, download it from Google Sheets as .xlsx and upload it on Teachers."
-    )
-    if st.button("Clear the table", key="plan_clear"):
-        st.session_state["plan_rows"] = [dict(_PLAN_BLANK)]
-        st.session_state["plan_version"] = version + 1
-        st.session_state.pop("plan_source", None)
-        _rerun()
-
-
-def _save_planned_month(lessons, ready, teacher_id, teacher_name, year, month, on_file_lessons, find) -> None:
-    """Show what saving the table changes in the app, and save it.
-
-    Saving is the same as uploading the month's sheet: the app's month is
-    made to match the table. So a month the app already has must be loaded
-    into the table first; otherwise a few planned classes would take the
-    rest of the month off. A table loaded for one teacher and month can't be
-    saved as another.
-    """
-    period = f"{calendar.month_name[month]} {year}"
-    here, source = (teacher_id, year, month), st.session_state.get("plan_source")
-    st.markdown("**Save to the app**")
-    blocked = ""
-    if source is not None and source != here:
-        blocked = "This table was loaded for another teacher or month. Load this one, or clear the table."
-    elif on_file_lessons and source != here:
-        blocked = f"The app already has {period} for this teacher: press Edit them here first."
-    elif not ready:
-        blocked = "Add a teacher and at least one complete lesson, without overlaps."
-    if blocked:
-        st.caption(blocked)
-        st.button("Save to the app", key="plan_save", type="primary", disabled=True)
-        return
-
-    preview = schedule_backfill.preview_from_lessons(lessons, year, month)
-    # The students the screen calls on file are saved as those students, spellings included.
-    matches = {name.casefold(): sid for name in {name for lesson in lessons for name in lesson["students"]}
-               if (sid := find(name))}
-    # Another teacher's subject with the same name gets this teacher's name added, as at upload.
-    renames = schedule_backfill.suggest_class_renames(preview["sessions"], teacher_name)
-    if renames:
-        st.info("Another teacher has the same subject name, so it's saved as: " + ", ".join(
-            f"{_subject(old)} → {_subject(new)}" for old, new in renames.items()))
-    _import_changes(preview, {}, teacher_id, renames, matches)
-    if not st.button("Save to the app", key="plan_save", type="primary"):
-        return
-
-    commit_id = teacher_id
-    if commit_id is None:
-        if not db.create_teacher(teacher_name):
-            st.warning("That teacher is already on file: pick them as an existing teacher.")
-            return
-        commit_id = next(item["ID"] for item in db.get_all_teachers()
-                         if item["Name"].casefold() == teacher_name.casefold())
-    with st.spinner(f"Saving {period} for {teacher_name}…"):
-        result = schedule_backfill.backfill(preview, commit_id, name_overrides=renames, student_matches=matches,
-                                            dates=preview["dates_shown"])
-    if result["status"] != "imported":
-        st.warning(f"Nothing saved ({result['status']}).")
-        return
-    counts = result["created"]
-    message = (f"Saved {_when(period)} for {_teacher(teacher_name)}: {counts.get('sessions_created', 0)} new, "
-               f"{counts.get('sessions_updated', 0)} changed, {counts.get('lessons_removed', 0)} removed, "
-               f"{counts.get('sessions_unchanged', 0)} unchanged.")
-    if counts.get("credits_raised"):
-        message += f" {_plural(counts['credits_raised'], 'credit')} for classes already invoiced."
-    _flash(message)
-    # The table now shows the month as saved, and a new teacher is picked as an existing one.
-    st.session_state["plan_rows"] = _rows_from_lessons(schedule_backfill.lessons_on_file(commit_id, year, month))
-    st.session_state["plan_version"] = st.session_state.get("plan_version", 0) + 1
-    st.session_state["plan_source"] = (commit_id, year, month)
-    if teacher_id is None:
-        st.session_state["plan_kept_plan_teacher_mode"] = "Existing teacher"
-        st.session_state["plan_kept_plan_teacher"] = next(
-            item["Name"] for item in db.get_all_teachers() if item["ID"] == commit_id)
-        for key in ("plan_teacher_mode", "plan_teacher"):
-            st.session_state.pop(key, None)
-    st.session_state["offer_billing"] = (year, month)
-    _rerun()
 
 
 def reminders_tab() -> None:
@@ -5178,7 +4799,7 @@ def _effects_text(plan: dict) -> str:
 
 
 def _pick(label: str, options: dict, key: str, placeholder: str = "Choose options") -> list:
-    """Draw one picker on Delete records and return what's picked.
+    """Draw one picker and return what's picked.
 
     Picks no longer on offer are dropped first: a teacher unpicked takes their
     subjects with them, and a different month offers different classes.
@@ -5364,7 +4985,6 @@ SECTIONS = {
     "Teachers": teachers_tab,
     "Students": students_tab,
     "Schedule": schedule_tab,
-    "Create/Edit schedule": create_schedule_tab,
     "Invoices": invoices_tab,
     "Payments": payments_tab,
     "Credits": credits_tab,

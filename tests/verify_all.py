@@ -1930,14 +1930,8 @@ def t_delete_where_they_meet():
             "invoice shortened on their own card; emptied invoice deleted; out of a whole teacher too")
 
 
-_EDIT_MONTH_SCRIPT = r"""
-import datetime as dt, json, db, schedule_backfill as sb
-from sqlalchemy import event, select
-
-@event.listens_for(db.engine, "connect")
-def _links_enforced(connection, _):
-    connection.execute("PRAGMA foreign_keys=ON")
-db.engine.dispose()
+_MONTH_EXPORT_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb, schedule_parser as sp, schedule_writer as sw
 
 db.initialise_database()
 db.create_teacher("Teacher A")
@@ -1950,9 +1944,7 @@ def lesson(day, names, subject="G11 Test Math", marks=None):
 
 sept = lambda d: dt.date(2026, 9, d)
 sb.backfill({"sessions": [lesson(sept(7), both), lesson(sept(14), both, marks={"Oh Minseok": "Online"}),
-                          lesson(sept(21), both), lesson(sept(28), both), lesson(dt.date(2026, 10, 5), both)]}, teacher)
-nam_invoice = next(row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, 9) if row["Student"] == "Nam Jihoon")
-db.issue_invoice_for_month(nam_invoice, 2026, 9)
+                          lesson(sept(21), both), lesson(dt.date(2026, 10, 5), both)]}, teacher)
 # A class cancelled as a whole on the Schedule screen.
 with db.SessionLocal() as s:
     s.query(db.ClassSession).filter(db.ClassSession.session_date == dt.date(2026, 10, 5)).update({"status": "Cancelled"})
@@ -1961,72 +1953,112 @@ with db.SessionLocal() as s:
 def shown(lessons):
     return [[str(l["date"]), l["subject"], l["students"], l["statuses"]] for l in lessons]
 
-def counts(plan):
-    return [sum(m[k] for m in plan.values()) for k in ("new", "changed", "removed", "unchanged")]
-
-def save(lessons, year, month):
-    preview = sb.preview_from_lessons(lessons, year, month)
-    planned = counts(sb.plan_import(preview, teacher, dates=preview["dates_shown"]))
-    c = sb.backfill(preview, teacher, dates=preview["dates_shown"])["created"]
-    return [planned, [c.get("sessions_created", 0), c.get("sessions_updated", 0), c.get("lessons_removed", 0),
-                      c.get("sessions_unchanged", 0)]]
-
 loaded = sb.lessons_on_file(teacher, 2026, 9)
-result = {"loaded": shown(loaded), "october": shown(sb.lessons_on_file(teacher, 2026, 10)),
-          "as_is": save(loaded, 2026, 9)}
-# The edits made in the table: Nam cancelled on the 21st, the 28th taken out, Seo Yerin
-# added on the 14th and a new Chemistry class on the 30th.
-edited = [l for l in sb.lessons_on_file(teacher, 2026, 9) if l["date"] != sept(28)]
-edited[1]["students"].append("Seo Yerin")
-edited[2]["statuses"]["Nam Jihoon"] = "Cancelled"
-edited.append({"date": sept(30), "start": dt.time(16), "end": dt.time(18), "subject": "G11 Test Chem",
-               "students": ["Oh Minseok"], "statuses": {}})
-result["edited"] = save(edited, 2026, 9)
-result["after"] = shown(sb.lessons_on_file(teacher, 2026, 9))
-result["credits"] = sorted([c["Student"], str(c["Class date"]), c["Amount"]] for c in db.get_credits())
-result["again"] = save(sb.lessons_on_file(teacher, 2026, 9), 2026, 9)
-with db.SessionLocal() as s:
-    result["broken"] = s.connection().exec_driver_sql("PRAGMA foreign_key_check").fetchall()
-print(json.dumps(result, default=str))
+october = sb.lessons_on_file(teacher, 2026, 10)
+data = sw.write_month(loaded, 2026, 9)
+print(json.dumps({"loaded": shown(loaded), "october": shown(october), "sheets": sp.get_sheet_names(data),
+                  "problems": sw.readback_problems(loaded, data, 2026, 9),
+                  "october_problems": sw.readback_problems(october, sw.write_month(october, 2026, 10), 2026, 10)}))
 """
 
 
-def t_edit_month_in_app():
-    """A month the app has loads into Create/Edit schedule and saves back like an upload.
+def t_month_export():
+    """A month on Schedule exports as the teacher's sheet, and the sheet reads back the same.
 
-    Loaded, each class keeps its students in order and their marks; a class
-    cancelled as a whole marks everyone Cancelled. Saved unchanged, nothing
-    changes. Edits save as an upload would: a billed student cancelled and a
-    billed class taken out are credited, a new student and class are added,
-    and the forecast matches what is saved. Loading again shows the edits.
+    Each class keeps its students in order and their marks, and a class
+    cancelled as a whole marks everyone Cancelled. The upload's own parser
+    reads the sheet back with nothing lost.
     """
     import json
     import tempfile
 
     with tempfile.TemporaryDirectory() as folder:
-        url = "sqlite:///" + os.path.join(folder, "edit.db").replace("\\", "/")
-        result = run(["-c", _EDIT_MONTH_SCRIPT], {"DATABASE_URL": url})
+        url = "sqlite:///" + os.path.join(folder, "export.db").replace("\\", "/")
+        result = run(["-c", _MONTH_EXPORT_SCRIPT], {"DATABASE_URL": url})
         assert result.returncode == 0, result.stderr[-1500:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
     pair = ["Nam Jihoon", "Oh Minseok"]
     assert got["loaded"] == [["2026-09-07", "G11 Test Math", pair, {}],
                              ["2026-09-14", "G11 Test Math", pair, {"Oh Minseok": "Online"}],
-                             ["2026-09-21", "G11 Test Math", pair, {}],
-                             ["2026-09-28", "G11 Test Math", pair, {}]], got["loaded"]
+                             ["2026-09-21", "G11 Test Math", pair, {}]], got["loaded"]
     assert got["october"] == [["2026-10-05", "G11 Test Math", pair,
                                {"Nam Jihoon": "Cancelled", "Oh Minseok": "Cancelled"}]], got["october"]
-    assert got["as_is"] == [[0, 0, 0, 4], [0, 0, 0, 4]], f"saving it unchanged changed something: {got['as_is']}"
-    planned, done = got["edited"]
-    assert planned == done == [1, 2, 1, 1], got["edited"]
-    assert got["after"] == [["2026-09-07", "G11 Test Math", pair, {}],
-                            ["2026-09-14", "G11 Test Math", pair + ["Seo Yerin"], {"Oh Minseok": "Online"}],
-                            ["2026-09-21", "G11 Test Math", pair, {"Nam Jihoon": "Cancelled"}],
-                            ["2026-09-30", "G11 Test Chem", ["Oh Minseok"], {}]], got["after"]
-    assert got["credits"] == [["Nam Jihoon", "2026-09-21", 130.0], ["Nam Jihoon", "2026-09-28", 130.0]], got["credits"]
-    assert got["again"] == [[0, 0, 0, 4], [0, 0, 0, 4]], got["again"]
-    assert got["broken"] == [], "broken links"
-    return ("loaded with order and marks (a whole-class cancel marks everyone); unchanged saves nothing; edits "
-            "save like an upload, billed changes credited, forecast matched; reloads as saved")
+    assert got["sheets"] == ["Sep"], got["sheets"]
+    assert got["problems"] == [] and got["october_problems"] == [], got
+    return "students in order with their marks; the sheet reads back exactly; a whole-class cancel marks everyone"
+
+
+_REPEAT_STUDENTS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(day, subject, names, marks=None):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": dt.time(16), "end_time": dt.time(18),
+            "warnings": [], "attendance": [{"student_name": n, "status": (marks or {}).get(n, "Attending")} for n in names]}
+
+sb.backfill({"sessions": [lesson(7, "G9 Test Eng", ["Nam Jihoon"]),
+                          lesson(14, "G9 Test Eng", ["Nam Jihoon"], marks={"Nam Jihoon": "Online"}),
+                          lesson(21, "G9 Test Eng", ["Nam Jihoon", "Oh Minseok"]),
+                          lesson(9, "G9 Test Math", ["Seo Yerin"]),
+                          lesson(22, "G9 Test Math", ["Seo Yerin"])]}, teacher)
+ids = {s["Name"]: s["ID"] for s in db.get_all_students()}
+month = db.get_month_schedule(teacher, 2026, 9)
+english = [item["ID"] for item in sorted(month, key=lambda i: i["Date"]) if item["Class"] == "G9 Test Eng"]
+
+def rosters():
+    rows = db.get_month_attendance(teacher, 2026, 9)
+    return [[str(item["Date"])[:10], item["Class"], [(r["student_name"], bool(r["is_online"])) for r in rows.get(item["ID"], [])]]
+            for item in sorted(db.get_month_schedule(teacher, 2026, 9), key=lambda i: (i["Date"], i["Class"]))]
+
+def lines(name):
+    with db.SessionLocal() as s:
+        return sorted(str(d)[:10] for d in s.scalars(
+            db.select(db.ClassSession.session_date)
+            .join(db.InvoiceItem, db.InvoiceItem.session_id == db.ClassSession.id)
+            .join(db.Invoice, db.Invoice.id == db.InvoiceItem.invoice_id)
+            .where(db.Invoice.student_id == ids[name], db.Invoice.status == "Open")))
+
+# Oh Minseok's September invoice goes out before the others are filled in.
+sent = next(row["Invoice ID"] for row in db.get_open_invoice_items_for_month(2026, 9) if row["Student"] == "Oh Minseok")
+db.issue_invoice_for_month(sent, 2026, 9)
+before = db.get_invoice(sent)["Total"]
+
+result = {"first": db.add_students_to_lessons(english, [ids["Oh Minseok"]]), "rosters": rosters(),
+          "new_lines": lines("Oh Minseok"), "sent_same": db.get_invoice(sent)["Total"] == before,
+          "credits": len(db.get_credits())}
+result["again"] = db.add_students_to_lessons(english, [ids["Oh Minseok"]])
+print(json.dumps(result))
+"""
+
+
+def t_repeat_students():
+    """Repeat fills a student into every class given, and leaves everyone else as they were.
+
+    The student goes in where they're missing, after those already there, whose
+    marks stay. Other subjects aren't touched. A sent invoice doesn't change: the
+    classes added go on the next one. Repeating again adds nothing.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "repeat.db").replace("\\", "/")
+        result = run(["-c", _REPEAT_STUDENTS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["first"] == [2, 0] and got["again"] == [0, 0], (got["first"], got["again"])
+    assert got["rosters"] == [
+        ["2026-09-07", "G9 Test Eng", [["Nam Jihoon", False], ["Oh Minseok", False]]],
+        ["2026-09-09", "G9 Test Math", [["Seo Yerin", False]]],
+        ["2026-09-14", "G9 Test Eng", [["Nam Jihoon", True], ["Oh Minseok", False]]],
+        ["2026-09-21", "G9 Test Eng", [["Nam Jihoon", False], ["Oh Minseok", False]]],
+        ["2026-09-22", "G9 Test Math", [["Seo Yerin", False]]]], got["rosters"]
+    assert got["new_lines"] == ["2026-09-07", "2026-09-14"], got["new_lines"]
+    assert got["sent_same"] and got["credits"] == 0, got
+    return "filled in where missing, marks kept, other subjects untouched, sent invoice unchanged, new classes on the next"
 
 
 _UNNAMED_ROWS_SCRIPT = r"""
@@ -2903,7 +2935,8 @@ for name, fn in [
     ("two names in one lesson aren't one child", t_same_lesson_not_same_child),
     ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),
-    ("editing a month on Create/Edit schedule", t_edit_month_in_app),
+    ("a month exported from Schedule", t_month_export),
+    ("Repeat fills a student across the month", t_repeat_students),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),
     ("two invoices in one month", t_two_invoices_one_month),
