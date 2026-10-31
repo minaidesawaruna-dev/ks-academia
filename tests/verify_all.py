@@ -2347,6 +2347,137 @@ def t_delete_all_time():
     return "one click to any year and month; a student with no classes shows"
 
 
+_DELETE_STAYS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+today = dt.date.today()
+sb.backfill({"sessions": [{"date": today.replace(day=1), "class_name": "G9 Test Eng", "start_time": dt.time(19),
+                           "end_time": dt.time(20), "warnings": [],
+                           "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}]}, teacher)
+student = db.get_all_students()[0]["ID"]
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Delete records"
+at.session_state["delete_teachers_0"] = [teacher]
+at.session_state["delete_students_0"] = [student]
+at.run()
+result = {"before": [i.value for i in at.info]}
+at.text_input(key="delete_confirm_0").set_value("delete").run()
+at.button(key="delete_go_0").click().run()
+choices = db.get_delete_choices(today.year, today.month)
+result["month"] = {"flash": [w.value for w in at.warning], "lessons": db.get_month_schedule(teacher, today.year, today.month),
+                   "teachers": len(db.get_all_teachers()), "students": len(db.get_all_students()),
+                   "offered": len(choices["Teachers"]) + len(choices["Students"])}
+at.button(key="delete_all_time_1").click().run()
+at.session_state["delete_teachers_1"] = [teacher]
+at.session_state["delete_students_1"] = [student]
+at.run()
+result["whole_before"] = [i.value for i in at.info]
+at.text_input(key="delete_confirm_1").set_value("delete").run()
+at.button(key="delete_go_1").click().run()
+result["whole"] = {"flash": [w.value for w in at.warning], "teachers": len(db.get_all_teachers()),
+                   "students": len(db.get_all_students())}
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result, default=str))
+"""
+
+
+def t_delete_says_what_stays():
+    """A delete kept to a month says who is left on file, because they drop off that month's lists.
+
+    The teacher and student lose the month's class and stay. They are then
+    offered in that month no more, so they look deleted. All time removes them,
+    and then nothing is left to mention.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "stays.db").replace("\\", "/")
+        result = run(["-c", _DELETE_STAYS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert len(got["before"]) == 1 and "Teacher A" in got["before"][0] and "Nam Jihoon" in got["before"][0], got
+    month = got["month"]
+    assert month["lessons"] == [] and month["teachers"] == 1 and month["students"] == 1 and month["offered"] == 0, month
+    assert any("Still on file" in text and "Teacher A" in text for text in month["flash"]), month["flash"]
+    whole = got["whole"]
+    assert got["whole_before"] == [] and whole["teachers"] == 0 and whole["students"] == 0, got
+    assert not any("Still on file" in text for text in whole["flash"]), whole["flash"]
+    return "a month's delete names who stays; All time removes them"
+
+
+_STUDENT_MORE_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+names = [f"Test Child {number:02d}" for number in range(1, 56)]
+sb.backfill({"sessions": [{"date": dt.date.today().replace(day=1), "class_name": "G9 Test Eng",
+                           "start_time": dt.time(16), "end_time": dt.time(18), "warnings": [],
+                           "attendance": [{"student_name": name, "status": "Attending"} for name in names]}]}, teacher)
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Students"
+at.run()
+
+def shown():
+    more = [button.label for button in at.button if button.key == "students_show_more"]
+    return [sum("Test Child" in box.label for box in at.expander), more]
+
+result = {"start": shown()}
+at.button(key="students_show_more").click().run()
+result["once"] = shown()
+at.button(key="students_show_more").click().run()
+result["twice"] = shown()
+at.text_input(key="student_search").set_value("Child 55").run()
+result["search"] = shown()
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_student_show_more():
+    """Students lists 25 at a time, with a button for the next lot until everyone is showing."""
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "more.db").replace("\\", "/")
+        result = run(["-c", _STUDENT_MORE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["start"] == [25, ["Show 25 more"]], got
+    assert got["once"] == [50, ["Show 5 more"]], got
+    assert got["twice"] == [55, []], got
+    assert got["search"] == [1, []], got
+    return "25, then 50, then all 55; a search still narrows it"
+
+
 _SAME_LESSON_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 
@@ -3011,6 +3142,8 @@ for name, fn in [
     ("renaming a subject", t_rename_subject),
     ("classes not added name their cells", t_not_added_names_cells),
     ("Delete records: all time in one click", t_delete_all_time),
+    ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
+    ("Students: show more", t_student_show_more),
     ("two names in one lesson aren't one child", t_same_lesson_not_same_child),
     ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),

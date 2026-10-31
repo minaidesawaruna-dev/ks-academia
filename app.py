@@ -1735,15 +1735,15 @@ def students_tab() -> None:
     # A hard limit, because Streamlit builds an expander's contents whether it's open
     # or not: each row is a table, three inputs, a note box and buttons, so the whole
     # academy is thousands of widgets and several seconds before anything appears.
-    # Searching is the quick way to find someone.
-    page = shown[:STUDENT_ROWS]
+    # Searching is the quick way to find someone, and Show more adds a page at a time.
+    page = shown[:st.session_state.get("student_rows", STUDENT_ROWS)]
     # Loaded for the whole page in one go, because Streamlit builds every expander
     # whether it's open or not: asking per row made this screen about a hundred
     # round trips to the database.
     page_ids = [item["ID"] for item in page]
     credit_waiting = db.get_student_credit_totals(page_ids)
     if len(shown) > len(page):
-        st.caption(f"Showing {len(page)} of {len(shown)} — search to find anyone else.")
+        st.caption(f"Showing {len(page)} of {len(shown)} — search, or Show more at the bottom.")
     elif not shown:
         st.caption("Nobody matches." if search.strip()
                    else f"Nobody had a class in {_when(calendar.month_name[month])}.")
@@ -1831,6 +1831,14 @@ def students_tab() -> None:
                     st.warning("Another student already has that name.")
                 else:
                     st.warning("Enter a name first.")
+
+    left = len(shown) - len(page)
+    if left > 0:
+        def show_more() -> None:
+            """Add another page of students to the list."""
+            st.session_state["student_rows"] = len(page) + STUDENT_ROWS
+
+        st.button(f"Show {min(left, STUDENT_ROWS)} more", key="students_show_more", on_click=show_more)
 
 
 # ---------------------------------------------------------------------------
@@ -4830,6 +4838,20 @@ def _effects_text(plan: dict) -> str:
     return "\n".join(lines) or "- Nothing else"
 
 
+def _still_on_file(plan: dict) -> str:
+    """Return a line naming what a delete kept to a period leaves on file, or "" if nothing.
+
+    Their classes in that period go, so they drop off its lists and look deleted
+    when they aren't.
+    """
+    kinds = {"Teacher": "teacher", "Subject": "subject", "Student": "student"}
+    chips = [_chip(kinds[item["Kind"]], item["Name"]) for item in plan["Linked"] if item["Kind"] in kinds]
+    if not chips:
+        return ""
+    names = ", ".join(chips[:6]) + (f" and {len(chips) - 6} more" if len(chips) > 6 else "")
+    return f"Still on file afterwards: {names}. Press All time to delete them too."
+
+
 def _pick(label: str, options: dict, key: str, placeholder: str = "Choose options") -> list:
     """Draw one picker and return what's picked.
 
@@ -4970,6 +4992,9 @@ def delete_records_tab() -> None:
         st.error(f"**Affects students you didn't pick** (red box) · {_plural(total, 'record')} to delete")
     else:
         st.success(f"**Only your picks are affected** · {_plural(total, 'record')} to delete")
+    stays = "" if whole or meet else _still_on_file(plan)
+    if stays:
+        st.info(stays)
 
     for index, item in enumerate(plan["Linked"]):
         with st.container(border=True, key=f"card-{_CARD_KINDS[item['Kind']]}-{index}"):
@@ -4992,7 +5017,8 @@ def delete_records_tab() -> None:
         done = db.master_delete(**picked)
         st.session_state["delete_gen"] = generation + 1
         removed = sum(row["How many"] for row in done["Rows"])
-        _flash(f"Deleted {_plural(removed, 'record')}. Next invoice no. #{done['Next after']}.", "warning")
+        _flash(f"Deleted {_plural(removed, 'record')}. Next invoice no. #{done['Next after']}. {stays}".strip(),
+               "warning")
         _rerun()
 
 
