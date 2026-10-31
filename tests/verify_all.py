@@ -837,7 +837,7 @@ result["asked_again"] = [m["parsed_name"] for m in sb.suggest_student_matches(
 for row in db.get_open_invoice_items_for_month(2026, 9):
     db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
 unnamed = db.get_unnamed_subjects(2026, 9)
-result["unnamed"] = [(u["Teacher"], u["Lessons"], u["Students"], u["Issued lines"]) for u in unnamed]
+result["unnamed"] = [(u["Teacher"], u["Lessons"], u["Times"], u["Students"], u["Issued lines"]) for u in unnamed]
 result["unnamed_in_august"] = db.get_unnamed_subjects(2026, 8)
 invoice_id = next(i["ID"] for i in db.get_invoices(status="Issued") if i["Student"] == "Oh Minseok")
 total_before = db.get_invoice(invoice_id)["Total"]
@@ -879,7 +879,7 @@ def t_merge_and_name():
     assert got["students_after_october"] == ["Choi Doyun", "Hayun Kim", "Nam Jihoon", "Oh Minseok",
                                              "Seo Yerin"], got["students_after_october"]
     assert got["asked_again"] == [], got["asked_again"]
-    assert got["unnamed"] == [["Teacher A", 2, ["Oh Minseok"], 2]], got["unnamed"]
+    assert got["unnamed"] == [["Teacher A", 2, ["Sun 13:30"], ["Oh Minseok"], 2]], got["unnamed"]
     assert got["unnamed_in_august"] == [], got["unnamed_in_august"]
     assert got["named"] == [["named", "Reading (Teacher A)"]], got["named"]
     assert got["relabelled"] == 2 and got["lines"] == ["Reading (Teacher A)"], got
@@ -2029,6 +2029,80 @@ def t_edit_month_in_app():
             "save like an upload, billed changes credited, forecast matched; reloads as saved")
 
 
+_UNNAMED_ROWS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+group = ["Choi Doyun", "Han Sora", "Kang Minji", "Nam Jihoon", "Oh Minseok", "Seo Yerin"]
+
+def lesson(day, subject, names, start):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": start,
+            "end_time": dt.time(start.hour + 1, start.minute), "warnings": [],
+            "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
+
+sb.backfill({"sessions": [lesson(20, "(unnamed class) · Sun 13:30", group, dt.time(13, 30)),
+                          lesson(27, "(unnamed class) · Sun 13:30", group, dt.time(13, 30)),
+                          lesson(8, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30)),
+                          lesson(15, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30)),
+                          lesson(25, "(unnamed class)", ["Bae Yuna", "Lim Taeo"], dt.time(16))]}, teacher)
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Teachers"
+at.run()
+# Badges escape their colons; the screen shows them plain.
+rows = [m.value.replace("\\", "") for m in at.markdown if "class(es)" in m.value]
+boxes = [t for t in at.text_input if t.key.startswith("name_subject_teachers_")]
+popovers = at.get("popover")
+result = {"errors": [e.value for e in at.exception], "rows": rows, "markdown": [m.value for m in at.markdown],
+          "boxes": len(boxes), "more": [p.proto.popover.label for p in popovers]}
+boxes[0].set_value("G9 Test Reading")
+at.button(key="name_subjects_teachers").click().run()
+result["left"] = len(db.get_unnamed_subjects())
+print(json.dumps(result))
+"""
+
+
+def t_unnamed_subject_rows():
+    """Each subject with no name reads the same way, and a long list of students opens up.
+
+    A one-to-one is named after its student, not a time, and a subject can have
+    no slot in its name at all. Both still show their day and time from the
+    lessons, and the student only once. Past four students the rest open from
+    "and 2 more", and naming a subject still saves from the box under its row.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "unnamed.db").replace("\\", "/")
+        result = run(["-c", _UNNAMED_ROWS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert len(got["rows"]) == 3, got["rows"]
+    alone = next(row for row in got["rows"] if "Pak Doyun" in row)
+    assert "Tue 16:30" in alone and alone.count("Pak Doyun") == 1, alone
+    plain = next(row for row in got["rows"] if "Bae Yuna" in row)
+    assert "Fri 16:00" in plain and "25 Sep" in plain and "–" not in plain, plain
+    many = next(row for row in got["rows"] if "Choi Doyun" in row)
+    assert "Sun 13:30" in many and "Oh Minseok" not in many and "more" not in many, many
+    assert got["more"] == ["and 2 more"], got["more"]
+    assert any(all(name in text for name in ("Choi Doyun", "Oh Minseok", "Seo Yerin")) for text in got["markdown"]), got["markdown"]
+    assert got["boxes"] == 3 and got["left"] == 2, got
+    return "one-to-one and no-slot rows show their real time; extra students open from \"and 2 more\""
+
+
 _RENAME_SUBJECT_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from sqlalchemy import event, select
@@ -2559,6 +2633,7 @@ for name, fn in [
     ("Delete records inside a year or month", t_delete_by_period),
     ("Delete records where a student and classes meet", t_delete_where_they_meet),
     ("renaming a subject", t_rename_subject),
+    ("rows of subjects with no name", t_unnamed_subject_rows),
     ("editing a month on Create/Edit schedule", t_edit_month_in_app),
     ("a month's invoices downloaded again", t_month_invoices_again),
     ("two imports at once", t_double_import),

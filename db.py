@@ -1,5 +1,5 @@
 from pathlib import Path
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from calendar import month_abbr, monthrange
 from typing import Any
@@ -2252,8 +2252,9 @@ def get_unnamed_subjects(year=None, month=None):
 
     A class cell with students and a time but no subject line comes in as
     "(unnamed class) · Sun 13:30", and that's what the invoices say. Its
-    teacher, times and students let the admin name it. With `year` and
-    `month`, only those with a lesson that month.
+    teacher, times and students let the admin name it. "Times" is read from
+    its lessons, most used first, as a one-to-one's name holds no time. With
+    `year` and `month`, only those with a lesson that month.
     """
     from schedule_parser import UNNAMED_CLASS
 
@@ -2268,7 +2269,7 @@ def get_unnamed_subjects(year=None, month=None):
             return []
         ids = [class_id for class_id, _, _ in classes]
         lessons = session.execute(
-            select(ClassSession.class_id, ClassSession.session_date)
+            select(ClassSession.class_id, ClassSession.session_date, ClassSession.start_time)
             .where(ClassSession.class_id.in_(ids))
         ).all()
         roster = session.execute(
@@ -2285,8 +2286,11 @@ def get_unnamed_subjects(year=None, month=None):
             .group_by(ClassSession.class_id)
         ).all())
     dates: dict[int, list] = defaultdict(list)
-    for class_id, when in lessons:
-        dates[class_id].append(as_date(when))
+    times: dict[int, Counter] = defaultdict(Counter)
+    for class_id, when, start in lessons:
+        day = as_date(when)
+        dates[class_id].append(day)
+        times[class_id][f"{day:%a} {as_time(start):%H:%M}"] += 1
     students: dict[int, set] = defaultdict(set)
     for class_id, name in roster:
         students[class_id].add(name)
@@ -2299,6 +2303,7 @@ def get_unnamed_subjects(year=None, month=None):
             "Class ID": class_id, "Class": name, "Teacher": teacher,
             "Lessons": len(days), "First": days[0] if days else None,
             "Last": days[-1] if days else None,
+            "Times": [slot for slot, _ in times[class_id].most_common()],
             "Students": sorted(students[class_id], key=str.casefold),
             "Issued lines": int(issued.get(class_id, 0)),
         })

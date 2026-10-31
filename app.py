@@ -1097,16 +1097,26 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
     )
     typed: dict[int, str] = {}
     for item in unnamed:
-        slot = item["Class"].split("·", 1)[-1].strip() if "·" in item["Class"] else ""
-        who = _chips("student", item["Students"], most=4)
-        span = (_when(f"{item['First']:%d %b}–{item['Last']:%d %b}") if item["First"] else "no classes")
+        first, last = item["First"], item["Last"]
+        span = ("no classes" if not first
+                else _when(f"{first:%d %b}" if first == last else f"{first:%d %b}–{last:%d %b}"))
+        times = f"{_chips('when', item['Times'], most=3)} · " if item["Times"] else ""
+        names = item["Students"]
+        more = len(names) - 4
+        who = ", ".join(_student(name) for name in names[:4]) if more > 0 else _chips("student", names)
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"{_teacher(item['Teacher'])} · {times}{item['Lessons']} class(es), {span} · {who}",
+                        width="content")
+            if more > 0:
+                # Opens without a rerun, so names typed in the boxes stay as they are.
+                with st.popover(f"and {more} more", type="tertiary",
+                                key=f"name_subject_more_{key}_{item['Class ID']}"):
+                    st.markdown(_chips("student", names, most=99))
         typed[item["Class ID"]] = st.text_input(
-            # An unnamed group is labelled by its weekly time, or by its one student.
-            f"{_teacher(item['Teacher'])} · "
-            f"{(_when(slot) if re.search(r'[0-9]:[0-9]', slot) else _student(slot)) if slot else 'no time'} · "
-            f"{item['Lessons']} class(es), {span} · {who}",
+            f"Subject name for {item['Class']}",
             key=f"name_subject_{key}_{item['Class ID']}",
             placeholder="Subject name, e.g. G9 English",
+            label_visibility="collapsed",
         )
     chosen = {class_id: name for class_id, name in typed.items() if name.strip()}
     if st.button(
