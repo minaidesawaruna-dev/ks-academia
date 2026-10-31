@@ -2038,16 +2038,39 @@ db.create_teacher("Teacher A")
 teacher = db.get_all_teachers()[0]["ID"]
 group = ["Choi Doyun", "Han Sora", "Kang Minji", "Nam Jihoon", "Oh Minseok", "Seo Yerin"]
 
-def lesson(day, subject, names, start):
-    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": start,
+def lesson(day, subject, names, start, cell):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": start, "cell": cell,
             "end_time": dt.time(start.hour + 1, start.minute), "warnings": [],
             "attendance": [{"student_name": n, "status": "Attending"} for n in names]}
 
-sb.backfill({"sessions": [lesson(20, "(unnamed class) · Sun 13:30", group, dt.time(13, 30)),
-                          lesson(27, "(unnamed class) · Sun 13:30", group, dt.time(13, 30)),
-                          lesson(8, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30)),
-                          lesson(15, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30)),
-                          lesson(25, "(unnamed class)", ["Bae Yuna", "Lim Taeo"], dt.time(16))]}, teacher)
+sheet = [lesson(20, "(unnamed class) · Sun 13:30", group, dt.time(13, 30), "Sep26!B20"),
+         lesson(27, "(unnamed class) · Sun 13:30", group, dt.time(13, 30), "Sep26!B27"),
+         lesson(8, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30), "Sep26!C8"),
+         lesson(15, "(unnamed class) · Pak Doyun", ["Pak Doyun"], dt.time(16, 30), "Sep26!C15"),
+         lesson(25, "(unnamed class)", ["Bae Yuna", "Lim Taeo"], dt.time(16), "Sep26!D25")]
+sb.backfill({"sessions": sheet}, teacher)
+days = [dt.date(2026, 9, d) for d in range(1, 31)]
+
+def invoice_lines():
+    with db.SessionLocal() as s:
+        return sorted((row.session_id, row.invoice_id) for row in s.query(db.InvoiceItem).all())
+
+def cells_listed():
+    return {u["Class"]: [cell for _, cell in u["Cells"]] for u in db.get_unnamed_subjects()}
+
+# The same sheet again with one lesson moved to another cell: only that note changes.
+lines_before = invoice_lines()
+moved = [dict(item, cell="Sep26!E8") if item["cell"] == "Sep26!C8" else item for item in sheet]
+again = sb.backfill({"sessions": moved}, teacher, dates=days)["created"]
+reupload = [again.get("sessions_updated", 0), again.get("sessions_unchanged", 0), invoice_lines() == lines_before]
+# Editing a lesson rewrites its student places: the cell stays with them.
+pak = next(u for u in db.get_unnamed_subjects() if "Pak Doyun" in u["Students"])
+with db.SessionLocal() as s:
+    edited = s.query(db.ClassSession).filter(db.ClassSession.class_id == pak["Class ID"],
+                                             db.ClassSession.session_date == dt.date(2026, 9, 8)).one().id
+held = db.get_schedule_session(edited)
+db.update_schedule_session(edited, session_date=held["Date"], start_time=held["Start"], end_time=held["End"],
+                           status=held["Status"], note="moved room", attendance_rows=held["Attendance"])
 
 page = '''
 import sys, types
@@ -2063,9 +2086,11 @@ at.run()
 # Badges escape their colons; the screen shows them plain.
 rows = [m.value.replace("\\", "") for m in at.markdown if "class(es)" in m.value]
 boxes = [t for t in at.text_input if t.key.startswith("name_subject_teachers_")]
+listed = cells_listed()
 popovers = at.get("popover")
 result = {"errors": [e.value for e in at.exception], "rows": rows, "markdown": [m.value for m in at.markdown],
-          "boxes": len(boxes), "more": [p.proto.popover.label for p in popovers]}
+          "boxes": len(boxes), "more": [p.proto.popover.label for p in popovers],
+          "reupload": reupload, "listed": listed}
 boxes[0].set_value("G9 Test Reading")
 at.button(key="name_subjects_teachers").click().run()
 result["left"] = len(db.get_unnamed_subjects())
@@ -2080,6 +2105,9 @@ def t_unnamed_subject_rows():
     no slot in its name at all. Both still show their day and time from the
     lessons, and the student only once. Past four students the rest open from
     "and 2 more", and naming a subject still saves from the box under its row.
+    Each row shows the workbook cells of its lessons. A later upload updates
+    them without counting the lesson as changed or touching its invoice lines,
+    and editing the lesson keeps them.
     """
     import json
     import tempfile
@@ -2094,13 +2122,15 @@ def t_unnamed_subject_rows():
     alone = next(row for row in got["rows"] if "Pak Doyun" in row)
     assert "Tue 16:30" in alone and alone.count("Pak Doyun") == 1, alone
     plain = next(row for row in got["rows"] if "Bae Yuna" in row)
-    assert "Fri 16:00" in plain and "25 Sep" in plain and "–" not in plain, plain
+    assert "Fri 16:00" in plain and "25 Sep" in plain and "Sep26!D25" in plain, plain
     many = next(row for row in got["rows"] if "Choi Doyun" in row)
     assert "Sun 13:30" in many and "Oh Minseok" not in many and "more" not in many, many
-    assert got["more"] == ["and 2 more"], got["more"]
+    assert sorted(got["more"]) == ["`Sep26!B20` and 1 more", "`Sep26!E8` and 1 more", "and 2 more"], got["more"]
+    assert got["reupload"] == [0, 5, True], got["reupload"]
+    assert got["listed"]["(unnamed class) · Pak Doyun"] == ["Sep26!E8", "Sep26!C15"], got["listed"]
     assert any(all(name in text for name in ("Choi Doyun", "Oh Minseok", "Seo Yerin")) for text in got["markdown"]), got["markdown"]
     assert got["boxes"] == 3 and got["left"] == 2, got
-    return "one-to-one and no-slot rows show their real time; extra students open from \"and 2 more\""
+    return "real time on every row; extra students and cells open; a re-upload moves only the cell, an edit keeps it"
 
 
 _NOT_ADDED_SCRIPT = r"""

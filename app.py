@@ -1147,14 +1147,20 @@ def _unnamed_subjects(key: str, year: int | None = None, month: int | None = Non
         names = item["Students"]
         more = len(names) - 4
         who = ", ".join(_student(name) for name in names[:4]) if more > 0 else _chips("student", names)
+        cells = item["Cells"]
+        where = f" · {_cell_list([cells[0][1]])}" if len(cells) == 1 else ""
         with st.container(horizontal=True, vertical_alignment="center"):
-            st.markdown(f"{_teacher(item['Teacher'])} · {times}{item['Lessons']} class(es), {span} · {who}",
+            st.markdown(f"{_teacher(item['Teacher'])} · {times}{item['Lessons']} class(es), {span} · {who}{where}",
                         width="content")
+            # These open without a rerun, so names typed in the boxes stay as they are.
             if more > 0:
-                # Opens without a rerun, so names typed in the boxes stay as they are.
                 with st.popover(f"and {more} more", type="tertiary",
                                 key=f"name_subject_more_{key}_{item['Class ID']}"):
                     st.markdown(_chips("student", names, most=99))
+            if len(cells) > 1:
+                with st.popover(f"{_cell_list([cells[0][1]])} and {len(cells) - 1} more", type="tertiary",
+                                key=f"name_subject_cells_{key}_{item['Class ID']}"):
+                    st.markdown("  \n".join(f"{_when(f'{day:%d %b}')} {_cell_list([cell])}" for day, cell in cells))
         typed[item["Class ID"]] = st.text_input(
             f"Subject name for {item['Class']}",
             key=f"name_subject_{key}_{item['Class ID']}",

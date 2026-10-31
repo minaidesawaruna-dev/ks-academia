@@ -800,6 +800,12 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             else:
                 created[f"lessons_{outcome}"] += 1
 
+    db.remember_lesson_cells(teacher_id, {
+        (existing[name.casefold()], item["date"], item["start_time"]): item["cell"]
+        for name, items in by_class.items() if name.casefold() in existing
+        for item in items if item.get("cell")
+    })
+
     # Price every subject in this workbook that still has the placeholder: by its
     # students' grades, or $60 by default. Done now that the lessons and students are in.
     imported_class_ids = {

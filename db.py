@@ -1624,10 +1624,10 @@ def _replace_session_attendance(session, session_id, attendance_rows):
     # added is carried over. Places in a class are sometimes first come, first served.
     """Replace a lesson's roster with `attendance_rows`, inside the caller's transaction.
 
-    Students keep their place in the order; new ones go at the end. Inactive
-    students are skipped.
+    Students keep their place in the order and the workbook cell they came
+    from; new ones go at the end. Inactive students are skipped.
     """
-    added, place = {}, {}
+    added, place, cell = {}, {}, {}
     for position, old_row in enumerate(session.scalars(
         select(SessionAttendance)
         .where(SessionAttendance.session_id == session_id)
@@ -1635,6 +1635,7 @@ def _replace_session_attendance(session, session_id, attendance_rows):
     ).all()):
         added[old_row.student_id] = old_row.created_at
         place[old_row.student_id] = position
+        cell[old_row.student_id] = old_row.source_cell
         session.delete(old_row)
 
     # One row per student, the first one given: two rows for the same child would
@@ -1667,6 +1668,7 @@ def _replace_session_attendance(session, session_id, attendance_rows):
             is_cancelled=bool(row.get("is_cancelled")),
             is_paid=bool(row.get("is_paid")),
             on_roster=1,
+            source_cell=cell.get(row["student_id"]),
             note=(row.get("note") or "").strip() or None,
             # A newcomer's time is set here, not by the database default, which SQLite writes
             # in a format that sorts before times carried over from the same second.
@@ -2247,13 +2249,44 @@ def merge_students(keep_id, drop_id, dry_run=False):
         return summary
 
 
+def remember_lesson_cells(teacher_id, cells):
+    """Note the workbook cell each of a teacher's lessons came from, so a flag can point at it.
+
+    `cells` maps (class id, date, start time) to a cell such as "Sep26!G19".
+    It's kept on the lesson's student places. Only that field is written, so
+    invoices and credits aren't touched and a lesson doesn't count as changed.
+    Returns how many places changed.
+    """
+    with SessionLocal() as session:
+        lessons = session.execute(
+            select(ClassSession.id, ClassSession.class_id, ClassSession.session_date, ClassSession.start_time)
+            .where(ClassSession.teacher_id == teacher_id)
+        ).all()
+        wanted = {}
+        for lesson_id, class_id, day, start in lessons:
+            cell = cells.get((class_id, as_date(day), as_time(start)))
+            if cell:
+                wanted[lesson_id] = cell[:40]
+        places = session.execute(
+            select(SessionAttendance.id, SessionAttendance.session_id, SessionAttendance.source_cell)
+            .where(SessionAttendance.session_id.in_(list(wanted)))
+        ).all() if wanted else []
+        changes = [{"id": place_id, "source_cell": wanted[lesson_id]}
+                   for place_id, lesson_id, held in places if held != wanted[lesson_id]]
+        if changes:
+            session.execute(update(SessionAttendance), changes)
+            session.commit()
+    return len(changes)
+
+
 def get_unnamed_subjects(year=None, month=None):
     """Return the subjects a workbook gave no name, with enough detail to tell them apart.
 
     A class cell with students and a time but no subject line comes in as
     "(unnamed class) · Sun 13:30", and that's what the invoices say. Its
     teacher, times and students let the admin name it. "Times" is read from
-    its lessons, most used first, as a one-to-one's name holds no time. With
+    its lessons, most used first, as a one-to-one's name holds no time.
+    "Cells" is each lesson's date and workbook cell, where one was noted. With
     `year` and `month`, only those with a lesson that month.
     """
     from schedule_parser import UNNAMED_CLASS
@@ -2278,6 +2311,11 @@ def get_unnamed_subjects(year=None, month=None):
             .join(Student, Student.id == SessionAttendance.student_id)
             .where(ClassSession.class_id.in_(ids))
         ).all()
+        noted = session.execute(
+            select(ClassSession.class_id, ClassSession.session_date, SessionAttendance.source_cell).distinct()
+            .join(SessionAttendance, SessionAttendance.session_id == ClassSession.id)
+            .where(ClassSession.class_id.in_(ids), SessionAttendance.source_cell.is_not(None))
+        ).all()
         issued = dict(session.execute(
             select(ClassSession.class_id, func.count(InvoiceItem.id))
             .join(ClassSession, ClassSession.id == InvoiceItem.session_id)
@@ -2291,6 +2329,9 @@ def get_unnamed_subjects(year=None, month=None):
         day = as_date(when)
         dates[class_id].append(day)
         times[class_id][f"{day:%a} {as_time(start):%H:%M}"] += 1
+    cells: dict[int, list] = defaultdict(list)
+    for class_id, when, cell in noted:
+        cells[class_id].append((as_date(when), cell))
     students: dict[int, set] = defaultdict(set)
     for class_id, name in roster:
         students[class_id].add(name)
@@ -2304,6 +2345,7 @@ def get_unnamed_subjects(year=None, month=None):
             "Lessons": len(days), "First": days[0] if days else None,
             "Last": days[-1] if days else None,
             "Times": [slot for slot, _ in times[class_id].most_common()],
+            "Cells": sorted(cells[class_id]),
             "Students": sorted(students[class_id], key=str.casefold),
             "Issued lines": int(issued.get(class_id, 0)),
         })
