@@ -2103,6 +2103,119 @@ def t_unnamed_subject_rows():
     return "one-to-one and no-slot rows show their real time; extra students open from \"and 2 more\""
 
 
+_NOT_ADDED_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, start, cell=None):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": start, "cell": cell,
+            "end_time": dt.time(start.hour + 2, start.minute), "warnings": [],
+            "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}
+
+four, half_four = dt.time(16), dt.time(16, 30)
+sb.backfill({"sessions": [lesson(7, "G10 Test Math", dt.time(10))]}, ids["Teacher B"])
+sb.backfill({"sessions": [lesson(7, "G9 Test Eng", four)]}, ids["Teacher A"])
+upload = {"sessions": [lesson(7, "G9 Test Eng", four, "Sep26!B7"),         # already there
+                       lesson(7, "G9 Test Art", half_four, "Sep26!C7"),    # a new subject over that lesson
+                       lesson(14, "G9 Test Art", half_four, "Sep26!C14"),  # so all of it stays out
+                       lesson(14, "G9 Test Eng", four, "Sep26!B14"),       # new, and goes in
+                       lesson(14, "G9 Test Eng", half_four, "Sep26!D14"),  # over the lesson above
+                       lesson(21, "G10 Test Math", four, "Sep26!E21")]}    # Teacher B's subject
+days = [dt.date(2026, 9, d) for d in (7, 14, 21)]
+listed = []
+plan = sb.plan_import(upload, ids["Teacher A"], dates=days, not_added=listed)[(2026, 9)]
+plain = sb.plan_import(upload, ids["Teacher A"], dates=days)[(2026, 9)]
+print(json.dumps({
+    "listed": sorted([item["cell"], item["reason"]] for item in listed),
+    "counts": [plan["new"], plan["unchanged"], plan["clash"], plan["skipped"]],
+    "same_without_list": plan == plain,
+    "student": sb.student_cells(upload["sessions"][:2], "Nam Jihoon"),
+    "subject": sb.subject_cells(upload["sessions"], "G9 Test Art"),
+}))
+"""
+
+
+def t_not_added_names_cells():
+    """Each lesson an upload can't add is listed with its workbook cell and the reason.
+
+    The table only used to give a number, so nobody could tell where in the
+    workbook to look. A new subject over a lesson on the calendar stays out
+    whole, a new lesson over another one stays out, and a subject another
+    teacher has is skipped. The counts are the same with or without the list.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "added.db").replace("\\", "/")
+        result = run(["-c", _NOT_ADDED_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["listed"] == [["Sep26!C14", "clash"], ["Sep26!C7", "clash"], ["Sep26!D14", "clash"],
+                             ["Sep26!E21", "skipped"]], got["listed"]
+    assert got["counts"] == [1, 1, 3, 1] and got["same_without_list"], got
+    assert got["student"] == ["Sep26!B7", "Sep26!C7"] and got["subject"] == ["Sep26!C7", "Sep26!C14"], got
+    return "clashes and taken names each listed with their cell; counts unchanged"
+
+
+_DATABASE_CHECK_SCRIPT = r"""
+import json, db
+from sqlalchemy import Column, String
+from streamlit.testing.v1 import AppTest
+
+real_check = db.initialise_database
+calls = []
+
+def counted_check():
+    calls.append(1)
+    real_check()
+
+db.initialise_database = counted_check
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.run()
+at.run()
+after_two_clicks = len(calls)
+# What a new version deployed without a restart looks like: the same tables, one more column.
+db.Teacher.__table__.append_column(Column("added_later", String(10)))
+at.run()
+at.run()
+print(json.dumps({"calls": [after_two_clicks, len(calls)], "errors": [e.value for e in at.exception]}))
+"""
+
+
+def t_database_check_covers_columns():
+    """A new column makes the database check run again, even without a restart.
+
+    The check runs once per process, keyed on what the code defines. When
+    that was only the tables, a new column kept the old key, so the column
+    was never added and every query asking for it failed. Ordinary clicks
+    must still skip the check.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "check.db").replace("\\", "/")
+        result = run(["-c", _DATABASE_CHECK_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["calls"] == [1, 2], f"the check ran {got['calls']} times, expected once, then once more"
+    return "skipped on ordinary clicks; runs again for a new column without a restart"
+
+
 _RENAME_SUBJECT_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from sqlalchemy import event, select
@@ -2633,6 +2746,8 @@ for name, fn in [
     ("Delete records inside a year or month", t_delete_by_period),
     ("Delete records where a student and classes meet", t_delete_where_they_meet),
     ("renaming a subject", t_rename_subject),
+    ("classes not added name their cells", t_not_added_names_cells),
+    ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),
     ("editing a month on Create/Edit schedule", t_edit_month_in_app),
     ("a month's invoices downloaded again", t_month_invoices_again),

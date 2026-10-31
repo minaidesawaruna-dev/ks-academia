@@ -87,22 +87,24 @@ _authenticator = auth.require_login()
 auth.logout_button(_authenticator)
 
 @st.cache_resource
-def _ensure_database_ready(tables: tuple[str, ...]) -> bool:
+def _ensure_database_ready(columns: tuple[str, ...]) -> bool:
     """Check the database tables once per process, not on every click.
 
     Streamlit reruns this file from the top on every click, so anything at
     the top level runs on every button press. Even the quick check costs a
     few database round trips each time.
 
-    The cache key is the list of tables the code defines. If a new version
-    is deployed without a restart, a new table changes the key, so the check
-    runs again instead of the new code hitting a database without the table.
+    The cache key is every table and column the code defines. If a new version
+    is deployed without a restart, a new table or column changes the key, so
+    the check runs again instead of the new code hitting a database without it.
     """
     db.initialise_database()
     return True
 
 
-_ensure_database_ready(tuple(sorted(db.Base.metadata.tables)))
+_ensure_database_ready(tuple(sorted(
+    f"{table.name}.{column.name}" for table in db.Base.metadata.tables.values() for column in table.columns
+)))
 
 LESSON_STATUSES = ["Scheduled", "Completed", "Cancelled"]
 
@@ -194,6 +196,12 @@ def _chips(kind: str, names, most: int = 6) -> str:
     if len(chips) > most:
         return ", ".join(chips[:most]) + f" and {len(chips) - most} more"
     return ", ".join(chips[:-1]) + " and " + chips[-1] if len(chips) > 1 else "".join(chips)
+
+
+def _cell_list(cells, most: int = 3) -> str:
+    """Return workbook cells as code text: "`Sep26!G19`, `Sep26!H3` and 4 more"."""
+    shown = ", ".join(f"`{cell}`" for cell in cells[:most])
+    return shown + (f" and {len(cells) - most} more" if len(cells) > most else "")
 
 
 def _chip_key() -> None:
@@ -652,9 +660,10 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
     """
     planned = {**preview, "sessions": copy.deepcopy(preview["sessions"])}
     planned["sessions"] = schedule_backfill.apply_review_decisions(planned, decisions)
+    not_added: list[dict] = []
     plan = schedule_backfill.plan_import(
         planned, teacher_id, name_overrides=name_overrides,
-        student_matches=student_matches, dates=planned.get("dates_shown"),
+        student_matches=student_matches, dates=planned.get("dates_shown"), not_added=not_added,
     )
     if not plan:
         return
@@ -687,11 +696,32 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
     if totals["changed_invoiced"]:
         notes.append(f"{totals['changed_invoiced']} changed class(es) already invoiced: anyone "
                      "taken off or cancelled is credited, anyone added is billed next.")
-    if totals["clash"] + totals["skipped"]:
-        notes.append("Not added: the teacher already has a class at that time, or another "
-                     "teacher's subject has that name.")
     if notes:
         st.caption(" ".join(notes))
+    if not_added:
+        _not_added_panel(not_added)
+
+
+def _not_added_panel(lessons: list[dict]) -> None:
+    """List the lessons an upload can't add, each with its Excel cell, so it can be found and fixed."""
+    why = {"clash": "The teacher already has a class then",
+           "skipped": "Another teacher's subject has this name"}
+    with st.expander(f"Not added ({len(lessons)}) — each with its Excel cell"):
+        st.dataframe(
+            _coloured([
+                {
+                    # A month planned in the app has no workbook behind it, so no cell.
+                    **({"Cell": item["cell"]} if item.get("cell") else {}),
+                    "Date": f"{item['date']:%a %d %b %Y}",
+                    "Time": f"{item['start_time']:%H:%M}–{item['end_time']:%H:%M}",
+                    "Subject": item["class_name"],
+                    "Why": why[item["reason"]],
+                }
+                for item in sorted(lessons, key=lambda x: (x["date"], x["start_time"]))
+            ]),
+            width="stretch",
+            hide_index=True,
+        )
 
 
 def _import_upload_panel() -> None:
@@ -863,6 +893,10 @@ def _import_upload_panel() -> None:
                 key=f"import_review_{scope}_{index}",
             )
             decisions[index] = "merge" if choice.startswith("Merge") else "separate"
+            written = [f"{_student(name)}: {_cell_list(found_in)}" for name in review["names"]
+                       if (found_in := schedule_backfill.student_cells(preview["sessions"], name))]
+            if written:
+                st.caption(" · ".join(written))
 
     student_matches: dict[str, int] = {}
     match_candidates = schedule_backfill.suggest_student_matches(preview["sessions"], teacher_id)
@@ -888,6 +922,9 @@ def _import_upload_panel() -> None:
             )
             if choice.startswith("Same as"):
                 student_matches[candidate["parsed_name"].casefold()] = candidate["existing_id"]
+            found_in = schedule_backfill.student_cells(preview["sessions"], candidate["parsed_name"])
+            if found_in:
+                st.caption(f"In the sheet: {_cell_list(found_in)}")
 
     name_overrides: dict[str, str] = {}
     if teacher_name:
@@ -944,6 +981,9 @@ def _import_upload_panel() -> None:
                 )
                 if choice.startswith("Merge"):
                     merged_into[drop] = keep
+                found_in = schedule_backfill.subject_cells(preview["sessions"], drop)
+                if found_in:
+                    st.caption(f"{_subject(drop)} in the sheet: {_cell_list(found_in)}")
 
         # Clashes are checked against the names that will actually be created: a merged
         # subject under the name it merges into, and a newly named class under the name
@@ -966,6 +1006,9 @@ def _import_upload_panel() -> None:
                     key=f"import_rename_{generation}_{original}",
                 )
                 renamed_to[original] = new_name.strip() or suggestion
+                found_in = schedule_backfill.subject_cells(effective, original)
+                if found_in:
+                    st.caption(f"In the sheet: {_cell_list(found_in)}")
 
         # backfill applies these in one pass, without following chains, so each original
         # spelling must point straight to its final name: a merged name follows its

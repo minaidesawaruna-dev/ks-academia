@@ -137,6 +137,17 @@ def use_subject_spellings(preview: dict[str, Any], teacher_id: int | None) -> di
     ]}
 
 
+def student_cells(sessions: list[dict[str, Any]], name: str) -> list[str]:
+    """Return the workbook cells a student's name is written in."""
+    return [item["cell"] for item in sessions if item.get("cell")
+            and any(entry["student_name"] == name for entry in item["attendance"])]
+
+
+def subject_cells(sessions: list[dict[str, Any]], name: str) -> list[str]:
+    """Return the workbook cells of a subject's lessons."""
+    return [item["cell"] for item in sessions if item.get("cell") and item["class_name"] == name]
+
+
 def suggest_subject_merges(sessions: list[dict[str, Any]], on_file=()) -> list[dict[str, Any]]:
     """Find subjects in one workbook that are the same class typed two ways.
 
@@ -948,7 +959,8 @@ def preview_from_lessons(lessons: list[dict[str, Any]], year: int, month: int) -
 def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 name_overrides: dict[str, str] | None = None,
                 student_matches: dict[str, int] | None = None,
-                dates=None, today: dt.date | None = None) -> dict[tuple[int, int], Counter]:
+                dates=None, today: dt.date | None = None,
+                not_added: list[dict] | None = None) -> dict[tuple[int, int], Counter]:
     """Work out what an upload would change, month by month, without saving anything.
 
     Follows backfill step by step (same names, same students, same lessons
@@ -956,6 +968,8 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     For each month it counts: new, changed, unchanged, removed, changed_invoiced,
     removed_invoiced, held (only its date has passed), clash (the teacher already
     has a class then) and skipped (another teacher's subject has that name).
+    A list passed as `not_added` is filled with each clash and skipped lesson
+    and the reason, so the screen can point at its cell in the workbook.
     """
     today = today or dt.date.today()
     preview = use_subject_spellings(preview, teacher_id)
@@ -1001,6 +1015,12 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                    and (excluded is None or lesson_id != excluded)
                    for start, end, lesson_id in on_calendar[session["date"]])
 
+    def leave_out(session, reason):
+        """Count a lesson that won't go in, and note it for the screen."""
+        counts[_month_of(session["date"])][reason] += 1
+        if not_added is not None:
+            not_added.append({**session, "reason": reason})
+
     for class_name, class_sessions in sorted(by_class.items()):
         class_sessions = sorted(class_sessions, key=lambda item: (item["date"], item["start_time"]))
         class_id = existing.get(class_name.casefold())
@@ -1008,7 +1028,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             if class_name.casefold() in taken_elsewhere or clashes(class_sessions[0]):
                 reason = "skipped" if class_name.casefold() in taken_elsewhere else "clash"
                 for session in class_sessions:
-                    counts[_month_of(session["date"])][reason] += 1
+                    leave_out(session, reason)
                 continue
         names_here = _names_for_class(class_id, name_to_id, same_name, rosters, taught)
         for session in class_sessions:
@@ -1016,7 +1036,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             current = stored.get((class_id, session["date"], session["start_time"])) if class_id else None
             if current is None:
                 if clashes(session):
-                    month["clash"] += 1
+                    leave_out(session, "clash")
                     continue
                 on_calendar[session["date"]].append((session["start_time"], session["end_time"], None))
                 month["new"] += 1
@@ -1030,7 +1050,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 # Nothing in the workbook changed; only the class's date has passed.
                 month["held"] += 1
             elif clashes(session, excluded=current["ID"]):
-                month["clash"] += 1
+                leave_out(session, "clash")
             else:
                 month["changed"] += 1
                 month["changed_invoiced"] += current["Invoiced"]
