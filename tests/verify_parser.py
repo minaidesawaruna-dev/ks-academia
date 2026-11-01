@@ -510,6 +510,58 @@ def t_standard_rate_by_grade():
     return "Grade 10 and below $60/h, above $65/h, no grade no price"
 
 
+def _one_day_sheet(class_cell, marks_cell=None):
+    """Return a small workbook with one class cell, and optionally the cell beside it."""
+    import datetime as dt
+    import io
+    from openpyxl import Workbook
+
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Sep 2026"
+    sheet.cell(row=1, column=2, value="7(MON)")
+    sheet.cell(row=1, column=4, value="8(TUE)")
+    for offset in range(8):
+        sheet.cell(row=2 + offset, column=1, value=dt.time(9 + offset, 0))
+    sheet.cell(row=2, column=2, value=class_cell)
+    if marks_cell:
+        sheet.cell(row=2, column=3, value=marks_cell)
+    out = io.BytesIO()
+    book.save(out)
+    return out.getvalue()
+
+
+def t_impossible_time_flagged():
+    """A time with over 59 minutes is flagged at its cell, and the rest of the upload still reads."""
+    book = _one_day_sheet("G9 Test Eng\n9.75am-11am\nNam Jihoon")
+    preview = sp.parse_workbook(book, ["Sep 2026"], 2026)
+    assert preview["sessions"] == [], preview["sessions"]
+    flagged = [w for w in preview["warnings"] if "more than 59 minutes" in w["message"]]
+    assert len(flagged) == 1 and flagged[0]["coordinate"] == "B2", preview["warnings"]
+    assert sp.parse_time_range("9.60am-11am") is None
+    return "the cell is named, nothing is guessed, and the upload carries on"
+
+
+def t_unlabelled_mark_keeps_status():
+    """A name beside the class with no label doesn't undo a status already on that student."""
+    book = _one_day_sheet("G9 Test Eng\n9am-11am\nSeo Yerin(결석)\nNam Jihoon", "Seo Yerin")
+    session = sp.parse_workbook(book, ["Sep 2026"], 2026)["sessions"][0]
+    marks = {entry["student_name"]: entry["status"] for entry in session["attendance"]}
+    assert marks == {"Seo Yerin": sp.CANCELLED, "Nam Jihoon": sp.ATTENDING}, marks
+    return "an absent student stays absent"
+
+
+def t_export_drops_control_characters():
+    """A control character in a name doesn't stop a month's export."""
+    import datetime as dt
+    import schedule_writer as sw
+
+    data = sw.write_month([{"date": dt.date(2026, 9, 7), "start": dt.time(9), "end": dt.time(11),
+                            "subject": "G9 Test\x0bEng", "students": ["Nam\x01Jihoon"]}], 2026, 9)
+    assert data[:2] == b"PK", data[:4]
+    return "the sheet is written without them"
+
+
 def t_export_fits_the_lessons():
     """An exported sheet runs from the first lesson to the last, and still reads back cleanly."""
     import schedule_writer as sw
@@ -1139,6 +1191,9 @@ for name, fn in [
     ("status stays with its student", t_status_stays_with_student),
     ("a written sheet reads back", t_written_sheet_reads_back),
     ("misread names caught before download", t_readback_catches_names),
+    ("impossible time flagged at its cell", t_impossible_time_flagged),
+    ("unlabelled mark keeps a status", t_unlabelled_mark_keeps_status),
+    ("export drops control characters", t_export_drops_control_characters),
 ]:
     check(name, fn)
 

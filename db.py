@@ -914,6 +914,18 @@ def get_unpriced_subjects(class_ids=None):
     at; otherwise years of lessons billed before the app kept prices would
     all show as unpriced.
     """
+    return _subjects_to_bill(lambda rate, when: rate <= UNSET_RATE, class_ids)
+
+
+def get_subjects_at_rate(price, year=None, month=None):
+    """Return each subject with a lesson still to bill at this price, in one month or any."""
+    return _subjects_to_bill(
+        lambda rate, when: abs(rate - price) < 0.005 and (not month or (when.year, when.month) == (int(year), int(month)))
+    )
+
+
+def _subjects_to_bill(wanted, class_ids=None):
+    """Return each subject with a lesson still to bill that `wanted(rate, date)` picks, and their months."""
     # The database checks which lessons are already on a sent invoice, so a month
     # that's fully billed returns nothing here, instead of fetching every lesson and
     # every invoice line just to throw them away.
@@ -956,7 +968,7 @@ def get_unpriced_subjects(class_ids=None):
             when = as_date(when)
             if session_id in counted:
                 continue
-            if _rate_lookup(rates, class_id, when) > UNSET_RATE:
+            if not wanted(_rate_lookup(rates, class_id, when), when):
                 continue
             counted.add(session_id)
             item = subjects.setdefault(class_id, {
@@ -1607,12 +1619,16 @@ def _teacher_has_conflict(
     end_time,
     excluded_session_id=None,
 ):
-    """Return True if the teacher already has a lesson overlapping this time on that date."""
+    """Return True if the teacher already has a lesson overlapping this time on that date.
+
+    A cancelled class doesn't count: its slot is free for a replacement.
+    """
     query = select(ClassSession).where(
         ClassSession.teacher_id == teacher_id,
         ClassSession.session_date == session_date,
         ClassSession.start_time < end_time,
         ClassSession.end_time > start_time,
+        ClassSession.status != "Cancelled",
     )
     if excluded_session_id is not None:
         query = query.where(ClassSession.id != excluded_session_id)
@@ -1976,7 +1992,7 @@ def update_schedule_session(
         class_session = session.get(ClassSession, session_id)
         if class_session is None:
             return "not_found"
-        if _teacher_has_conflict(
+        if status != "Cancelled" and _teacher_has_conflict(
             session,
             class_session.teacher_id,
             session_date,
@@ -4284,6 +4300,30 @@ def get_credits(status=None, student_id=None):
             key=lambda row: (row["Status"] != "Open", row["Class date"] or date.min),
         )
         return results
+
+
+def get_credits_back_on_lesson():
+    """Return used or refunded credits whose student is on that class again.
+
+    Putting a student back only drops a credit nobody has used yet. Once it's
+    come off an invoice or been paid back it stays, and any balance carried
+    forward from it stays too, so the student has that money back for a class
+    they're now in. Nothing is charged by itself; this is how the admin finds
+    out, so they can decide whether to add the charge by editing an invoice.
+    """
+    with SessionLocal() as session:
+        rows = session.execute(
+            select(Credit, Student.full_name)
+            .join(Student, Student.id == Credit.student_id)
+            .join(ClassSession, ClassSession.id == Credit.session_id)
+            .join(SessionAttendance, and_(SessionAttendance.session_id == Credit.session_id,
+                                          SessionAttendance.student_id == Credit.student_id))
+            .where(Credit.status != "Open", SessionAttendance.is_cancelled.is_(False),
+                   ClassSession.status != "Cancelled")
+            .order_by(Credit.session_date, Credit.id)
+        ).all()
+        return [{"Student": name, "Subject": credit.class_name or "", "Class date": credit.session_date,
+                 "Amount": float(credit.amount or 0), "Status": credit.status} for credit, name in rows]
 
 
 def refund_credits(credit_ids, refunded_on=None):

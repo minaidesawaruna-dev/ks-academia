@@ -636,6 +636,8 @@ def parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
 
     start_minute = int(match.group("sm") or 0)
     end_minute = int(match.group("em") or 0)
+    if max(start_minute, end_minute) > 59:
+        return None
     start_flag = match.group("sap")
     end_flag = match.group("eap")
 
@@ -669,6 +671,16 @@ def _is_time_line(line: str) -> bool:
     remainder = (line[: match.start()] + line[match.end():]).strip()
     remainder = re.sub(r"[\s\-~()\[\].,:]", "", remainder)
     return remainder == ""
+
+
+def _impossible_time(text: str) -> str | None:
+    """Return the first line of a cell that is a time with over 59 minutes ("9.75am-11am"), or None."""
+    for line in _cell_lines(text):
+        match = TIME_RANGE_RE.search(line)
+        if match and max(int(match.group("sm") or 0), int(match.group("em") or 0)) > 59 and (
+                _is_time_line(line) or _AMPM.search(match.group(0))):
+            return line
+    return None
 
 
 # The grade in a class name, and the price per hour for it.
@@ -1890,6 +1902,17 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                 elif row > axis_end:
                     if _ABSENCE_WORD.search(cell.value):
                         absence_notes.append((cell.coordinate, cell.value))
+                elif _impossible_time(cell.value):
+                    warnings.append(
+                        _warning(
+                            f"the time {_impossible_time(cell.value)} has more than 59 minutes, "
+                            "so this cell was not read as a class — fix the time in the cell.",
+                            sheet=sheet_name,
+                            coordinate=cell.coordinate,
+                            date=session_date,
+                            cell_text=cell.value,
+                        )
+                    )
                 else:
                     status_cells.append(
                         (row, column, parsed, _fill_key(cell), cell.value)
@@ -2123,6 +2146,8 @@ def _parse_sheet(worksheet, month: int | None, year: int):
                             )
                         )
                     previous = attendance[index]["status"]
+                    if entry["status"] is None:
+                        status = previous  # a name with no label says nothing new about them
                     if previous not in (ATTENDING, status):
                         session_warnings.append(
                             _warning(

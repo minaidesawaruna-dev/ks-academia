@@ -1223,6 +1223,33 @@ def _unpriced_everywhere() -> None:
         )
 
 
+def _default_price_notice(year: int | None = None, month: int | None = None) -> None:
+    """Warn about subjects billing at the $60 default because their grade isn't clear.
+
+    Once saved, the default passes every price check, so this is the only sign
+    that nobody decided it. To clear one, give it its price on Teachers.
+    """
+    subjects = schedule_backfill.default_priced(year, month)
+    if not subjects:
+        return
+    st.warning(f"**{len(subjects)} subject(s) are on the {_money(f'${schedule_parser.JUNIOR_RATE:,.0f}/h')} "
+               "default** because their grade isn't clear. Check the price before sending.")
+    with st.expander("Which"):
+        st.dataframe(
+            _coloured([
+                {
+                    "Teacher": item["Teacher"],
+                    "Subject": item["Class"],
+                    "Lessons": item["Sessions"],
+                    "Because": item["Because"],
+                }
+                for item in subjects
+            ]),
+            width="stretch",
+            hide_index=True,
+        )
+
+
 def _save_subject_rate(class_id: int, month_start: dt.date, rate: float) -> str:
     """Price one subject from a whole calendar month onward.
 
@@ -1559,6 +1586,7 @@ def teachers_tab() -> None:
                                              label_visibility="collapsed")
             if columns[2].button("Rename", key="teacher_save", width="stretch"):
                 if db.update_teacher_name(record["ID"], new_name):
+                    _teaching_activity.clear()
                     _flash("Renamed.")
                     _rerun()
                 else:
@@ -1573,6 +1601,7 @@ def teachers_tab() -> None:
         return
 
     _unpriced_everywhere()
+    _default_price_notice()
     _unnamed_subjects("teachers")
     st.markdown("#### Teacher detail")
     _teacher_drilldown(teachers)
@@ -2979,6 +3008,14 @@ def credits_tab() -> None:
     come off anything.
     """
     st.caption("Classes already invoiced, then missed. Each comes off the student's next invoice.")
+    back = db.get_credits_back_on_lesson()
+    if back:
+        lines = [" · ".join((_student(item["Student"]), _subject(item["Subject"]),
+                             _when(item["Class date"].strftime("%d %b %Y")), _money(item["Amount"])))
+                 for item in back]
+        st.warning("**Back on a class they were credited for.** The credit stays, because it's already "
+                   "been used or refunded. To charge the class again, edit one of their invoices:  \n"
+                   + "  \n".join(lines))
     credits = db.get_credits()
 
     # By the month of the missed lesson, to answer "what did September's
@@ -3860,6 +3897,7 @@ def invoices_tab() -> None:
     # nothing riding on its prices, and saying so every time would be clutter.
     if month_items:
         _unpriced_warning(year, month)
+        _default_price_notice(year, month)
         _unnamed_subjects("invoices", year, month)
 
     shown_items = [row for row in month_items if needle in row["Student"].casefold()]

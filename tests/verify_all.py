@@ -2551,6 +2551,212 @@ def t_part_payment_follows_invoice():
     return "each invoice has its own amount, starting at what it owes; $0 is refused"
 
 
+_REUPLOAD_KEEPS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+day = dt.date(2026, 9, 7)
+
+def sheet():
+    return {"sessions": [{"date": day, "class_name": "G9 Test Eng", "start_time": dt.time(16),
+                          "end_time": dt.time(18), "warnings": [],
+                          "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}]}
+
+sb.backfill(sheet(), teacher)
+lesson = db.get_month_schedule(teacher, 2026, 9)[0]["ID"]
+detail = db.get_schedule_session(lesson)
+rows = [{**row, "note": "Pays by transfer"} for row in detail["Attendance"]]
+db.update_schedule_session(lesson, detail["Date"], detail["Start"], detail["End"], "Cancelled", "", rows)
+forecast = sb.plan_import(sheet(), teacher)
+outcome = sb.backfill(sheet(), teacher)["created"]
+after = db.get_schedule_session(lesson)
+result = {"forecast": dict(forecast[(2026, 9)]), "outcome": outcome, "status": after["Status"],
+          "note": after["Attendance"][0]["note"], "lines": len(db.get_open_invoice_items_for_month(2026, 9))}
+# The cancelled class's slot is free, and the class can't come back on top of its replacement.
+other = db.create_class_and_first_session(
+    name="G9 Test Math", teacher_id=teacher, hourly_rate=60.0, display_color="#FFF2CC", student_ids=[],
+    session_date=day, start_time=dt.time(16), end_time=dt.time(18), status="Completed", note="", attendance_rows=[])
+result["replacement"] = other
+result["back"] = db.update_schedule_session(lesson, after["Date"], after["Start"], after["End"], "Completed", "",
+                                            after["Attendance"])
+result["still_editable"] = db.update_schedule_session(lesson, after["Date"], after["Start"], after["End"], "Cancelled",
+                                                      "Room change", after["Attendance"])
+print(json.dumps(result))
+"""
+
+
+def t_reupload_keeps_app_changes():
+    """A re-upload leaves a class cancelled in the app cancelled, and keeps a note typed on a student.
+
+    The forecast agrees. A cancelled class frees its slot for a replacement,
+    can't be brought back on top of it, and can still be edited.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "keeps.db").replace("\\", "/")
+        result = run(["-c", _REUPLOAD_KEEPS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["forecast"] == {"unchanged": 1}, got
+    assert got["outcome"].get("sessions_unchanged") == 1 and "sessions_updated" not in got["outcome"], got
+    assert got["status"] == "Cancelled" and got["note"] == "Pays by transfer" and got["lines"] == 0, got
+    assert got["replacement"] == "created", got
+    assert got["back"] == "teacher_conflict" and got["still_editable"] == "updated", got
+    return "cancelled stays cancelled, the note stays, forecast agrees; the slot is free for a replacement"
+
+
+_CREDIT_BACK_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+
+def lesson(day, end):
+    return {"date": day, "class_name": "G9 Test Eng", "start_time": dt.time(16), "end_time": dt.time(end), "warnings": [],
+            "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}
+
+sb.backfill({"sessions": [lesson(dt.date(2026, 9, 7), 18)]}, teacher)
+sb.backfill({"sessions": [lesson(dt.date(2026, 10, 5), 17)]}, teacher)
+student = db.get_all_students()[0]["ID"]
+class_id = db.get_month_schedule(teacher, 2026, 9)[0]["ID"]
+
+def roster(on):
+    detail = db.get_schedule_session(class_id)
+    return db.update_schedule_session(class_id, detail["Date"], detail["Start"], detail["End"], detail["Status"], "",
+                                      [{"student_id": student}] if on else [])
+
+def credits():
+    return sorted((c["Amount"], c["Status"]) for c in db.get_credits())
+
+db.issue_invoice_for_month(db.get_invoices(status="Open")[0]["ID"], 2026, 9)
+roster(False)
+result = {"unused": credits()}
+roster(True)
+result["unused_back"] = [credits(), db.get_credits_back_on_lesson()]
+roster(False)
+db.issue_invoice_for_month(db.get_invoices(status="Open")[0]["ID"], 2026, 10)
+result["used"] = credits()
+result["off_list"] = db.get_credits_back_on_lesson()
+roster(True)
+result["used_back"] = [credits(), [(c["Amount"], c["Status"]) for c in db.get_credits_back_on_lesson()]]
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Credits"
+at.run()
+result["screen"] = [[w.value for w in at.warning if "Back on a class" in w.value], [e.value for e in at.exception]]
+roster(False)
+result["off_again"] = credits()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_used_credit_listed():
+    """Putting a student back drops an unused credit; a used one stays and is listed for the admin.
+
+    Taking them off again doesn't raise a second credit.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "back.db").replace("\\", "/")
+        result = run(["-c", _CREDIT_BACK_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["unused"] == [[120.0, "Open"]] and got["unused_back"] == [[], []], got
+    assert got["used"] == [[60.0, "Applied"], [60.0, "Open"]] and got["off_list"] == [], got
+    assert got["used_back"] == [[[60.0, "Applied"], [60.0, "Open"]], [[60.0, "Applied"]]], got
+    assert got["off_again"] == got["used"], got
+    warned, errors = got["screen"]
+    assert errors == [] and len(warned) == 1 and "Nam Jihoon" in warned[0], got["screen"]
+    return "an unused credit goes; a used one stays and shows on Credits; no second credit"
+
+
+_DEFAULT_PRICE_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+day = dt.date.today().replace(day=1)
+
+def lesson(name, hour, *students):
+    return {"date": day, "class_name": name, "start_time": dt.time(hour), "end_time": dt.time(hour + 1), "warnings": [],
+            "attendance": [{"student_name": student, "status": "Attending"} for student in students]}
+
+sb.backfill({"sessions": [lesson("G9 Test Eng", 8, "Nam Jihoon"), lesson("G12 Test Eng", 10, "Oh Minseok"),
+                          lesson("Reading Club", 12, "Seo Yerin"), lesson("Debate Club", 14, "Nam Jihoon", "Oh Minseok"),
+                          lesson("Essay Club", 16, "Oh Minseok")]}, teacher)
+
+def listed(*month):
+    return {item["Class"]: item["Because"] for item in sb.default_priced(*month)}
+
+def warnings(screen):
+    page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+    at = AppTest.from_string(page, default_timeout=120)
+    at.query_params["screen"] = screen
+    at.run()
+    return [[w.value for w in at.warning if "because their grade" in w.value], [e.value for e in at.exception]]
+
+next_month = (day + dt.timedelta(days=32))
+result = {"listed": listed(), "month": listed(day.year, day.month), "other": listed(next_month.year, next_month.month),
+          "unpriced": len(db.get_unpriced_subjects()), "teachers": warnings("Teachers"), "invoices": warnings("Invoices")}
+ids = {c["Class"]: c["Class ID"] for c in db.get_subjects_at_rate(60.0)}
+db.set_class_rate_for_month(ids["Reading Club"], day, 70.0)
+result["repriced"] = listed()
+for invoice in db.get_invoices(status="Open"):
+    db.issue_invoice_for_month(invoice["ID"], day.year, day.month)
+result["billed"] = listed()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_default_price_flagged():
+    """A subject with no clear grade on the $60 default is flagged, though it passes the price checks.
+
+    A grade in the name or a clear grade from its students isn't flagged. The
+    flag goes once the subject has another price or its lessons are billed.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "default.db").replace("\\", "/")
+        result = run(["-c", _DEFAULT_PRICE_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["unpriced"] == 0, got
+    assert set(got["listed"]) == {"Reading Club", "Debate Club"}, got
+    assert got["listed"]["Reading Club"] == "grade not known" and "Grades" in got["listed"]["Debate Club"], got
+    assert got["month"] == got["listed"] and got["other"] == {}, got
+    for screen in ("teachers", "invoices"):
+        warned, errors = got[screen]
+        assert errors == [] and len(warned) == 1 and warned[0].startswith("**2 subject(s)"), got[screen]
+    assert set(got["repriced"]) == {"Debate Club"} and got["billed"] == {}, got
+    return "flagged on Teachers and Invoices; cleared by another price or by billing"
+
+
 _STUDENT_MORE_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from streamlit.testing.v1 import AppTest
@@ -3275,6 +3481,9 @@ for name, fn in [
     ("Delete records: all time in one click", t_delete_all_time),
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
     ("Students: show more", t_student_show_more),
+    ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),
+    ("a used credit is listed when the student is back", t_used_credit_listed),
+    ("the $60 default is flagged", t_default_price_flagged),
     ("a class cancelled as a whole bills nobody", t_whole_class_cancelled),
     ("part-payment amount follows the invoice", t_part_payment_follows_invoice),
     ("two names in one lesson aren't one child", t_same_lesson_not_same_child),

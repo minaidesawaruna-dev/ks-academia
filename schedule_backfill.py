@@ -8,7 +8,8 @@ the teacher keeps editing it:
 * A class not seen before is created.
 * A class already on the calendar (same subject, date and start time) is
   updated from the workbook: students, times, Online/Recording/Cancelled.
-* Things only set in the app, such as Paid ticks and class notes, are kept.
+* Things only set in the app are kept: Paid ticks, notes, and a class
+  cancelled as a whole, which a workbook has no way of saying.
 
 Subject names must be unique across the academy, so suggest_class_renames
 flags a name another teacher already uses before anything is saved, and
@@ -35,6 +36,7 @@ __all__ = [
     "backfill",
     "price_rule",
     "price_by_rule",
+    "default_priced",
     "apply_review_decisions",
     "suggest_class_renames",
     "suggest_student_matches",
@@ -274,6 +276,18 @@ def price_by_rule(unpriced: list[dict]) -> tuple[int, list[dict]]:
     return len(done), unpriced
 
 
+def default_priced(year: int | None = None, month: int | None = None) -> list[dict]:
+    """Return subjects still to bill at the $60 default, each with why: their grade isn't clear.
+
+    A saved default looks like any other price, so the rule is asked again
+    without the subject's own price. Nothing records who chose a price, so a
+    subject that really is $60 stays listed until its lessons are billed.
+    """
+    subjects = db.get_subjects_at_rate(JUNIOR_RATE, year, month)
+    rule = price_rule(subjects, rates=[])
+    return [{**item, "Because": rule[item["Class ID"]][1]} for item in subjects if not rule[item["Class ID"]][2]]
+
+
 def _without_grade(name: str) -> str:
     """Remove a grade written in front of a name: "G5 Minji" -> "Minji".
 
@@ -502,6 +516,22 @@ def _attendance_rows(session: dict[str, Any], name_to_id: dict[str, int]) -> lis
             }
         )
     return rows
+
+
+def _lesson_status(day: dt.date, today: dt.date, current: dict[str, Any] | None = None) -> str:
+    """Return a lesson's status after an import: by its date, unless it was cancelled in the app."""
+    if current and current.get("Status") == "Cancelled":
+        return "Cancelled"
+    return "Completed" if day <= today else "Scheduled"
+
+
+def _keep_app_details(rows: list[dict], current: dict[str, Any]) -> None:
+    """Carry each student's Paid tick over, and their note unless the workbook has its own."""
+    held = {row["student_id"]: row for row in current.get("Attendance", [])}
+    for row in rows:
+        old = held.get(row["student_id"], {})
+        row["is_paid"] = old.get("is_paid", False)
+        row["note"] = row["note"] or old.get("note") or ""
 
 
 def _listed_twice(session: dict[str, Any], name_to_id: dict[str, int]) -> bool:
@@ -743,7 +773,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
                 session_date=first["date"],
                 start_time=first["start_time"],
                 end_time=first["end_time"],
-                status="Completed" if first["date"] <= dt.date.today() else "Scheduled",
+                status=_lesson_status(first["date"], dt.date.today()),
                 note="",
                 attendance_rows=_attendance_rows(first, names_here),
             )
@@ -763,7 +793,6 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
             start_at = 1
 
         for session in class_sessions[start_at:]:
-            status = "Completed" if session["date"] <= dt.date.today() else "Scheduled"
             attendance_rows = _attendance_rows(session, names_here)
             month_key = (session["date"].year, session["date"].month)
             existing_session_id = db.find_schedule_session(
@@ -777,7 +806,7 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
                     session_date=session["date"],
                     start_time=session["start_time"],
                     end_time=session["end_time"],
-                    status=status,
+                    status=_lesson_status(session["date"], dt.date.today()),
                     note="",
                     attendance_rows=attendance_rows,
                 )
@@ -788,14 +817,10 @@ def _backfill(preview, teacher_id, hourly_rate, name_overrides, student_matches,
                     created[f"lessons_{outcome}"] += 1
                 continue
 
-            # Already on the calendar: keep each student's Paid tick and the class note,
-            # which the workbook doesn't have.
+            # Already on the calendar: keep what only the app knows.
             current = db.get_schedule_session(existing_session_id) or {}
-            paid_by_student = {
-                row["student_id"]: row["is_paid"] for row in current.get("Attendance", [])
-            }
-            for row in attendance_rows:
-                row["is_paid"] = paid_by_student.get(row["student_id"], False)
+            status = _lesson_status(session["date"], dt.date.today(), current)
+            _keep_app_details(attendance_rows, current)
 
             # Skip a class the workbook still describes exactly as saved, so re-uploading a
             # month to add one class doesn't rewrite all the others.
@@ -1009,7 +1034,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             month = counts[_month_of(day)]
             month["removed"] += 1
             month["removed_invoiced"] += lesson["Invoiced"]
-        else:
+        elif lesson["Status"] != "Cancelled":
             on_calendar[day].append((lesson["Start"], lesson["End"], lesson["ID"]))
 
     def clashes(session, excluded=None):
@@ -1045,8 +1070,9 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 on_calendar[session["date"]].append((session["start_time"], session["end_time"], None))
                 month["new"] += 1
                 continue
-            status = "Completed" if session["date"] <= today else "Scheduled"
+            status = _lesson_status(session["date"], today, current)
             rows = _attendance_rows(session, names_here)
+            _keep_app_details(rows, current)
             if _matches_stored(session, status, rows, current):
                 month["unchanged"] += 1
             elif (current["Status"], status) == ("Scheduled", "Completed") and _matches_stored(

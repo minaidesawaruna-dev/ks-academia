@@ -31,6 +31,7 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 from openpyxl import Workbook
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -163,7 +164,8 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
         fill = PatternFill("solid", fgColor=colour)
         col = day_column[lesson["date"].day]
         for offset, text in ((0, class_text(lesson)), (1, status_text(lesson))):
-            cell = sheet.cell(row=2 + top, column=col + offset, value=text)
+            # Excel refuses control characters, and one would stop the whole month's export.
+            cell = sheet.cell(row=2 + top, column=col + offset, value=ILLEGAL_CHARACTERS_RE.sub("", text))
             cell.alignment = Alignment(wrap_text=True, vertical="top")
             for row in range(2 + top, 3 + bottom):
                 sheet.cell(row=row, column=col + offset).fill = fill
