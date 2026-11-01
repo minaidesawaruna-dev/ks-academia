@@ -2420,6 +2420,137 @@ def t_delete_says_what_stays():
     return "a month's delete names who stays; All time removes them"
 
 
+_WHOLE_CLASS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+day = dt.date(2026, 9, 7)
+sb.backfill({"sessions": [{"date": day, "class_name": "G9 Test Eng", "start_time": dt.time(16),
+                           "end_time": dt.time(18), "warnings": [],
+                           "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}]}, teacher)
+lesson = db.get_month_schedule(teacher, 2026, 9)[0]["ID"]
+student = db.get_all_students()[0]["ID"]
+
+def set_status(status):
+    detail = db.get_schedule_session(lesson)
+    return db.update_schedule_session(lesson, detail["Date"], detail["Start"], detail["End"], status, "",
+                                      detail["Attendance"])
+
+def seen():
+    return {"lines": len(db.get_open_invoice_items_for_month(2026, 9)),
+            "month": db.get_all_student_month_breakdowns(2026, 9).get(student, {}).get("total", 0),
+            "credits": [(c["Amount"], c["Status"]) for c in db.get_credits()]}
+
+result = {"start": seen()}
+set_status("Cancelled")
+result["cancelled"] = seen()
+set_status("Completed")
+result["back"] = seen()
+draft = db.get_invoices(status="Open")[0]["ID"]
+result["issued"] = db.issue_invoice_for_month(draft, 2026, 9)[0]
+set_status("Cancelled")
+result["cancelled_after_billing"] = seen()
+set_status("Completed")
+result["back_after_billing"] = seen()
+print(json.dumps(result, default=str))
+"""
+
+
+def t_whole_class_cancelled():
+    """A class cancelled as a whole bills nobody, even with no student marked cancelled.
+
+    Before invoicing the line just goes, and comes back with the class. After
+    invoicing the sent invoice stands and a credit is raised, and restoring
+    the class drops that credit.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "cancel.db").replace("\\", "/")
+        result = run(["-c", _WHOLE_CLASS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["start"]["lines"] == 1 and got["start"]["month"] > 0, got
+    assert got["cancelled"] == {"lines": 0, "month": 0, "credits": []}, got
+    assert got["back"]["lines"] == 1 and got["back"]["credits"] == [], got
+    assert got["issued"] == "issued", got
+    assert got["cancelled_after_billing"]["credits"] == [[120.0, "Open"]], got
+    assert got["back_after_billing"]["credits"] == [], got
+    return "off the draft before billing, a credit after it; restoring the class undoes both"
+
+
+_PART_PAYMENT_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+today = dt.date.today()
+year, month = today.year, today.month
+
+def lesson(day, end, name):
+    return {"date": dt.date(year, month, day), "class_name": f"G9 Test {name.split()[0]}", "start_time": dt.time(16),
+            "end_time": dt.time(end), "warnings": [], "attendance": [{"student_name": name, "status": "Attending"}]}
+
+sb.backfill({"sessions": [lesson(1, 17, "Nam Jihoon"), lesson(2, 19, "Seo Yerin")]}, teacher)
+for draft in db.get_invoices(status="Open"):
+    db.issue_invoice_for_month(draft["ID"], year, month)
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Payments"
+at.run()
+at.checkbox(key=f"part_pay_{year}_{month}").check().run()
+box = at.selectbox(key=f"part_who_{year}_{month}")
+labels = box.options
+ids = {row["Student"]: row["ID"] for row in db.get_invoices(status="Issued")}
+
+def amount(label):
+    name = "Nam Jihoon" if "Nam Jihoon" in label else "Seo Yerin"
+    return [item.value for item in at.number_input if item.key == f"part_amt_{ids[name]}"]
+
+first, second = labels[0], labels[1]
+result = {"first": amount(first)}
+at.selectbox(key=f"part_who_{year}_{month}").set_value(second).run()
+result["second"] = amount(second)
+at.number_input(key=f"part_amt_{ids['Seo Yerin' if 'Seo Yerin' in second else 'Nam Jihoon']}").set_value(0.0).run()
+result["off_at_zero"] = at.button(key=f"part_save_{year}_{month}").disabled
+at.selectbox(key=f"part_who_{year}_{month}").set_value(first).run()
+result["back"] = amount(first)
+result["names"] = [first, second]
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_part_payment_follows_invoice():
+    """The part-payment amount starts at what the chosen invoice owes, and $0 can't be recorded."""
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "part.db").replace("\\", "/")
+        result = run(["-c", _PART_PAYMENT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["first"] == got["back"] and len(got["first"]) == 1, got
+    assert got["first"] != got["second"] and len(got["second"]) == 1, got
+    assert got["off_at_zero"] is True, got
+    return "each invoice has its own amount, starting at what it owes; $0 is refused"
+
+
 _STUDENT_MORE_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from streamlit.testing.v1 import AppTest
@@ -3144,6 +3275,8 @@ for name, fn in [
     ("Delete records: all time in one click", t_delete_all_time),
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
     ("Students: show more", t_student_show_more),
+    ("a class cancelled as a whole bills nobody", t_whole_class_cancelled),
+    ("part-payment amount follows the invoice", t_part_payment_follows_invoice),
     ("two names in one lesson aren't one child", t_same_lesson_not_same_child),
     ("database check covers new columns", t_database_check_covers_columns),
     ("rows of subjects with no name", t_unnamed_subject_rows),

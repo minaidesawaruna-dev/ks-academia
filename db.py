@@ -2100,19 +2100,6 @@ def find_student_clashes(student_ids, dates, start_time, end_time, excluded_sess
             session, list(student_ids), list(dates), start_time, end_time, excluded_session_id)]
 
 
-def get_student_bookings(student_ids, first_day, last_day) -> list[dict]:
-    """Return every lesson these students are really booked into between two dates, in one query.
-
-    For checking a whole planned month at once; asking lesson by lesson
-    would be a database round trip each.
-    """
-    if not student_ids:
-        return []
-    with SessionLocal() as session:
-        return [_clash_entry(*row) for row in _bookings(
-            session, list(student_ids), between=(first_day, last_day))]
-
-
 def get_session_clashes(session_id) -> list[dict]:
     """Return the other lessons this lesson's students have at the same time."""
     with SessionLocal() as session:
@@ -3119,6 +3106,9 @@ def sync_invoice_items(session_id):
       writing why underneath, and a lesson invoiced in advance that the
       student then missed must come off their next invoice. The sent invoice
       itself is never changed.
+
+    A class cancelled as a whole counts as everyone on it having cancelled,
+    whatever each student is marked.
     """
 
     with SessionLocal() as session:
@@ -3133,6 +3123,9 @@ def sync_invoice_items(session_id):
         ).all()
         billable = {row.student_id for row in rows if not row.is_cancelled}
         cancelled = {row.student_id for row in rows if row.is_cancelled}
+        if lesson.status == "Cancelled":
+            cancelled |= billable
+            billable = set()
 
         existing = session.scalars(
             select(InvoiceItem).where(InvoiceItem.session_id == session_id)
@@ -3706,9 +3699,7 @@ def issue_invoice_for_month(invoice_id, year, month, issued_on=None):
     last_day = date(year, month, monthrange(year, month)[1])
 
     with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
-        if session.get_bind().dialect.name == "postgresql":
-            session.execute(text("SELECT pg_advisory_xact_lock(:key)"),
-                            {"key": INVOICE_NUMBER_START})
+        _lock_numbers(session)
         invoice = session.get(Invoice, invoice_id)
         if invoice is None:
             return "missing", None
@@ -3990,8 +3981,7 @@ def replace_invoice(invoice_id, lines, extra=(), note=None, today=None, add=()):
     extra = [entry for entry in extra if entry["Description"] and entry["Amount"]]
 
     with _ONE_ISSUE_AT_A_TIME, SessionLocal() as session:
-        if session.get_bind().dialect.name == "postgresql":
-            session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": INVOICE_NUMBER_START})
+        _lock_numbers(session)
         old = session.get(Invoice, invoice_id)
         if old is None or old.status != "Issued":
             return "not_issued", None, None
@@ -4681,9 +4671,9 @@ def get_invoice_payments(year, month, today=None):
                 ),
                 "Note": invoice.payment_note or "",
             }
-            # An invoice issued a month at a time covers one month. One billed all at once
-            # ("Bill it now") can cover several, and the screen has to say so rather than let
-            # its total look like this month's.
+            # Invoices are issued a month at a time, but one from before that rule can cover
+            # several, and the screen has to say so rather than let its total look like this
+            # month's.
             earliest, latest = spans.get(invoice.id, (None, None))
             row["Covers"] = ""
             if earliest is not None and latest is not None:
@@ -4859,7 +4849,7 @@ def _record_import(teacher_id, year, month, sessions_created, sessions_updated, 
         row.sessions_created = sessions_created
         row.sessions_updated = sessions_updated
         row.warning_count = warning_count
-        row.imported_at = datetime.utcnow()
+        row.imported_at = datetime.now(timezone.utc).replace(tzinfo=None)
         session.commit()
 
 
@@ -4922,8 +4912,8 @@ def get_all_student_month_breakdowns(year, month):
 
     What each student's lessons in a month add up to, grouped like an
     invoice (_invoice_lines): by subject, teacher and price. One query for
-    everyone instead of one per student; the Students screen lists up to
-    200 of these on one page.
+    everyone instead of one per student, however many the Students screen
+    is showing.
 
     A lesson already on a sent invoice is priced from that invoice's line,
     not today's price table. Pricing everything at today's prices made this
@@ -4946,6 +4936,7 @@ def get_all_student_month_breakdowns(year, month):
             .where(
                 ClassSession.session_date >= first_day,
                 ClassSession.session_date <= last_day,
+                ClassSession.status != "Cancelled",
                 SessionAttendance.is_cancelled.is_(False),
             )
         ).all()

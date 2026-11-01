@@ -114,13 +114,12 @@ CONDITIONS = [IN_CLASS, "Online", "Recording", "Cancelled"]
 # "A month" of a weekly class is four lessons on the same weekday.
 WEEKS_PER_MONTH = 4
 
-# DELETE_PHRASE is the word typed to confirm a delete on Delete records. The row limits say
-# how many open invoices, students and paid invoices to draw at once: each row
-# builds its widgets (and sometimes an invoice file) up front, so these keep the
-# pages quick. The search box reaches the rest.
+# The word typed to confirm a delete on Delete records.
 DELETE_PHRASE = "delete"
 # How many of each kind Delete records' warning lists by name before it gives a count.
 BEYOND_ROWS = 5
+# How many open invoices, students and paid invoices to draw at once: each row builds
+# its widgets (and sometimes an invoice file) up front, so these keep the pages quick.
 OPEN_INVOICE_ROWS = 25
 STUDENT_ROWS = 25
 PAID_ROWS = 40
@@ -188,12 +187,17 @@ def _flag(text) -> str:
     return _chip("flag", text)
 
 
+def _name_list(names, most: int = 6) -> str:
+    """Return "A, B and C", or "A, B, C and 4 more" past `most`."""
+    names = list(names)
+    if len(names) > most:
+        return ", ".join(names[:most]) + f" and {len(names) - most} more"
+    return ", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else "".join(names)
+
+
 def _chips(kind: str, names, most: int = 6) -> str:
-    """Return several badges of one kind: "A, B and C", or "A, B, C and 4 more" past `most`."""
-    chips = [_chip(kind, name) for name in names]
-    if len(chips) > most:
-        return ", ".join(chips[:most]) + f" and {len(chips) - most} more"
-    return ", ".join(chips[:-1]) + " and " + chips[-1] if len(chips) > 1 else "".join(chips)
+    """Return several badges of one kind, listed as _name_list does."""
+    return _name_list([_chip(kind, name) for name in names], most)
 
 
 def _cell_list(cells, most: int = 3) -> str:
@@ -1550,7 +1554,8 @@ def teachers_tab() -> None:
                 label_visibility="collapsed",
             )
             record = next(item for item in teachers if item["Name"] == chosen)
-            new_name = columns[1].text_input("New name", value=record["Name"], key="teacher_rename",
+            new_name = columns[1].text_input("New name", value=record["Name"],
+                                             key=f"teacher_rename_{record['ID']}",
                                              label_visibility="collapsed")
             if columns[2].button("Rename", key="teacher_save", width="stretch"):
                 if db.update_teacher_name(record["ID"], new_name):
@@ -2042,7 +2047,7 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
         default_day = min(dt.date.today().day, calendar.monthrange(year, month)[1])
         columns = st.columns([2, 1, 1, 1])
         when = columns[0].date_input(
-            "Date", value=dt.date(year, month, default_day), key="new_lesson_date"
+            "Date", value=dt.date(year, month, default_day), key=f"new_lesson_date_{year}_{month}"
         )
         # No suggested times: a filled-in time is easy to miss and then gets copied into
         # every repeat of the class.
@@ -2328,7 +2333,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                 note=detail.get("Note") or "",
                 attendance_rows=existing,
             )
-            if outcome in ("updated", "success", True):
+            if outcome == "updated":
                 st.session_state[f"repeat_{lesson_id}"] = [lookup[name] for name in adding]
                 _saved_message(f"Added {len(adding)} student(s).", lesson_id)
                 _rerun()
@@ -2360,7 +2365,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                     note=detail.get("Note") or "",
                     attendance_rows=kept,
                 )
-                if outcome in ("updated", "success", True):
+                if outcome == "updated":
                     _flash(f"Took {len(removing)} student(s) out of this class.")
                     _rerun()
                 else:
@@ -2456,7 +2461,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                 note=lesson_note[:500],
                 attendance_rows=prepared,
             )
-            if outcome in ("updated", "success", True):
+            if outcome == "updated":
                 if (when.year, when.month) != st.session_state.get("month"):
                     # The class moved out of the month on screen; follow it instead of leaving an
                     # empty grid.
@@ -2576,7 +2581,7 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                 display_color=class_colour,
                 effective_from=db.as_date(detail["Date"]),
             )
-            if outcome in ("updated", "success", True):
+            if outcome == "updated":
                 # Only once the subject itself has saved: saving the note first left it on a
                 # rename that was refused.
                 db.set_subject_note(detail["Class ID"], class_note[:1000])
@@ -2804,7 +2809,8 @@ def _invoice_search() -> str:
     needle = st.text_input("Find a student", key="invoice_find",
                            placeholder="Type part of a name").strip().casefold()
     if needle:
-        sent = sum(needle in item["Student"].casefold() for item in db.get_invoices(status="Issued"))
+        sent = sum(item["Status"] == "Issued" and needle in item["Student"].casefold()
+                   for item in db.get_invoice_lookup())
         if sent and st.button(f"Show {sent} sent invoice(s)", key="invoice_find_sent"):
             st.session_state["invoice_reference_open"] = True
             st.session_state["issued_search_next"] = needle
@@ -3914,14 +3920,14 @@ def _part_payment_form(unpaid: list[dict], year: int, month: int) -> None:
     columns = st.columns([1, 1, 2])
     amount = columns[0].number_input(
         "Amount received ($)", min_value=0.0, max_value=float(row["Owing"]),
-        value=float(row["Owing"]), step=10.0, key=f"part_amt_{year}_{month}",
+        value=float(row["Owing"]), step=10.0, key=f"part_amt_{row['ID']}",
     )
     when = columns[1].date_input("Date received", value=dt.date.today(), key=f"part_on_{year}_{month}")
     note = columns[2].text_input(
         "Note", placeholder="e.g. paid $200 now, rest next month",
         key=f"part_note_{year}_{month}",
     )
-    if st.button("Record this payment", key=f"part_save_{year}_{month}", type="primary"):
+    if st.button("Record this payment", key=f"part_save_{year}_{month}", type="primary", disabled=amount <= 0):
         outcome = db.mark_invoice_paid(row["ID"], paid_on=when, amount=amount, note=note)
         if outcome in ("paid", "part paid"):
             short = row["Owing"] - amount
@@ -4157,14 +4163,6 @@ def _history_view() -> None:
 
 
 _COMPARE_MAX = 8
-
-
-def _name_list(names: list[str], most: int = 6) -> str:
-    """Return "A, B and C", or "A, B, C and 4 more" past `most`."""
-    names = list(names)
-    if len(names) > most:
-        return ", ".join(names[:most]) + f" and {len(names) - most} more"
-    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
 
 
 def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
@@ -4848,8 +4846,7 @@ def _still_on_file(plan: dict) -> str:
     chips = [_chip(kinds[item["Kind"]], item["Name"]) for item in plan["Linked"] if item["Kind"] in kinds]
     if not chips:
         return ""
-    names = ", ".join(chips[:6]) + (f" and {len(chips) - 6} more" if len(chips) > 6 else "")
-    return f"Still on file afterwards: {names}. Press All time to delete them too."
+    return f"Still on file afterwards: {_name_list(chips)}. Press All time to delete them too."
 
 
 def _pick(label: str, options: dict, key: str, placeholder: str = "Choose options") -> list:
