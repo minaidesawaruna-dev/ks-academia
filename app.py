@@ -1223,31 +1223,49 @@ def _unpriced_everywhere() -> None:
         )
 
 
-def _default_price_notice(year: int | None = None, month: int | None = None) -> None:
+def _default_price_notice(key: str, year: int | None = None, month: int | None = None) -> None:
     """Warn about subjects billing at the $60 default because their grade isn't clear.
 
     Once saved, the default passes every price check, so this is the only sign
-    that nobody decided it. To clear one, give it its price on Teachers.
+    that nobody decided it. Typing a price here, or keeping $60, is that decision
+    and clears the flag. A form, so typing a price doesn't rerun the page.
     """
     subjects = schedule_backfill.default_priced(year, month)
     if not subjects:
         return
-    st.warning(f"**{len(subjects)} subject(s) are on the {_money(f'${schedule_parser.JUNIOR_RATE:,.0f}/h')} "
+    default = f"${schedule_parser.JUNIOR_RATE:,.0f}"
+    st.warning(f"**{len(subjects)} subject(s) are on the {_money(f'{default}/h')} "
                "default** because their grade isn't clear. Check the price before sending.")
-    with st.expander("Which"):
-        st.dataframe(
-            _coloured([
-                {
-                    "Teacher": item["Teacher"],
-                    "Subject": item["Class"],
-                    "Lessons": item["Sessions"],
-                    "Because": item["Because"],
-                }
-                for item in subjects
-            ]),
-            width="stretch",
-            hide_index=True,
-        )
+    with st.expander("Which, and set their price"):
+        with st.form(f"default_price_{key}", border=False):
+            buttons = st.columns(2)
+            save = buttons[0].form_submit_button(
+                "Save prices", type="primary", key=f"default_price_save_{key}", width="stretch",
+            )
+            keep = buttons[1].form_submit_button(
+                f"Keep {default} for the rest", key=f"default_price_keep_{key}", width="stretch",
+            )
+            typed: dict[int, float | None] = {}
+            for item in subjects:
+                row = st.columns([5, 1], vertical_alignment="center")
+                row[0].markdown(f"{_teacher(item['Teacher'])} · {_subject(item['Class'])} · "
+                                f"{item['Sessions']} lesson(s) · {item['Because']}")
+                typed[item["Class ID"]] = row[1].number_input(
+                    f"Price for {item['Class']}", min_value=0.01, value=None, step=5.0,
+                    placeholder="New price", key=f"default_price_{key}_{item['Class ID']}",
+                    label_visibility="collapsed",
+                )
+    chosen = {class_id: price for class_id, price in typed.items() if price}
+    if save and not chosen:
+        st.warning("Type a price first.")
+    elif save or keep:
+        kept = [class_id for class_id in typed if keep and class_id not in chosen]
+        schedule_backfill.settle_default_prices(chosen, kept)
+        done = [f"Priced {len(chosen)} subject(s)"] if chosen else []
+        if kept:
+            done.append(f"Kept {_money(f'{default}/h')} for {len(kept)} subject(s)")
+        _flash(". ".join(done) + ".")
+        _rerun()
 
 
 def _save_subject_rate(class_id: int, month_start: dt.date, rate: float) -> str:
@@ -1601,7 +1619,7 @@ def teachers_tab() -> None:
         return
 
     _unpriced_everywhere()
-    _default_price_notice()
+    _default_price_notice("teachers")
     _unnamed_subjects("teachers")
     st.markdown("#### Teacher detail")
     _teacher_drilldown(teachers)
@@ -2183,7 +2201,9 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
                     if c["Class"].strip().lower() == new_name.strip().lower()
                 ]
                 class_id = created[0]["ID"] if created else None
-                if class_id and not typed_rate and rate <= db.UNSET_RATE:
+                if class_id and typed_rate:
+                    db.mark_prices_checked([class_id])
+                elif class_id and rate <= db.UNSET_RATE:
                     # No grade in the name: its students' grades decide, else $60.
                     schedule_backfill.price_by_rule(db.get_unpriced_subjects(class_ids=[class_id]))
             else:
@@ -3897,7 +3917,7 @@ def invoices_tab() -> None:
     # nothing riding on its prices, and saying so every time would be clutter.
     if month_items:
         _unpriced_warning(year, month)
-        _default_price_notice(year, month)
+        _default_price_notice("invoices", year, month)
         _unnamed_subjects("invoices", year, month)
 
     shown_items = [row for row in month_items if needle in row["Student"].casefold()]

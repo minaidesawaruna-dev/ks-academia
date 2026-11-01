@@ -2700,12 +2700,13 @@ def lesson(name, hour, *students):
 
 sb.backfill({"sessions": [lesson("G9 Test Eng", 8, "Nam Jihoon"), lesson("G12 Test Eng", 10, "Oh Minseok"),
                           lesson("Reading Club", 12, "Seo Yerin"), lesson("Debate Club", 14, "Nam Jihoon", "Oh Minseok"),
-                          lesson("Essay Club", 16, "Oh Minseok")]}, teacher)
+                          lesson("Essay Club", 16, "Oh Minseok"), lesson("Chess Club", 18, "Hayun Kim"),
+                          lesson("Drama Club", 20, "Seo Yerin"), lesson("Poetry Club", 21, "Seo Yerin")]}, teacher)
 
 def listed(*month):
     return {item["Class"]: item["Because"] for item in sb.default_priced(*month)}
 
-def warnings(screen):
+def opened(screen):
     page = '''
 import sys, types
 stub = types.ModuleType("auth")
@@ -2716,8 +2717,14 @@ exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__nam
 '''
     at = AppTest.from_string(page, default_timeout=120)
     at.query_params["screen"] = screen
-    at.run()
+    return at.run()
+
+def warnings(screen):
+    at = opened(screen)
     return [[w.value for w in at.warning if "because their grade" in w.value], [e.value for e in at.exception]]
+
+def price(name):
+    return db.get_class_rates_for_date([ids[name]], day)[ids[name]]
 
 next_month = (day + dt.timedelta(days=32))
 result = {"listed": listed(), "month": listed(day.year, day.month), "other": listed(next_month.year, next_month.month),
@@ -2725,9 +2732,28 @@ result = {"listed": listed(), "month": listed(day.year, day.month), "other": lis
 ids = {c["Class"]: c["Class ID"] for c in db.get_subjects_at_rate(60.0)}
 db.set_class_rate_for_month(ids["Reading Club"], day, 70.0)
 result["repriced"] = listed()
-for invoice in db.get_invoices(status="Open"):
-    db.issue_invoice_for_month(invoice["ID"], day.year, day.month)
+db.set_class_rate_for_month(ids["Poetry Club"], day, 60.0)
+result["typed_60"] = listed()
+open_invoices = db.get_invoices(status="Open")
+db.issue_invoice_for_month(next(i["ID"] for i in open_invoices if i["Student"] == "Hayun Kim"), day.year, day.month)
 result["billed"] = listed()
+
+at = opened("Teachers")
+at.button(key="default_price_save_teachers").click().run()
+result["nothing_typed"] = listed()
+result["asked"] = [w.value for w in at.warning if "Type a price" in w.value]
+at.number_input(key=f"default_price_teachers_{ids['Drama Club']}").set_value(75.0)
+at.button(key="default_price_save_teachers").click().run()
+result["saved"] = listed()
+result["saved_errors"] = [e.value for e in at.exception]
+
+at = opened("Invoices")
+at.button(key="default_price_keep_invoices").click().run()
+result["kept"] = listed()
+result["kept_errors"] = [e.value for e in at.exception]
+result["prices"] = {name: price(name) for name in ("Drama Club", "Debate Club", "Poetry Club", "Reading Club")}
+db.initialise_database()
+result["still_kept"] = listed()
 print(json.dumps(result, default=str))
 """
 
@@ -2736,7 +2762,8 @@ def t_default_price_flagged():
     """A subject with no clear grade on the $60 default is flagged, though it passes the price checks.
 
     A grade in the name or a clear grade from its students isn't flagged. The
-    flag goes once the subject has another price or its lessons are billed.
+    flag goes once someone decides the price, in the flag or on Teachers, even
+    if they keep $60, or once its lessons are billed.
     """
     import json
     import tempfile
@@ -2747,14 +2774,21 @@ def t_default_price_flagged():
         assert result.returncode == 0, result.stderr[-1500:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
     assert got["unpriced"] == 0, got
-    assert set(got["listed"]) == {"Reading Club", "Debate Club"}, got
+    flagged = {"Reading Club", "Debate Club", "Chess Club", "Drama Club", "Poetry Club"}
+    assert set(got["listed"]) == flagged, got
     assert got["listed"]["Reading Club"] == "grade not known" and "Grades" in got["listed"]["Debate Club"], got
     assert got["month"] == got["listed"] and got["other"] == {}, got
     for screen in ("teachers", "invoices"):
         warned, errors = got[screen]
-        assert errors == [] and len(warned) == 1 and warned[0].startswith("**2 subject(s)"), got[screen]
-    assert set(got["repriced"]) == {"Debate Club"} and got["billed"] == {}, got
-    return "flagged on Teachers and Invoices; cleared by another price or by billing"
+        assert errors == [] and len(warned) == 1 and warned[0].startswith("**5 subject(s)"), got[screen]
+    assert set(got["repriced"]) == flagged - {"Reading Club"}, got
+    assert set(got["typed_60"]) == {"Debate Club", "Chess Club", "Drama Club"}, got
+    assert set(got["billed"]) == {"Debate Club", "Drama Club"}, got
+    assert set(got["nothing_typed"]) == {"Debate Club", "Drama Club"} and got["asked"], got
+    assert set(got["saved"]) == {"Debate Club"} and got["saved_errors"] == [], got
+    assert got["kept"] == {} and got["kept_errors"] == [] and got["still_kept"] == {}, got
+    assert got["prices"] == {"Drama Club": 75.0, "Debate Club": 60.0, "Poetry Club": 60.0, "Reading Club": 70.0}, got
+    return "flagged on Teachers and Invoices; settled in the flag, on Teachers or by billing"
 
 
 _STUDENT_MORE_SCRIPT = r"""

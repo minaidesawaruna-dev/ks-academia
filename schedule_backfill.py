@@ -37,6 +37,7 @@ __all__ = [
     "price_rule",
     "price_by_rule",
     "default_priced",
+    "settle_default_prices",
     "apply_review_decisions",
     "suggest_class_renames",
     "suggest_student_matches",
@@ -280,12 +281,25 @@ def default_priced(year: int | None = None, month: int | None = None) -> list[di
     """Return subjects still to bill at the $60 default, each with why: their grade isn't clear.
 
     A saved default looks like any other price, so the rule is asked again
-    without the subject's own price. Nothing records who chose a price, so a
-    subject that really is $60 stays listed until its lessons are billed.
+    without the subject's own price. A subject leaves the list once someone
+    has decided its price, even if they kept $60.
     """
-    subjects = db.get_subjects_at_rate(JUNIOR_RATE, year, month)
+    subjects = [item for item in db.get_subjects_at_rate(JUNIOR_RATE, year, month) if not item["Price Checked"]]
     rule = price_rule(subjects, rates=[])
     return [{**item, "Because": rule[item["Class ID"]][1]} for item in subjects if not rule[item["Class ID"]][2]]
+
+
+def settle_default_prices(prices: dict[int, float], kept: list[int]) -> None:
+    """Record what someone decided for flagged subjects: a new price, or the $60 kept.
+
+    A new price starts from the first month still to bill at $60 in any month,
+    not just the month on screen, so no unbilled lesson is left behind at $60.
+    """
+    first = {item["Class ID"]: item["Months"][0] for item in db.get_subjects_at_rate(JUNIOR_RATE)}
+    db.set_class_rates_for_months(
+        (class_id, dt.date(*first[class_id], 1), price) for class_id, price in prices.items() if class_id in first
+    )
+    db.mark_prices_checked([*prices, *kept])
 
 
 def _without_grade(name: str) -> str:

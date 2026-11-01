@@ -173,6 +173,8 @@ class AcademyClass(Base):
     status = Column(String(20), nullable=False, default="Ongoing")
     display_color = Column(String(7), nullable=False, default="#4F81BD")
     note = Column(String(1000), nullable=True)
+    # True once someone has decided this subject's price, which clears the $60 default flag.
+    price_checked = Column(Boolean, nullable=False, default=False)
     # Not used by the app any more; kept so older databases still load.
     is_active = Column(Boolean, nullable=False, default=True)
     created_at = Column(
@@ -705,6 +707,16 @@ def initialise_database():
                         "NOT NULL DEFAULT '#4F81BD'"
                     )
                 )
+        # FALSE, not 0: PostgreSQL refuses a number as a boolean default.
+        if "price_checked" not in class_columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE classes "
+                        "ADD COLUMN price_checked BOOLEAN "
+                        "NOT NULL DEFAULT FALSE"
+                    )
+                )
 
     if "class_sessions" in class_tables:
         session_columns = {
@@ -948,6 +960,7 @@ def _subjects_to_bill(wanted, class_ids=None):
                 AcademyClass.name,
                 Teacher.id,
                 Teacher.name,
+                AcademyClass.price_checked,
             )
             .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
             .join(Teacher, ClassSession.teacher_id == Teacher.id)
@@ -964,7 +977,7 @@ def _subjects_to_bill(wanted, class_ids=None):
         rates = _rate_index(session, {row[1] for row in rows})
         subjects: dict[int, dict[str, Any]] = {}
         counted: set[int] = set()
-        for session_id, class_id, when, name, teacher_id, teacher in rows:
+        for session_id, class_id, when, name, teacher_id, teacher, checked in rows:
             when = as_date(when)
             if session_id in counted:
                 continue
@@ -973,7 +986,7 @@ def _subjects_to_bill(wanted, class_ids=None):
             counted.add(session_id)
             item = subjects.setdefault(class_id, {
                 "Class ID": class_id, "Class": name, "Teacher ID": teacher_id,
-                "Teacher": teacher, "Sessions": 0, "Months": set(),
+                "Teacher": teacher, "Sessions": 0, "Months": set(), "Price Checked": checked,
             })
             item["Sessions"] += 1
             item["Months"].add((when.year, when.month))
@@ -1347,11 +1360,23 @@ def set_class_rate_for_month(class_id, month_start, hourly_rate):
     if hourly_rate is None or float(hourly_rate) <= 0:
         return "invalid"
     with SessionLocal() as session:
-        if session.get(AcademyClass, class_id) is None:
+        academy_class = session.get(AcademyClass, class_id)
+        if academy_class is None:
             return "class_unavailable"
+        academy_class.price_checked = True
         outcome = _apply_month_rate(session, class_id, month_start, hourly_rate)
         session.commit()
         return outcome
+
+
+def mark_prices_checked(class_ids):
+    """Record that someone has decided these subjects' prices, even if they stay as they are."""
+    ids = [int(value) for value in class_ids]
+    if not ids:
+        return
+    with SessionLocal() as session:
+        session.execute(update(AcademyClass).where(AcademyClass.id.in_(ids)).values(price_checked=True))
+        session.commit()
 
 
 def _apply_month_rate(session, class_id, month_start, hourly_rate, periods=None):
@@ -1606,6 +1631,7 @@ def update_scheduling_class(
         )
         if float(current or 0) != float(hourly_rate):
             _apply_month_rate(session, class_id, effective_from, hourly_rate)
+            academy_class.price_checked = True
 
         session.commit()
         return "updated"
