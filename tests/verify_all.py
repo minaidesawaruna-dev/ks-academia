@@ -523,6 +523,8 @@ def t_read_functions_all_run():
         "get_delete_choices": lambda: db.get_delete_choices(year, month),
         "get_delete_choices (all months)": db.get_delete_choices,
         "get_invoice_lookup": db.get_invoice_lookup,
+        "find_bookings_elsewhere": lambda: db.find_bookings_elsewhere(
+            [s["ID"] for s in db.get_all_students()[:25]], [first], tid),
         "describe_master_delete": lambda: db.describe_master_delete(
             [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }
@@ -2230,6 +2232,80 @@ def t_not_added_names_cells():
     return "clashes and taken names each listed with their cell; counts unchanged"
 
 
+_UPLOAD_DOUBLE_BOOKED_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, start, hours, people, cell=None):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": start, "cell": cell,
+            "end_time": dt.time(start.hour + hours, start.minute), "warnings": [],
+            "attendance": [{"student_name": name, "status": status} for name, status in people]}
+
+# Teacher B's month is already saved.
+sb.backfill({"sessions": [
+    lesson(7, "G10 Test Math", dt.time(16), 2,
+           [("Nam Jihoon", "Attending"), ("Seo Yerin", "Cancelled"), ("Oh Minseok", "Attending")]),
+    lesson(21, "G10 Test Math", dt.time(10), 2, [("Nam Jihoon", "Attending")]),
+]}, ids["Teacher B"])
+
+# Teacher A's upload.
+upload = {"sessions": [
+    # Nam Jihoon overlaps Teacher B's 16:00-18:00; Seo Yerin is off that day with Teacher B;
+    # Oh Minseok is off this one; Hayun Kim is new, so has nothing else booked.
+    lesson(7, "G9 Test Eng", dt.time(17), 2,
+           [("Nam Jihoon", "Attending"), ("Seo Yerin", "Attending"), ("Oh Minseok", "Cancelled"),
+            ("Hayun Kim", "Attending")], "Sep26!B7"),
+    # Starts as Teacher B's 10:00-12:00 ends, so it doesn't overlap.
+    lesson(21, "G9 Test Eng", dt.time(12), 2, [("Nam Jihoon", "Attending")], "Sep26!B21"),
+]}
+days = [dt.date(2026, 9, d) for d in (7, 21)]
+found = []
+plan = sb.plan_import(upload, ids["Teacher A"], dates=days, double_booked=found)[(2026, 9)]
+plain = sb.plan_import(upload, ids["Teacher A"], dates=days)[(2026, 9)]
+new_teacher = []
+sb.plan_import(upload, None, dates=days, double_booked=new_teacher)
+sb.backfill(upload, ids["Teacher A"], dates=days)
+again = []
+sb.plan_import(upload, ids["Teacher A"], dates=days, double_booked=again)
+print(json.dumps({
+    "found": [[f["cell"], f["student"], f["class_name"], f["other"]["Class"], f["other"]["Teacher"]] for f in found],
+    "same_without_list": plan == plain,
+    "new_teacher": len(new_teacher),
+    "after_saving": [[c["Student"], c["First"]["Class"], c["Second"]["Class"]]
+                     for c in db.get_month_student_clashes(2026, 9)],
+    "re_upload": len(again),
+}))
+"""
+
+
+def t_upload_warns_double_booked():
+    """An upload warns about a student it puts in two classes at once, across teachers.
+
+    The upload's own clash check only looks at the uploading teacher's
+    calendar, so a student also in another teacher's class at that time was
+    only found on Schedule. Students marked off either lesson, new names and
+    lessons that only touch don't count. A re-upload still warns, and the
+    warning matches the month's list on Schedule once saved.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "booked.db").replace("\\", "/")
+        result = run(["-c", _UPLOAD_DOUBLE_BOOKED_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["found"] == [["Sep26!B7", "Nam Jihoon", "G9 Test Eng", "G10 Test Math", "Teacher B"]], got["found"]
+    assert got["same_without_list"] and got["new_teacher"] == 1, got
+    assert got["after_saving"] == [["Nam Jihoon", "G10 Test Math", "G9 Test Eng"]], got["after_saving"]
+    assert got["re_upload"] == 1, got
+    return "one real double booking found with its cell; off, new and touching ones aren't; matches Schedule"
+
+
 _DATABASE_CHECK_SCRIPT = r"""
 import json, db
 from sqlalchemy import Column, String
@@ -2418,6 +2494,72 @@ def t_delete_says_what_stays():
     assert got["whole_before"] == [] and whole["teachers"] == 0 and whole["students"] == 0, got
     assert not any("Still on file" in text for text in whole["flash"]), whole["flash"]
     return "a month's delete names who stays; All time removes them"
+
+
+_DELETE_CLASSLESS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+teacher = db.get_all_teachers()[0]["ID"]
+today = dt.date.today()
+sb.backfill({"sessions": [{"date": today.replace(day=1), "class_name": "G9 Test Eng", "start_time": dt.time(19),
+                           "end_time": dt.time(20), "warnings": [],
+                           "attendance": [{"student_name": "Nam Jihoon", "status": "Attending"}]}]}, teacher)
+db.create_student("Seo Yerin")   # typed by mistake: never in a class
+db.create_student("Oh Minseok")  # the same
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Delete records"
+at.run()
+box = at.checkbox(key="delete_classless_0")
+result = {"label": box.label,
+          "this month": at.multiselect(key="delete_students_0").options}
+box.check().run()
+result["after tick"] = {"year": at.session_state["delete_year_0"], "month": at.session_state["delete_month_0"],
+                        "offered": at.multiselect(key="delete_students_0").options}
+names = {s["Name"]: s["ID"] for s in db.get_all_students()}
+at.multiselect(key="delete_students_0").set_value([names["Seo Yerin"], names["Oh Minseok"]]).run()
+at.text_input(key="delete_confirm_0").set_value("delete").run()
+at.button(key="delete_go_0").click().run()
+result["left"] = sorted(s["Name"] for s in db.get_all_students())
+result["lessons"] = len(db.get_month_schedule(teacher, today.year, today.month))
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result, default=str))
+"""
+
+
+def t_delete_classless_students():
+    """Delete records can list only the students in no class, to clear names typed by mistake.
+
+    They are in no month's list, so they were hard to find. Ticking the box
+    narrows the Students list to them and sets All time, so the ones picked
+    go outright; the student with a class and the class itself stay.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "classless.db").replace("\\", "/")
+        result = run(["-c", _DELETE_CLASSLESS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["label"] == "Only students with no classes (2)", got["label"]
+    assert got["this month"] == ["Nam Jihoon"], got["this month"]
+    tick = got["after tick"]
+    assert tick["year"] == 0 and tick["month"] == 0 and tick["offered"] == ["Oh Minseok", "Seo Yerin"], tick
+    assert got["left"] == ["Nam Jihoon"] and got["lessons"] == 1, got
+    return "only the two with no classes listed, All time set, both gone; the student in a class stays"
 
 
 _WHOLE_CLASS_SCRIPT = r"""
@@ -3193,7 +3335,7 @@ result = {"numbers": [number(nam), number(oh), number(oh_sept), number(oh_oct), 
 # What the screen offers: a month narrows each list to what it touched.
 def offered(choices):
     return {kind: sorted(row.get("Name") or row.get("Number") or row["ID"] for row in rows)
-            for kind, rows in choices.items() if kind not in ("Classes", "History")} | {"Classes": len(choices["Classes"])}
+            for kind, rows in choices.items() if kind not in ("Classes", "History", "No classes")} | {"Classes": len(choices["Classes"])}
 result["offered_oct"] = offered(db.get_delete_choices(2026, 10))
 result["offered_sep"] = offered(db.get_delete_choices(2026, 9))
 result["offered_all"] = offered(db.get_delete_choices())
@@ -3512,8 +3654,10 @@ for name, fn in [
     ("Delete records where a student and classes meet", t_delete_where_they_meet),
     ("renaming a subject", t_rename_subject),
     ("classes not added name their cells", t_not_added_names_cells),
+    ("an upload warns about double bookings", t_upload_warns_double_booked),
     ("Delete records: all time in one click", t_delete_all_time),
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
+    ("Delete records: students with no classes", t_delete_classless_students),
     ("Students: show more", t_student_show_more),
     ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),
     ("a used credit is listed when the student is back", t_used_credit_listed),

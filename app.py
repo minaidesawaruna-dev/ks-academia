@@ -653,22 +653,27 @@ def _warning_panel(preview: dict) -> None:
                     st.markdown(f"\u26a0\ufe0f {item['message']}")
 
 
-def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> None:
+def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> list[dict]:
     """Show what saving will change on the calendar, month by month, before anything is written.
 
     Re-uploading a corrected workbook is routine; this lets the admin check
     it changes what they expect and nothing else. It works on a copy of the
-    upload, because answering the name questions changes it.
+    upload, because answering the name questions changes it. Returns the
+    double bookings it found, so the message after saving can mention them.
     """
     planned = {**preview, "sessions": copy.deepcopy(preview["sessions"])}
     planned["sessions"] = schedule_backfill.apply_review_decisions(planned, decisions)
     not_added: list[dict] = []
+    double_booked: list[dict] = []
     plan = schedule_backfill.plan_import(
         planned, teacher_id, name_overrides=name_overrides,
         student_matches=student_matches, dates=planned.get("dates_shown"), not_added=not_added,
+        double_booked=double_booked,
     )
     if not plan:
-        return
+        return []
+    if double_booked:
+        _double_booked_warning(double_booked)
     st.markdown("**What this changes**")
     st.dataframe(
         _coloured([
@@ -702,6 +707,30 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
         st.caption(" ".join(notes))
     if not_added:
         _not_added_panel(not_added)
+    return double_booked
+
+
+def _double_booked_warning(found: list[dict]) -> None:
+    """Warn about students the upload puts in two classes at once, each with its Excel cell.
+
+    They are still saved, the same as when a class is added on Schedule; the
+    warning reminds the admin to move one of the classes there.
+    """
+    lines = [
+        (f"`{item['cell']}` " if item["cell"] else "")
+        + f"{_student(item['student'])} in {_subject(item['class_name'])} "
+        + _when(f"{item['date']:%a %d %b} {item['start_time']:%H:%M}–{item['end_time']:%H:%M}")
+        + f" is also in {_subject(item['other']['Class'])}"
+        + (f" with {_teacher(item['other']['Teacher'])}" if item["other"]["Teacher"] else "")
+        + ", " + _when(f"{db.as_time(item['other']['Start']):%H:%M}–{db.as_time(item['other']['End']):%H:%M}")
+        for item in found[:8]
+    ]
+    if len(found) > 8:
+        lines.append(f"…and {len(found) - 8} more, listed on Schedule for that month")
+    st.warning(
+        f"Booked into another class at this time ({len(found)}). Saved anyway; "
+        "move one of the classes on Schedule.  \n" + "  \n".join(lines)
+    )
 
 
 def _not_added_panel(lessons: list[dict]) -> None:
@@ -1019,7 +1048,7 @@ def _import_upload_panel() -> None:
         for original, chosen in settled.items():
             name_overrides[original] = renamed_to.get(chosen, chosen)
 
-    _import_changes(preview, decisions, teacher_id, name_overrides, student_matches)
+    double_booked = _import_changes(preview, decisions, teacher_id, name_overrides, student_matches)
 
     if st.button("Commit import", type="primary", key="import_commit"):
         if not teacher_name:
@@ -1092,7 +1121,12 @@ def _import_upload_panel() -> None:
                     f" {len(twice)} class(es) list one student twice — kept once, as first "
                     f"written; check {', '.join(twice[:5])}{' …' if len(twice) > 5 else ''}."
                 )
-            _flash(message)
+            if double_booked:
+                message += (
+                    f" {len(double_booked)} double booking(s) with another teacher's class: "
+                    "move one of each pair on Schedule."
+                )
+            _flash(message, "warning" if double_booked else "success")
             # Also shown where the preview was, which is where the admin who just clicked
             # is looking, until the next workbook is read.
             st.session_state["import_done"] = f"{_teacher(teacher_name)} — {message}"
@@ -4864,7 +4898,20 @@ def _beyond_text(beyond: dict) -> str:
             lines.append(f"- {_plural(len(beyond['Emptied']), 'invoice')} deleted")
         if beyond["Credits"]:
             lines.append(f"- {_money(sum(row['Amount'] for row in beyond['Credits']))} credit gone")
-    return "**Not picked, but affected.** Check these are test records:\n" + "\n".join(lines)
+    return ("**Not picked, but affected** (the students themselves stay on file). "
+            "Check these are test records:\n" + "\n".join(lines))
+
+
+def _left_without_classes(plan: dict) -> str:
+    """Return a line naming students who weren't picked and lose every class, or "" if none.
+
+    They stay on file but drop off every month's lists, so they look deleted.
+    """
+    names = sorted((row["Student"] for row in plan["Beyond"]["Places"] if row["None left"]), key=str.lower)
+    if not names:
+        return ""
+    return (f"Still on file with no classes left: {_chips('student', names, most=10)}. "
+            "To delete them too, pick them under Students.")
 
 
 def _effects_text(plan: dict) -> str:
@@ -5002,7 +5049,18 @@ def delete_records_tab() -> None:
                 f"delete_classes_{generation}",
                 placeholder="None: the whole subject goes" if whole else f"None: all its classes in {period}")
     with student_side:
-        students = _pick(f"Students ({period})", {row["ID"]: row["Name"] for row in choices["Students"]},
+        classless_key = f"delete_classless_{generation}"
+        classless = set(choices["No classes"])
+        # They have no classes, so a delete kept to a month would leave them: ticking it
+        # sets All time, so the ones picked go outright.
+        only_classless = st.checkbox(
+            f"Only students with no classes ({len(classless)})", key=classless_key,
+            on_change=lambda: all_time() if st.session_state.get(classless_key) else None,
+            help="Students on file who aren't in any class, such as a name typed by mistake or one "
+                 "left from a demo. Ticking this sets All time, so the ones you pick are deleted outright.")
+        students = _pick(f"Students ({period})",
+                         {row["ID"]: row["Name"] for row in choices["Students"]
+                          if not only_classless or row["ID"] in classless},
                          f"delete_students_{generation}")
         invoices = []
         if students:
@@ -5047,7 +5105,7 @@ def delete_records_tab() -> None:
         st.error(f"**Affects students you didn't pick** (red box) · {_plural(total, 'record')} to delete")
     else:
         st.success(f"**Only your picks are affected** · {_plural(total, 'record')} to delete")
-    stays = "" if whole or meet else _still_on_file(plan)
+    stays = " ".join(filter(None, ["" if whole or meet else _still_on_file(plan), _left_without_classes(plan)]))
     if stays:
         st.info(stays)
 

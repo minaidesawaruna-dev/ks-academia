@@ -1003,7 +1003,8 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 name_overrides: dict[str, str] | None = None,
                 student_matches: dict[str, int] | None = None,
                 dates=None, today: dt.date | None = None,
-                not_added: list[dict] | None = None) -> dict[tuple[int, int], Counter]:
+                not_added: list[dict] | None = None,
+                double_booked: list[dict] | None = None) -> dict[tuple[int, int], Counter]:
     """Work out what an upload would change, month by month, without saving anything.
 
     Follows backfill step by step (same names, same students, same lessons
@@ -1013,16 +1014,14 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     has a class then) and skipped (another teacher's subject has that name).
     A list passed as `not_added` is filled with each clash and skipped lesson
     and the reason, so the screen can point at its cell in the workbook.
+    A list passed as `double_booked` is filled with each student the upload
+    puts in a lesson while they are in another teacher's lesson at that time.
     """
     today = today or dt.date.today()
     preview = use_subject_spellings(preview, teacher_id)
     sessions, _ = _final_sessions(preview.get("sessions") or [], name_overrides or {})
     counts: dict[tuple[int, int], Counter] = defaultdict(Counter)
     teacher = next((t for t in db.get_all_teachers() if t["ID"] == teacher_id), None)
-    if teacher is None:
-        for session in sessions:
-            counts[_month_of(session["date"])]["new"] += 1
-        return counts
 
     students_on_file = db.get_all_students()
     name_to_id = {**(student_matches or {}), **db.get_student_aliases(),
@@ -1031,6 +1030,28 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     for session in sessions:
         for entry in session["attendance"]:
             name_to_id.setdefault(entry["student_name"].casefold(), -len(name_to_id) - 1)
+
+    # Each lesson that will be on the calendar after the upload, with the students
+    # on file who will be in it, for the double-booking check at the end.
+    staying: list[tuple[dict, list[int]]] = []
+
+    def stays(session, names):
+        """Note a lesson the upload leaves on the calendar, with the students who will attend."""
+        if double_booked is None:
+            return
+        attending = [row["student_id"] for row in _attendance_rows(session, names)
+                     if not row["is_cancelled"] and row["student_id"] > 0]
+        if attending:
+            staying.append((session, attending))
+
+    if teacher is None:
+        for session in sessions:
+            counts[_month_of(session["date"])]["new"] += 1
+            stays(session, name_to_id)
+        if double_booked is not None:
+            double_booked.extend(_double_bookings(staying, None))
+        return counts
+
     same_name, rosters, taught = _same_name_rules(teacher_id, students_on_file)
 
     existing = _teacher_classes(teacher)
@@ -1083,6 +1104,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                     continue
                 on_calendar[session["date"]].append((session["start_time"], session["end_time"], None))
                 month["new"] += 1
+                stays(session, names_here)
                 continue
             status = _lesson_status(session["date"], today, current)
             rows = _attendance_rows(session, names_here)
@@ -1095,7 +1117,43 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 month["held"] += 1
             elif clashes(session, excluded=current["ID"]):
                 leave_out(session, "clash")
+                continue
             else:
                 month["changed"] += 1
                 month["changed_invoiced"] += current["Invoiced"]
+            # A lesson cancelled in the app stays cancelled, so nobody is really booked into it.
+            if status != "Cancelled":
+                stays(session, names_here)
+    if double_booked is not None:
+        double_booked.extend(_double_bookings(staying, teacher_id))
     return counts
+
+
+def _double_bookings(staying: list[tuple[dict, list[int]]], teacher_id: int | None) -> list[dict]:
+    """Return each student an upload puts in a lesson while they are in another teacher's lesson.
+
+    `staying` holds each lesson that will be on the calendar after the upload,
+    with the ids of the students on file who will attend it. Other teachers'
+    lessons on those days are read in one query and compared here.
+    One row per student and pair of lessons: the upload's lesson (with its
+    cell), the student's name and the other lesson as db._clash_entry gives it.
+    """
+    if not staying:
+        return []
+    elsewhere: dict[tuple[int, dt.date], list[dict]] = defaultdict(list)
+    for entry in db.find_bookings_elsewhere(
+            {student_id for _, ids in staying for student_id in ids},
+            {session["date"] for session, _ in staying}, teacher_id):
+        elsewhere[(entry["Student ID"], db.as_date(entry["Date"]))].append(entry)
+    found = []
+    for session, ids in staying:
+        for student_id in ids:
+            for other in elsewhere.get((student_id, session["date"]), []):
+                if db.as_time(other["Start"]) < session["end_time"] and db.as_time(other["End"]) > session["start_time"]:
+                    found.append({
+                        "cell": session.get("cell"), "date": session["date"],
+                        "start_time": session["start_time"], "end_time": session["end_time"],
+                        "class_name": session["class_name"], "student": other["Student"], "other": other,
+                    })
+    found.sort(key=lambda item: (item["date"], item["start_time"], item["student"]))
+    return found

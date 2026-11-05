@@ -2097,11 +2097,12 @@ def _clash_entry(lesson, academy_class, teacher, student) -> dict:
 
 
 def _bookings(session, student_ids=None, dates=None, start_time=None, end_time=None,
-              excluded_session_id=None, between=None):
+              excluded_session_id=None, between=None, other_than_teacher=None):
     """Return the lessons students are really booked into.
 
     Leaves out cancelled lessons and students marked cancelled: they won't
-    be there, so it can't be a clash.
+    be there, so it can't be a clash. `other_than_teacher` leaves out that
+    teacher's lessons.
     """
     query = (
         select(ClassSession, AcademyClass, Teacher, Student)
@@ -2122,6 +2123,8 @@ def _bookings(session, student_ids=None, dates=None, start_time=None, end_time=N
         query = query.where(ClassSession.id != excluded_session_id)
     if between is not None:
         query = query.where(ClassSession.session_date.between(*between))
+    if other_than_teacher is not None:
+        query = query.where(ClassSession.teacher_id != other_than_teacher)
     return session.execute(
         query.order_by(ClassSession.session_date, Student.full_name, ClassSession.start_time)
     ).all()
@@ -2140,6 +2143,20 @@ def find_student_clashes(student_ids, dates, start_time, end_time, excluded_sess
     with SessionLocal() as session:
         return [_clash_entry(*row) for row in _bookings(
             session, list(student_ids), list(dates), start_time, end_time, excluded_session_id)]
+
+
+def find_bookings_elsewhere(student_ids, dates, teacher_id=None) -> list[dict]:
+    """Return the lessons these students have with other teachers on these dates.
+
+    An upload uses this to warn about double bookings before it saves. The
+    uploading teacher's own lessons are left out: the upload is about to
+    rewrite them, and its own clash check already covers them.
+    """
+    if not student_ids or not dates:
+        return []
+    with SessionLocal() as session:
+        return [_clash_entry(*row) for row in _bookings(
+            session, list(student_ids), list(dates), other_than_teacher=teacher_id)]
 
 
 def get_session_clashes(session_id) -> list[dict]:
@@ -6305,7 +6322,8 @@ def get_delete_choices(year=None, month=None) -> dict:
     A period (a year, a month of any year, or both) narrows every list to
     what it touched: teachers and students with a class in it, subjects
     taught in it, its classes, invoices with a line in it, and teachers with
-    past schedules in it. With neither, everything is offered.
+    past schedules in it. With neither, everything is offered. "No classes"
+    lists the students in no class at any time, whatever the period.
     """
     period = bool(year or month)
     with SessionLocal() as session:
@@ -6322,6 +6340,10 @@ def get_delete_choices(year=None, month=None) -> dict:
         students = dict(session.execute(select(Student.id, Student.full_name)).all())
         invoices = session.execute(
             select(Invoice.id, Invoice.invoice_number, Invoice.status, Invoice.student_id)).all()
+        # Students in no class at any time, whatever the period: a name typed by
+        # mistake, or one left behind once a demo teacher was deleted.
+        in_a_class = set(session.scalars(select(SessionAttendance.student_id).distinct()))
+        classless = [key for key in students if key not in in_a_class]
 
         if period:
             # Only what the period touched. A draft's lines have no date until issued,
@@ -6354,6 +6376,7 @@ def get_delete_choices(year=None, month=None) -> dict:
                     for lesson_id, class_id, _, day, start in sorted(lessons, key=lambda row: (row[3], row[4]))
                     if class_id in subjects],
         "Students": [{"ID": key, "Name": students[key]} for key in sorted(students, key=by_name(students))],
+        "No classes": classless,
         # Highest number first, drafts last. Sorted here, because Postgres and SQLite
         # put empty numbers at opposite ends.
         "Invoices": [{"ID": invoice_id, "Number": number, "Status": status, "Student ID": student_id}
