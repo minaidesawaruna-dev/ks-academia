@@ -4965,6 +4965,37 @@ def _pick(label: str, options: dict, key: str, placeholder: str = "Choose option
     return st.multiselect(label, list(options), format_func=options.get, key=key, placeholder=placeholder)
 
 
+def _classless_students(classless: list[dict], generation: int, students_key: str, all_time) -> None:
+    """List the students in no class, so some or all of them can be picked for deleting.
+
+    They are in no month's list, so a name typed by mistake or left from a demo
+    was hard to find. Picking puts them in the Students box and sets All time,
+    since a delete kept to a month would leave them; the usual preview and
+    confirmation follow.
+    """
+    if not classless:
+        return
+
+    def pick(everyone: bool) -> None:
+        """Add the ticked students, or all of them, to the Students box."""
+        chosen = [row["ID"] for row in classless
+                  if everyone or st.session_state.get(f"classless_{generation}_{row['ID']}")]
+        if chosen:
+            all_time()
+            st.session_state[students_key] = list(dict.fromkeys([*st.session_state.get(students_key, []), *chosen]))
+
+    with st.expander(f"Students with no classes ({len(classless)})"):
+        with st.form(f"classless_form_{generation}", border=False):
+            buttons = st.columns(2)
+            buttons[0].form_submit_button(f"Pick all {len(classless)}", on_click=pick, args=(True,),
+                                          key=f"classless_all_{generation}", width="stretch")
+            buttons[1].form_submit_button("Pick ticked", on_click=pick, args=(False,),
+                                          key=f"classless_ticked_{generation}", width="stretch")
+            for row in classless:
+                # A label is markdown, so a name typed with a * or [ shows as written.
+                st.checkbox(_MARKDOWN_SYNTAX.sub(r"\\\1", row["Name"]), key=f"classless_{generation}_{row['ID']}")
+
+
 def _invoice_label(item: dict) -> str:
     """Return how an invoice is listed on Delete records: "#9001 · sent", "#8000 · void", "Draft"."""
     if item["Number"] is None:
@@ -5049,19 +5080,10 @@ def delete_records_tab() -> None:
                 f"delete_classes_{generation}",
                 placeholder="None: the whole subject goes" if whole else f"None: all its classes in {period}")
     with student_side:
-        classless_key = f"delete_classless_{generation}"
-        classless = set(choices["No classes"])
-        # They have no classes, so a delete kept to a month would leave them: ticking it
-        # sets All time, so the ones picked go outright.
-        only_classless = st.checkbox(
-            f"Only students with no classes ({len(classless)})", key=classless_key,
-            on_change=lambda: all_time() if st.session_state.get(classless_key) else None,
-            help="Students on file who aren't in any class, such as a name typed by mistake or one "
-                 "left from a demo. Ticking this sets All time, so the ones you pick are deleted outright.")
-        students = _pick(f"Students ({period})",
-                         {row["ID"]: row["Name"] for row in choices["Students"]
-                          if not only_classless or row["ID"] in classless},
-                         f"delete_students_{generation}")
+        students_key = f"delete_students_{generation}"
+        _classless_students(choices["No classes"], generation, students_key, all_time)
+        students = _pick(f"Students ({period})", {row["ID"]: row["Name"] for row in choices["Students"]},
+                         students_key)
         invoices = []
         if students:
             names = {row["ID"]: row["Name"] for row in choices["Students"]}

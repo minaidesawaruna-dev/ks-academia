@@ -6343,7 +6343,7 @@ def get_delete_choices(year=None, month=None) -> dict:
         # Students in no class at any time, whatever the period: a name typed by
         # mistake, or one left behind once a demo teacher was deleted.
         in_a_class = set(session.scalars(select(SessionAttendance.student_id).distinct()))
-        classless = [key for key in students if key not in in_a_class]
+        classless = {key: name for key, name in students.items() if key not in in_a_class}
 
         if period:
             # Only what the period touched. A draft's lines have no date until issued,
@@ -6376,7 +6376,7 @@ def get_delete_choices(year=None, month=None) -> dict:
                     for lesson_id, class_id, _, day, start in sorted(lessons, key=lambda row: (row[3], row[4]))
                     if class_id in subjects],
         "Students": [{"ID": key, "Name": students[key]} for key in sorted(students, key=by_name(students))],
-        "No classes": classless,
+        "No classes": [{"ID": key, "Name": classless[key]} for key in sorted(classless, key=by_name(classless))],
         # Highest number first, drafts last. Sorted here, because Postgres and SQLite
         # put empty numbers at opposite ends.
         "Invoices": [{"ID": invoice_id, "Number": number, "Status": status, "Student ID": student_id}

@@ -2521,14 +2521,17 @@ exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__nam
 at = AppTest.from_string(page, default_timeout=120)
 at.query_params["screen"] = "Delete records"
 at.run()
-box = at.checkbox(key="delete_classless_0")
-result = {"label": box.label,
-          "this month": at.multiselect(key="delete_students_0").options}
-box.check().run()
-result["after tick"] = {"year": at.session_state["delete_year_0"], "month": at.session_state["delete_month_0"],
-                        "offered": at.multiselect(key="delete_students_0").options}
 names = {s["Name"]: s["ID"] for s in db.get_all_students()}
-at.multiselect(key="delete_students_0").set_value([names["Seo Yerin"], names["Oh Minseok"]]).run()
+name_of = {key: name for name, key in names.items()}
+picks = lambda: sorted(name_of[key] for key in at.multiselect(key="delete_students_0").value)
+result = {"list": [e.label for e in at.expander], "ticks": [c.label for c in at.checkbox if c.key.startswith("classless_0_")],
+          "this month": at.multiselect(key="delete_students_0").options}
+at.checkbox(key=f"classless_0_{names['Seo Yerin']}").check()
+at.button(key="classless_ticked_0").click().run()
+result["ticked"] = {"year": at.session_state["delete_year_0"], "month": at.session_state["delete_month_0"],
+                    "picked": picks()}
+at.button(key="classless_all_0").click().run()
+result["all"] = picks()
 at.text_input(key="delete_confirm_0").set_value("delete").run()
 at.button(key="delete_go_0").click().run()
 result["left"] = sorted(s["Name"] for s in db.get_all_students())
@@ -2539,11 +2542,12 @@ print(json.dumps(result, default=str))
 
 
 def t_delete_classless_students():
-    """Delete records can list only the students in no class, to clear names typed by mistake.
+    """Delete records lists the students in no class, to pick some or all of them for deleting.
 
-    They are in no month's list, so they were hard to find. Ticking the box
-    narrows the Students list to them and sets All time, so the ones picked
-    go outright; the student with a class and the class itself stay.
+    They are in no month's list, so a name typed by mistake was hard to find.
+    Pick ticked adds the ticked ones to the Students box and sets All time, so
+    they go outright; Pick all adds the rest. The student with a class and the
+    class itself stay.
     """
     import json
     import tempfile
@@ -2554,12 +2558,12 @@ def t_delete_classless_students():
         assert result.returncode == 0, result.stderr[-1500:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
     assert got["errors"] == [], got["errors"]
-    assert got["label"] == "Only students with no classes (2)", got["label"]
+    assert "Students with no classes (2)" in got["list"] and got["ticks"] == ["Oh Minseok", "Seo Yerin"], got
     assert got["this month"] == ["Nam Jihoon"], got["this month"]
-    tick = got["after tick"]
-    assert tick["year"] == 0 and tick["month"] == 0 and tick["offered"] == ["Oh Minseok", "Seo Yerin"], tick
+    assert got["ticked"] == {"year": 0, "month": 0, "picked": ["Seo Yerin"]}, got["ticked"]
+    assert got["all"] == ["Oh Minseok", "Seo Yerin"], got["all"]
     assert got["left"] == ["Nam Jihoon"] and got["lessons"] == 1, got
-    return "only the two with no classes listed, All time set, both gone; the student in a class stays"
+    return "the two with no classes listed; one ticked, then all, picked with All time; both gone, the other stays"
 
 
 _WHOLE_CLASS_SCRIPT = r"""
