@@ -525,9 +525,8 @@ def t_read_functions_all_run():
         "get_invoice_lookup": db.get_invoice_lookup,
         "get_classrooms": db.get_classrooms,
         "get_month_room_shortages": lambda: db.get_month_room_shortages(year, month),
-        "most_lessons_at_once": lambda: db.most_lessons_at_once(first, dt.time(10), dt.time(12)),
-        "find_bookings_elsewhere": lambda: db.find_bookings_elsewhere(
-            [s["ID"] for s in db.get_all_students()[:25]], [first], tid),
+        "most_lessons_at_once": lambda: db.most_lessons_at_once([first], dt.time(10), dt.time(12)),
+        "get_lessons_using_rooms": lambda: db.get_lessons_using_rooms(first, first, other_than_teacher=tid),
         "describe_master_delete": lambda: db.describe_master_delete(
             [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }
@@ -2592,8 +2591,15 @@ sb.backfill({"sessions": [lesson(7, 4, "G10 Test Math", group),
 sb.backfill({"sessions": [lesson(8, 3, "G9 Test Eng", ["Hayun Kim"]), lesson(8, 10, "G9 Test Eng", ["Hayun Kim"]),
                           lesson(9, 7, "G9 Test Eng", ["Hayun Kim"]), lesson(9, 14, "G9 Test Eng", ["Hayun Kim"]),
                           lesson(9, 21, "G9 Test Eng", ["Hayun Kim"])]}, ids["Teacher B"])
+# A one-to-one teacher priced above $100 an hour is still one-to-one.
+english = next(c["ID"] for c in db.get_all_classes() if c["Class"] == "G9 Test Eng")
+db.set_class_rate_for_month(english, dt.date(2026, 9, 1), 110.0)
 for row in db.get_open_invoice_items_for_month(2026, 9):
     db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+# A month only booked so far, quieter than any: it must never be named the quietest.
+ahead = dt.date.today() + dt.timedelta(days=40)
+sb.backfill({"sessions": [{**lesson(ahead.month, ahead.day, "G9 Test Eng", ["Hayun Kim"]),
+                           "date": ahead, "end_time": dt.time(17)}]}, ids["Teacher B"])
 
 page = '''
 import sys, types
@@ -2609,6 +2615,15 @@ at.session_state["data_month_year"] = 2026
 at.session_state["data_month_month"] = 9
 at.run()
 result = {"busy": [m.value for m in at.markdown if m.value.startswith("Busiest month")]}
+# The same year up to the booked month ahead (only meaningful while it's still in 2026).
+at.session_state["data_month_year"] = ahead.year
+at.session_state["data_month_month"] = ahead.month
+at.run()
+result["busy_ahead"] = [m.value for m in at.markdown if m.value.startswith("Busiest month")]
+result["ahead"] = [ahead.year, ahead.month]
+at.session_state["data_month_year"] = 2026
+at.session_state["data_month_month"] = 9
+at.run()
 at.radio(key="data_view").set_value("Invoiced").run()
 result["heading"] = any("Hours and students, by teacher" in m.value for m in at.markdown)
 dots = []
@@ -2654,9 +2669,10 @@ db.set_classrooms(2)
 month = db.get_month_room_shortages(2026, 9)
 result["month"] = [[str(s["Date"]), f"{s['Start']:%H:%M}", f"{s['End']:%H:%M}", s["Most"],
                     sorted(l["Class"] for l in s["Lessons"])] for s in month]
-result["at_once"] = [db.most_lessons_at_once(dt.date(2026, 9, 5), dt.time(11), dt.time(12)),
-                     db.most_lessons_at_once(dt.date(2026, 9, 5), dt.time(13), dt.time(14)),
-                     db.most_lessons_at_once(dt.date(2026, 9, 12), dt.time(10), dt.time(12))]
+fifth, twelfth = dt.date(2026, 9, 5), dt.date(2026, 9, 12)
+both = db.most_lessons_at_once([fifth, twelfth], dt.time(11), dt.time(12))
+result["at_once"] = [both[fifth], db.most_lessons_at_once([fifth], dt.time(13), dt.time(14))[fifth],
+                     db.most_lessons_at_once([twelfth], dt.time(10), dt.time(12))[twelfth], both[twelfth]]
 
 # Teacher B uploads a sheet: 12 Sep now has their student back, and 19 Sep is new with nobody else on.
 upload = {"sessions": [lesson(5, "G9 Test Eng", (11,), (13,), "Seo Yerin", cell="Sep26!B5"),
@@ -2682,9 +2698,35 @@ at.session_state["month"] = (2026, 9)
 at.run()
 result["screen"] = [m.value for m in at.markdown if "classes at once" in m.value]
 result["number_box"] = [n.value for n in at.number_input if n.label == "Classrooms"]
-db.set_classrooms(3)
+
+# Add a class: Teacher A at 11:00-12:00 on 5 Sep, when 3 classes already run; then at 13:00.
+at.date_input(key="new_lesson_date_2026_9").set_value(dt.date(2026, 9, 5))
+at.time_input(key="new_lesson_start").set_value(dt.time(11))
+at.time_input(key="new_lesson_end").set_value(dt.time(12)).run()
+result["add_full"] = [w.value for w in at.warning if "classrooms are in use" in w.value]
+at.time_input(key="new_lesson_start").set_value(dt.time(13))
+at.time_input(key="new_lesson_end").set_value(dt.time(14)).run()
+result["add_free"] = [w.value for w in at.warning if "classrooms are in use" in w.value]
+
+# A real upload: Teacher B's month, exported, uploaded for a new Teacher D.
+import schedule_writer
+sheet = schedule_writer.write_month(sb.lessons_on_file(ids["Teacher B"], 2026, 9), 2026, 9)
+up = AppTest.from_string(page, default_timeout=120)
+up.query_params["screen"] = "Teachers"
+up.run()
+up.radio(key="import_teacher_mode").set_value("New teacher").run()
+up.text_input(key="import_new_teacher_name_0").set_value("Teacher D").run()
+up.file_uploader(key="import_file_0").set_value(
+    ("Teacher D.xlsx", sheet, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")).run()
+up.button(key="import_parse").click().run()
+# A past month isn't ticked for a new teacher; the admin ticks September.
+up.multiselect(key="import_months_1_None").set_value(["2026-09"]).run()
+result["preview_rooms"] = [w.value for w in up.warning if "classrooms" in w.value]
+up.button(key="import_commit").click().run()
+result["after_commit"] = [w.value for w in up.warning if "Imported" in w.value]
+result["errors"] = [e.value for e in at.exception] + [e.value for e in up.exception]
+db.set_classrooms(4)
 result["after_raise"] = len(db.get_month_room_shortages(2026, 9))
-result["errors"] = [e.value for e in at.exception]
 print(json.dumps(result))
 """
 
@@ -2708,15 +2750,21 @@ def t_classrooms_limit():
     assert got["errors"] == [], got["errors"]
     assert got["default"] == 13, got
     assert got["month"] == [["2026-09-05", "11:00", "11:30", 3, ["G10 Test Math", "G9 Test Art", "G9 Test Eng"]]], got["month"]
-    assert got["at_once"] == [3, 0, 2], got["at_once"]
+    assert got["at_once"] == [3, 0, 2, 2], got["at_once"]
     assert got["upload"] == [["2026-09-05", "11:00", 3, ["Sep26!B5"]], ["2026-09-12", "11:00", 3, ["Sep26!B12"]]], got["upload"]
     assert got["same_without"], got
     screen = got["screen"]
     assert len(screen) == 1 and "Sat 05 Sep" in screen[0] and "3 classes at once" in screen[0] \
         and "Teacher C" in screen[0], screen
     assert got["number_box"] == [2], got["number_box"]
+    assert len(got["add_full"]) == 1 and "Sat 05 Sep" in got["add_full"][0], got["add_full"]
+    assert got["add_free"] == [], got["add_free"]
+    assert len(got["preview_rooms"]) == 1 and "4 classes at once" in got["preview_rooms"][0], got["preview_rooms"]
+    done = got["after_commit"]
+    assert len(done) == 1 and "1 double booking(s)" in done[0] and "1 time(s) need more than the 2 classrooms" in done[0], done
     assert got["after_raise"] == 0, got
-    return "13 by default; one time over 2 rooms found, cancelled and back-to-back left out; upload names its cells"
+    return ("13 by default; one time over 2 rooms found, cancelled and back-to-back left out; "
+            "Add a class warns; a real upload warns, then counts both in its message")
 
 
 def t_data_busy_months_and_teachers():
@@ -2739,9 +2787,12 @@ def t_data_busy_months_and_teachers():
     assert len(busy) == 1 and "September" in busy[0] and "10 teaching hours" in busy[0] \
         and "July" in busy[0].split("Quietest")[1] and busy[0].endswith("2 hours."), busy
     assert got["heading"], got
-    assert got["dots"] == [["Teacher A", 4.0, 3, "Group classes, over $100 an hour"],
+    assert got["dots"] == [["Teacher A", 4.0, 3, "Group classes"],
                            ["Teacher B", 6.0, 1, "Mostly one student"]], got["dots"]
-    return "busiest September, quietest July; a group teacher and a one-to-one teacher told apart"
+    if got["ahead"][0] == 2026:
+        assert len(got["busy_ahead"]) == 1 and "Quietest: :gray-badge[July]" in got["busy_ahead"][0], got
+    return ("busiest September, quietest July, a booked month ahead never quietest; "
+            "a one-to-one teacher at $110 an hour still one-to-one")
 
 
 _WHOLE_CLASS_SCRIPT = r"""

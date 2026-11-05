@@ -2097,12 +2097,11 @@ def _clash_entry(lesson, academy_class, teacher, student) -> dict:
 
 
 def _bookings(session, student_ids=None, dates=None, start_time=None, end_time=None,
-              excluded_session_id=None, between=None, other_than_teacher=None):
+              excluded_session_id=None, between=None):
     """Return the lessons students are really booked into.
 
     Leaves out cancelled lessons and students marked cancelled: they won't
-    be there, so it can't be a clash. `other_than_teacher` leaves out that
-    teacher's lessons.
+    be there, so it can't be a clash.
     """
     query = (
         select(ClassSession, AcademyClass, Teacher, Student)
@@ -2123,8 +2122,6 @@ def _bookings(session, student_ids=None, dates=None, start_time=None, end_time=N
         query = query.where(ClassSession.id != excluded_session_id)
     if between is not None:
         query = query.where(ClassSession.session_date.between(*between))
-    if other_than_teacher is not None:
-        query = query.where(ClassSession.teacher_id != other_than_teacher)
     return session.execute(
         query.order_by(ClassSession.session_date, Student.full_name, ClassSession.start_time)
     ).all()
@@ -2143,20 +2140,6 @@ def find_student_clashes(student_ids, dates, start_time, end_time, excluded_sess
     with SessionLocal() as session:
         return [_clash_entry(*row) for row in _bookings(
             session, list(student_ids), list(dates), start_time, end_time, excluded_session_id)]
-
-
-def find_bookings_elsewhere(student_ids, dates, teacher_id=None) -> list[dict]:
-    """Return the lessons these students have with other teachers on these dates.
-
-    An upload uses this to warn about double bookings before it saves. The
-    uploading teacher's own lessons are left out: the upload is about to
-    rewrite them, and its own clash check already covers them.
-    """
-    if not student_ids or not dates:
-        return []
-    with SessionLocal() as session:
-        return [_clash_entry(*row) for row in _bookings(
-            session, list(student_ids), list(dates), other_than_teacher=teacher_id)]
 
 
 def get_session_clashes(session_id) -> list[dict]:
@@ -2227,7 +2210,9 @@ def get_lessons_using_rooms(first_day, last_day, other_than_teacher=None) -> lis
     A cancelled lesson doesn't, and nor does one whose students are all
     marked cancelled. A lesson with every student online still does: the
     teacher may teach it from a classroom. `other_than_teacher` leaves out
-    that teacher's lessons, for an upload about to rewrite them.
+    that teacher's lessons, for an upload about to rewrite them. Each lesson
+    lists the ids of the students coming ("Students"), so an upload can check
+    double bookings from the same lessons.
     """
     with SessionLocal() as session:
         query = (
@@ -2241,20 +2226,21 @@ def get_lessons_using_rooms(first_day, last_day, other_than_teacher=None) -> lis
         if other_than_teacher is not None:
             query = query.where(ClassSession.teacher_id != other_than_teacher)
         rows = session.execute(query).all()
-        # Counted in a second query grouped by one column only, which every database accepts.
-        places, off = defaultdict(int), defaultdict(int)
+        # Each lesson's places in a second query, so no grouping is needed.
+        places, coming = defaultdict(int), defaultdict(list)
         for chunk in _chunks([row[0] for row in rows]):
-            for lesson_id, cancelled in session.execute(
-                select(SessionAttendance.session_id, SessionAttendance.is_cancelled)
+            for lesson_id, student_id, cancelled in session.execute(
+                select(SessionAttendance.session_id, SessionAttendance.student_id, SessionAttendance.is_cancelled)
                 .where(SessionAttendance.session_id.in_(chunk))
             ):
                 places[lesson_id] += 1
-                off[lesson_id] += bool(cancelled)
+                if not cancelled:
+                    coming[lesson_id].append(student_id)
     return [
         {"ID": lesson_id, "Date": as_date(day), "Start": as_time(start), "End": as_time(end),
-         "Class": subject, "Teacher": teacher or ""}
+         "Class": subject, "Teacher": teacher or "", "Students": coming[lesson_id]}
         for lesson_id, day, start, end, subject, teacher in rows
-        if not (places[lesson_id] and off[lesson_id] == places[lesson_id])
+        if not places[lesson_id] or coming[lesson_id]
     ]
 
 
@@ -2305,17 +2291,27 @@ def get_month_room_shortages(year, month, rooms=None) -> list[dict]:
                                get_classrooms() if rooms is None else rooms)
 
 
-def most_lessons_at_once(day, start, end) -> int:
-    """Return the most lessons already running at one moment between `start` and `end` on `day`.
+def most_lessons_at_once(days, start, end) -> dict:
+    """Return, for each day, the most lessons already running at one moment between `start` and `end`.
 
-    Adding a class then needs one classroom more than this.
+    Adding a class then needs one classroom more than this. All the days are
+    read in one query, so a class repeated over months costs no more.
     """
-    running = [lesson for lesson in get_lessons_using_rooms(day, day)
-               if lesson["Start"] < end and lesson["End"] > start]
-    edges = sorted({start, end} | {moment for lesson in running for moment in (lesson["Start"], lesson["End"])
-                                   if start < moment < end})
-    return max((sum(1 for lesson in running if lesson["Start"] < finish and lesson["End"] > begin)
-                for begin, finish in zip(edges, edges[1:])), default=0)
+    days = set(days)
+    if not days or not start < end:
+        return {}
+    by_day = defaultdict(list)
+    for lesson in get_lessons_using_rooms(min(days), max(days)):
+        if lesson["Date"] in days and lesson["Start"] < end and lesson["End"] > start:
+            by_day[lesson["Date"]].append(lesson)
+    most = {}
+    for day in days:
+        running = by_day.get(day, [])
+        edges = sorted({start, end} | {moment for lesson in running
+                                       for moment in (lesson["Start"], lesson["End"]) if start < moment < end})
+        most[day] = max((sum(1 for lesson in running if lesson["Start"] < finish and lesson["End"] > begin)
+                         for begin, finish in zip(edges, edges[1:])), default=0)
+    return most
 
 
 def set_student_note(student_id, note):
@@ -5368,6 +5364,32 @@ def _teacher_month_scheduled(session, first_day, last_day, teacher_ids):
     return buckets
 
 
+def _teacher_month_class_sizes(session, first_day, last_day, teacher_ids):
+    """Return, per teacher, the lessons taught in a period and the places in them: (lessons, places).
+
+    A place is a student who came, so places per lesson is the class size,
+    whatever the price. Counted over the same lessons as the hours taught.
+    """
+    if not teacher_ids:
+        return {}
+    teacher_of = dict(session.execute(
+        select(ClassSession.id, ClassSession.teacher_id).where(
+            *_lesson_window(first_day, min(last_day, date.today()), list(teacher_ids)),
+            ClassSession.status != "Cancelled",
+        )
+    ).all())
+    lessons, places = defaultdict(int), defaultdict(int)
+    for teacher_id in teacher_of.values():
+        lessons[teacher_id] += 1
+    for chunk in _chunks(list(teacher_of)):
+        for (lesson_id,) in session.execute(
+            select(SessionAttendance.session_id).where(
+                SessionAttendance.session_id.in_(chunk), SessionAttendance.is_cancelled.is_(False))
+        ):
+            places[teacher_of[lesson_id]] += 1
+    return {teacher_id: (count, places[teacher_id]) for teacher_id, count in lessons.items()}
+
+
 def _teacher_month_uninvoiced(session, first_day, last_day, teacher_ids):
     """Return, per teacher and month, the lessons with a student not yet invoiced, and their value.
 
@@ -5483,6 +5505,7 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
         taught = _teacher_month_scheduled(session, first_day, last_day, ids)
         students = _teacher_student_counts(session, first_day, last_day, ids)
         waiting = _teacher_month_uninvoiced(session, first_day, last_day, ids)
+        sizes = _teacher_month_class_sizes(session, first_day, last_day, ids)
 
         results = []
         for teacher in teachers:
@@ -5502,6 +5525,8 @@ def get_teacher_month_stats(year, month, teacher_ids=None):
                     "Invoiced lesson hours": round(bucket["Lesson hours"], 2) if bucket else 0.0,
                     "Hours": round(hours, 2),
                     "Students": count,
+                    "Lessons": sizes.get(teacher.id, (0, 0))[0],
+                    "Places": sizes.get(teacher.id, (0, 0))[1],
                     "Not invoiced lessons": unbilled["lessons"],
                     "Not invoiced hours": round(unbilled["hours"], 2),
                     "Not invoiced value": unbilled["value"],

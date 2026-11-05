@@ -1055,21 +1055,36 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
 
     def uses_room(session) -> None:
         """Note an upload lesson that will be on the calendar, unless every student is off it."""
+        if over_rooms is None:
+            return
         statuses = [(entry.get("status") or "").casefold() for entry in session["attendance"]]
         if not statuses or any(status != "cancelled" for status in statuses):
             in_rooms.append({"Date": session["date"], "Start": session["start_time"], "End": session["end_time"],
                              "Class": session["class_name"], "Teacher": teacher["Name"] if teacher else "",
                              "cell": session.get("cell"), "Mine": True})
 
+    def check_others() -> None:
+        """Compare this teacher's lessons after the upload with everyone else's, in one read."""
+        if double_booked is None and over_rooms is None:
+            return
+        days = {session["date"] for session, _ in staying} | {lesson["Date"] for lesson in in_rooms}
+        if not days:
+            return
+        others = [lesson for lesson in db.get_lessons_using_rooms(min(days), max(days), other_than_teacher=teacher_id)
+                  if lesson["Date"] in days]
+        if double_booked is not None:
+            names = {item["ID"]: item["Name"] for item in students_on_file}
+            double_booked.extend(_double_bookings(staying, others, names))
+        if over_rooms is not None:
+            over_rooms.extend(stretch for stretch in db.find_room_shortages(others + in_rooms, db.get_classrooms())
+                              if any(lesson.get("Mine") for lesson in stretch["Lessons"]))
+
     if teacher is None:
         for session in sessions:
             counts[_month_of(session["date"])]["new"] += 1
             stays(session, name_to_id)
             uses_room(session)
-        if double_booked is not None:
-            double_booked.extend(_double_bookings(staying, None))
-        if over_rooms is not None:
-            over_rooms.extend(_room_shortages(in_rooms, None))
+        check_others()
         return counts
 
     same_name, rosters, taught = _same_name_rules(teacher_id, students_on_file)
@@ -1149,8 +1164,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             if status != "Cancelled":
                 stays(session, names_here)
                 uses_room(session)
-    if double_booked is not None:
-        double_booked.extend(_double_bookings(staying, teacher_id))
+    # The saved lessons the workbook leaves alone still take a room.
     if over_rooms is not None:
         for lesson in kept.values():
             rows = lesson.get("Attendance") or []
@@ -1158,51 +1172,33 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 in_rooms.append({"Date": db.as_date(lesson["Date"]), "Start": db.as_time(lesson["Start"]),
                                  "End": db.as_time(lesson["End"]), "Class": lesson["Class"],
                                  "Teacher": teacher["Name"], "cell": None, "Mine": True})
-        over_rooms.extend(_room_shortages(in_rooms, teacher_id))
+    check_others()
     return counts
 
 
-def _room_shortages(mine: list[dict], teacher_id: int | None) -> list[dict]:
-    """Return the times when this teacher's lessons and everyone else's need more rooms than there are.
-
-    `mine` are the teacher's lessons after the upload. Other teachers' lessons
-    on those days are read in one query. Only times one of this teacher's
-    lessons is part of are kept: the others aren't this upload's doing.
-    """
-    if not mine:
-        return []
-    days = {lesson["Date"] for lesson in mine}
-    others = [lesson for lesson in db.get_lessons_using_rooms(min(days), max(days), other_than_teacher=teacher_id)
-              if lesson["Date"] in days]
-    return [stretch for stretch in db.find_room_shortages(others + mine, db.get_classrooms())
-            if any(lesson.get("Mine") for lesson in stretch["Lessons"])]
-
-
-def _double_bookings(staying: list[tuple[dict, list[int]]], teacher_id: int | None) -> list[dict]:
+def _double_bookings(staying: list[tuple[dict, list[int]]], others: list[dict],
+                     names: dict[int, str]) -> list[dict]:
     """Return each student an upload puts in a lesson while they are in another teacher's lesson.
 
     `staying` holds each lesson that will be on the calendar after the upload,
-    with the ids of the students on file who will attend it. Other teachers'
-    lessons on those days are read in one query and compared here.
+    with the ids of the students on file who will attend it; `others` are the
+    other teachers' lessons on those days (db.get_lessons_using_rooms).
     One row per student and pair of lessons: the upload's lesson (with its
-    cell), the student's name and the other lesson as db._clash_entry gives it.
+    cell), the student's name and the other lesson.
     """
-    if not staying:
-        return []
     elsewhere: dict[tuple[int, dt.date], list[dict]] = defaultdict(list)
-    for entry in db.find_bookings_elsewhere(
-            {student_id for _, ids in staying for student_id in ids},
-            {session["date"] for session, _ in staying}, teacher_id):
-        elsewhere[(entry["Student ID"], db.as_date(entry["Date"]))].append(entry)
+    for lesson in others:
+        for student_id in lesson["Students"]:
+            elsewhere[(student_id, lesson["Date"])].append(lesson)
     found = []
     for session, ids in staying:
         for student_id in ids:
             for other in elsewhere.get((student_id, session["date"]), []):
-                if db.as_time(other["Start"]) < session["end_time"] and db.as_time(other["End"]) > session["start_time"]:
+                if other["Start"] < session["end_time"] and other["End"] > session["start_time"]:
                     found.append({
                         "cell": session.get("cell"), "date": session["date"],
                         "start_time": session["start_time"], "end_time": session["end_time"],
-                        "class_name": session["class_name"], "student": other["Student"], "other": other,
+                        "class_name": session["class_name"], "student": names.get(student_id, ""), "other": other,
                     })
     found.sort(key=lambda item: (item["date"], item["start_time"], item["student"]))
     return found

@@ -2237,8 +2237,9 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
                            + _clash_lines(booked, dated=bool(extra)))
         if times_set and start < end:
             rooms = db.get_classrooms()
-            full = [day for day in (when + dt.timedelta(weeks=week) for week in range(extra + 1))
-                    if db.most_lessons_at_once(day, start, end) >= rooms]
+            in_use = db.most_lessons_at_once([when + dt.timedelta(weeks=week) for week in range(extra + 1)],
+                                             start, end)
+            full = sorted(day for day, count in in_use.items() if count >= rooms)
             if full:
                 st.warning(f"All {rooms} classrooms are in use at that time on "
                            + _chips("when", [f"{day:%a %d %b}" for day in full], most=6)
@@ -2710,9 +2711,8 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                 st.warning(_explain(str(outcome)))
 
 
-def _classrooms_button(column) -> None:
+def _classrooms_button(column, rooms: int) -> None:
     """Show how many classrooms the academy has, with a box to change it when rooms are added."""
-    rooms = db.get_classrooms()
     with column.popover(f"{rooms} classrooms", icon=":material/meeting_room:",
                         help="The most classes that can run at once. Change it when the academy adds rooms."):
         with st.form("classrooms_form", border=False):
@@ -2723,9 +2723,8 @@ def _classrooms_button(column) -> None:
                 _rerun()
 
 
-def _month_room_shortages(year: int, month: int) -> None:
+def _month_room_shortages(year: int, month: int, rooms: int) -> None:
     """Show the times this month when more classes run at once than there are classrooms, all teachers."""
-    rooms = db.get_classrooms()
     found = db.get_month_room_shortages(year, month, rooms)
     if not found:
         return
@@ -2755,12 +2754,13 @@ def schedule_tab() -> None:
         "Teacher", [item["Name"] for item in teachers], key="tt_teacher"
     )
     teacher_id = next(item["ID"] for item in teachers if item["Name"] == teacher_name)
-    _classrooms_button(top[1])
+    rooms = db.get_classrooms()
+    _classrooms_button(top[1], rooms)
 
     _anchor("grid-top")
     year, month = _month_navigator()
     _month_clashes(year, month)
-    _month_room_shortages(year, month)
+    _month_room_shortages(year, month, rooms)
     summary = db.get_month_schedule(teacher_id, year, month)
     # One query for the whole month's rosters, not three per class. The grid only
     # needs each card's student names and conditions, which is what this returns.
@@ -4433,8 +4433,9 @@ def _teaching_view() -> None:
         width="stretch",
     )
     # The busiest and quietest whole months, so admin time can be planned around them.
-    # A month still under way is left out: half a month would always look quietest.
-    whole_months = [row for row in months if (row["Year"], row["Month"]) != (today.year, today.month)]
+    # Only months that have ended: half a month, or one only booked so far, would
+    # always look quietest.
+    whole_months = [row for row in months if (row["Year"], row["Month"]) < (today.year, today.month)]
     if len(whole_months) >= 2:
         busiest = max(whole_months, key=lambda row: row["Hours"])
         quietest = min(whole_months, key=lambda row: row["Hours"])
@@ -4703,18 +4704,11 @@ def data_tab() -> None:
     _hours_and_students(snapshot)
 
 
-# How a teacher's month reads from what one hour of it brought in: one student pays
-# $60–65 an hour, so over $100 means several students shared the hour.
-_TEACHER_KINDS = {"Group classes, over $100 an hour": "#2a78d6",
-                  "Mostly one student": "#a9c8ee",
-                  "Not invoiced yet": "#c3c2b7"}
-
-
-def _teacher_kind(invoiced: float, invoiced_hours: float) -> str:
-    """Return which of _TEACHER_KINDS a teacher's month is."""
-    if not invoiced_hours:
-        return "Not invoiced yet"
-    return "Group classes, over $100 an hour" if invoiced / invoiced_hours > 100 else "Mostly one student"
+# A teacher's month by class size: students who came per lesson. Judged by the
+# lessons, not the price, so raising a one-to-one teacher's price doesn't make
+# them look like a group teacher.
+_TEACHER_KINDS = {"Group classes": "#2a78d6", "Mostly one student": "#a9c8ee"}
+GROUP_CLASS_SIZE = 1.5
 
 
 def _hours_and_students(snapshot: pd.DataFrame) -> None:
@@ -4723,11 +4717,12 @@ def _hours_and_students(snapshot: pd.DataFrame) -> None:
     Many students means a teacher in demand; many hours with few students
     means mostly one-to-one, with room for small groups. Names show on hover.
     """
-    taught = snapshot[snapshot["Hours"] > 0].copy()
+    taught = snapshot[(snapshot["Hours"] > 0) & (snapshot["Lessons"] > 0)].copy()
     if taught.empty:
         return
-    taught["Kind"] = [_teacher_kind(invoiced, hours)
-                      for invoiced, hours in zip(taught["Invoiced"], taught["Invoiced lesson hours"])]
+    taught["Students a lesson"] = (taught["Places"] / taught["Lessons"]).round(1)
+    taught["Kind"] = ["Group classes" if size >= GROUP_CLASS_SIZE else "Mostly one student"
+                      for size in taught["Students a lesson"]]
     taught["Per teaching hour"] = [_per_hour(invoiced, hours)
                                    for invoiced, hours in zip(taught["Invoiced"], taught["Invoiced lesson hours"])]
     st.markdown("##### Hours and students, by teacher")
@@ -4743,14 +4738,14 @@ def _hours_and_students(snapshot: pd.DataFrame) -> None:
             color=alt.Color("Kind:N", scale=alt.Scale(domain=list(_TEACHER_KINDS), range=list(_TEACHER_KINDS.values())),
                             legend=alt.Legend(title=None, orient="bottom", labelLimit=0)),
             tooltip=[alt.Tooltip("Teacher:N"), alt.Tooltip("Hours:Q", title="Hours taught"),
-                     alt.Tooltip("Students:Q"), alt.Tooltip("Per teaching hour:N"),
-                     alt.Tooltip("Invoiced:Q", format="$,.2f")],
+                     alt.Tooltip("Students:Q"), alt.Tooltip("Students a lesson:Q"),
+                     alt.Tooltip("Per teaching hour:N"), alt.Tooltip("Invoiced:Q", format="$,.2f")],
         )
         .properties(height=300),
         width="stretch",
     )
-    st.caption("Each dot is a teacher; hover for the name. Many students: in demand. "
-               "Many hours but few students: mostly one-to-one, with room for small groups.")
+    st.caption(f"Each dot is a teacher; hover for the name. Group classes average {GROUP_CLASS_SIZE:g} students "
+               "a lesson or more. Many students: in demand. Many hours but few students: room for small groups.")
 
 
 # ---------------------------------------------------------------------------
