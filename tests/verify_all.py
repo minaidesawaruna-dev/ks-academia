@@ -2566,6 +2566,85 @@ def t_delete_classless_students():
     return "the two with no classes listed; one ticked, then all, picked with All time; both gone, the other stays"
 
 
+_DATA_TEACHERS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+import pyarrow as pa
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+db.create_teacher("Teacher B")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(month, day, subject, people):
+    return {"date": dt.date(2026, month, day), "class_name": subject, "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": name, "status": "Attending"} for name in people]}
+
+group = ["Nam Jihoon", "Seo Yerin", "Oh Minseok"]
+sb.backfill({"sessions": [lesson(7, 4, "G10 Test Math", group),
+                          lesson(9, 5, "G10 Test Math", group), lesson(9, 12, "G10 Test Math", group)]},
+            ids["Teacher A"])
+sb.backfill({"sessions": [lesson(8, 3, "G9 Test Eng", ["Hayun Kim"]), lesson(8, 10, "G9 Test Eng", ["Hayun Kim"]),
+                          lesson(9, 7, "G9 Test Eng", ["Hayun Kim"]), lesson(9, 14, "G9 Test Eng", ["Hayun Kim"]),
+                          lesson(9, 21, "G9 Test Eng", ["Hayun Kim"])]}, ids["Teacher B"])
+for row in db.get_open_invoice_items_for_month(2026, 9):
+    db.issue_invoice_for_month(row["Invoice ID"], 2026, 9)
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Data"
+at.session_state["data_month_year"] = 2026
+at.session_state["data_month_month"] = 9
+at.run()
+result = {"busy": [m.value for m in at.markdown if m.value.startswith("Busiest month")]}
+at.radio(key="data_view").set_value("Invoiced").run()
+result["heading"] = any("Hours and students, by teacher" in m.value for m in at.markdown)
+dots = []
+for chart in at.get("vega_lite_chart"):
+    for data in chart.proto.datasets:
+        frame = pa.ipc.open_stream(data.data.data).read_pandas()
+        if {"Kind", "Teacher", "Students"} <= set(frame.columns):
+            dots += [[row.Teacher, float(row.Hours), int(row.Students), row.Kind]
+                     for row in frame.sort_values("Teacher").itertuples()]
+result["dots"] = dots
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_data_busy_months_and_teachers():
+    """Data names the busiest and quietest months and plots each teacher's hours against students.
+
+    The owner plans admin time around busy months, and looks for teachers in
+    demand (many students) or busy with few students (mostly one-to-one).
+    Over $100 per teaching hour means several students shared the hour.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "data.db").replace("\\", "/")
+        result = run(["-c", _DATA_TEACHERS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    busy = got["busy"]
+    assert len(busy) == 1 and "September" in busy[0] and "10 teaching hours" in busy[0] \
+        and "July" in busy[0].split("Quietest")[1] and busy[0].endswith("2 hours."), busy
+    assert got["heading"], got
+    assert got["dots"] == [["Teacher A", 4.0, 3, "Group classes, over $100 an hour"],
+                           ["Teacher B", 6.0, 1, "Mostly one student"]], got["dots"]
+    return "busiest September, quietest July; a group teacher and a one-to-one teacher told apart"
+
+
 _WHOLE_CLASS_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 
@@ -3662,6 +3741,7 @@ for name, fn in [
     ("Delete records: all time in one click", t_delete_all_time),
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
     ("Delete records: students with no classes", t_delete_classless_students),
+    ("Data: busy months and each teacher's hours and students", t_data_busy_months_and_teachers),
     ("Students: show more", t_student_show_more),
     ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),
     ("a used credit is listed when the student is back", t_used_credit_listed),

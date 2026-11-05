@@ -4361,6 +4361,16 @@ def _teaching_view() -> None:
         .properties(height=240),
         width="stretch",
     )
+    # The busiest and quietest whole months, so admin time can be planned around them.
+    # A month still under way is left out: half a month would always look quietest.
+    whole_months = [row for row in months if (row["Year"], row["Month"]) != (today.year, today.month)]
+    if len(whole_months) >= 2:
+        busiest = max(whole_months, key=lambda row: row["Hours"])
+        quietest = min(whole_months, key=lambda row: row["Hours"])
+        st.markdown(
+            f"Busiest month: {_when(calendar.month_name[busiest['Month']])} · {busiest['Hours']:,.0f} teaching hours. "
+            f"Quietest: {_when(calendar.month_name[quietest['Month']])} · {quietest['Hours']:,.0f} hours."
+        )
     starts = sorted(
         ((first[1], t) for t, first in first_on_record.items()
          if first[0] == year and 1 < first[1] <= month),
@@ -4619,6 +4629,57 @@ def data_tab() -> None:
         width="stretch",
         hide_index=True,
     )
+    _hours_and_students(snapshot)
+
+
+# How a teacher's month reads from what one hour of it brought in: one student pays
+# $60–65 an hour, so over $100 means several students shared the hour.
+_TEACHER_KINDS = {"Group classes, over $100 an hour": "#2a78d6",
+                  "Mostly one student": "#a9c8ee",
+                  "Not invoiced yet": "#c3c2b7"}
+
+
+def _teacher_kind(invoiced: float, invoiced_hours: float) -> str:
+    """Return which of _TEACHER_KINDS a teacher's month is."""
+    if not invoiced_hours:
+        return "Not invoiced yet"
+    return "Group classes, over $100 an hour" if invoiced / invoiced_hours > 100 else "Mostly one student"
+
+
+def _hours_and_students(snapshot: pd.DataFrame) -> None:
+    """Plot each teacher's hours against their students for the month.
+
+    Many students means a teacher in demand; many hours with few students
+    means mostly one-to-one, with room for small groups. Names show on hover.
+    """
+    taught = snapshot[snapshot["Hours"] > 0].copy()
+    if taught.empty:
+        return
+    taught["Kind"] = [_teacher_kind(invoiced, hours)
+                      for invoiced, hours in zip(taught["Invoiced"], taught["Invoiced lesson hours"])]
+    taught["Per teaching hour"] = [_per_hour(invoiced, hours)
+                                   for invoiced, hours in zip(taught["Invoiced"], taught["Invoiced lesson hours"])]
+    st.markdown("##### Hours and students, by teacher")
+    st.altair_chart(
+        alt.Chart(taught)
+        .mark_circle(size=120, opacity=0.9)
+        .encode(
+            # A little room past the furthest dot, so it isn't cut in half at the edge.
+            x=alt.X("Hours:Q", title="Hours taught",
+                    scale=alt.Scale(domain=[0, float(taught["Hours"].max()) * 1.08])),
+            y=alt.Y("Students:Q", title="Students",
+                    scale=alt.Scale(domain=[0, float(taught["Students"].max()) * 1.1])),
+            color=alt.Color("Kind:N", scale=alt.Scale(domain=list(_TEACHER_KINDS), range=list(_TEACHER_KINDS.values())),
+                            legend=alt.Legend(title=None, orient="bottom", labelLimit=0)),
+            tooltip=[alt.Tooltip("Teacher:N"), alt.Tooltip("Hours:Q", title="Hours taught"),
+                     alt.Tooltip("Students:Q"), alt.Tooltip("Per teaching hour:N"),
+                     alt.Tooltip("Invoiced:Q", format="$,.2f")],
+        )
+        .properties(height=300),
+        width="stretch",
+    )
+    st.caption("Each dot is a teacher; hover for the name. Many students: in demand. "
+               "Many hours but few students: mostly one-to-one, with room for small groups.")
 
 
 # ---------------------------------------------------------------------------
