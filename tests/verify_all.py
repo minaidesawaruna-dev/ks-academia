@@ -2561,7 +2561,8 @@ def t_delete_classless_students():
         assert result.returncode == 0, result.stderr[-1500:]
         got = json.loads(result.stdout.strip().splitlines()[-1])
     assert got["errors"] == [], got["errors"]
-    assert "Students with no classes (2)" in got["list"] and got["ticks"] == ["Oh Minseok", "Seo Yerin"], got
+    assert "Students with no classes (2)" in got["list"] \
+        and got["ticks"] == [":blue-badge[Oh Minseok]", ":blue-badge[Seo Yerin]"], got
     assert got["this month"] == ["Nam Jihoon"], got["this month"]
     assert got["ticked"] == {"year": 0, "month": 0, "picked": ["Seo Yerin"]}, got["ticked"]
     assert got["all"] == ["Oh Minseok", "Seo Yerin"], got["all"]

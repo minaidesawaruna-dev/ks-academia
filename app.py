@@ -5124,8 +5124,8 @@ def _classless_students(classless: list[dict], generation: int, students_key: st
             buttons[1].form_submit_button("Pick ticked", on_click=pick, args=(False,),
                                           key=f"classless_ticked_{generation}", width="stretch")
             for row in classless:
-                # A label is markdown, so a name typed with a * or [ shows as written.
-                st.checkbox(_MARKDOWN_SYNTAX.sub(r"\\\1", row["Name"]), key=f"classless_{generation}_{row['ID']}")
+                # A student badge, as everywhere else; _chip escapes a name typed with a * or [.
+                st.checkbox(_student(row["Name"]), key=f"classless_{generation}_{row['ID']}")
 
 
 def _invoice_label(item: dict) -> str:
