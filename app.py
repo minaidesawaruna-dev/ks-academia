@@ -4720,9 +4720,10 @@ def _hours_and_students(snapshot: pd.DataFrame) -> None:
     taught = snapshot[(snapshot["Hours"] > 0) & (snapshot["Lessons"] > 0)].copy()
     if taught.empty:
         return
-    taught["Students a lesson"] = (taught["Places"] / taught["Lessons"]).round(1)
-    taught["Kind"] = ["Group classes" if size >= GROUP_CLASS_SIZE else "Mostly one student"
-                      for size in taught["Students a lesson"]]
+    # Judged on the exact average; rounded only for the hover text, so 1.45 isn't a group.
+    size = taught["Places"] / taught["Lessons"]
+    taught["Students a lesson"] = size.round(1)
+    taught["Kind"] = ["Group classes" if exact >= GROUP_CLASS_SIZE else "Mostly one student" for exact in size]
     taught["Per teaching hour"] = [_per_hour(invoiced, hours)
                                    for invoiced, hours in zip(taught["Invoiced"], taught["Invoiced lesson hours"])]
     st.markdown("##### Hours and students, by teacher")

@@ -2591,6 +2591,12 @@ sb.backfill({"sessions": [lesson(7, 4, "G10 Test Math", group),
 sb.backfill({"sessions": [lesson(8, 3, "G9 Test Eng", ["Hayun Kim"]), lesson(8, 10, "G9 Test Eng", ["Hayun Kim"]),
                           lesson(9, 7, "G9 Test Eng", ["Hayun Kim"]), lesson(9, 14, "G9 Test Eng", ["Hayun Kim"]),
                           lesson(9, 21, "G9 Test Eng", ["Hayun Kim"])]}, ids["Teacher B"])
+# 16 students over 11 lessons is 1.45 a lesson: just under a group, though it rounds to 1.5.
+db.create_teacher("Teacher C")
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+sb.backfill({"sessions": [{**lesson(9, day, "G8 Test Bio", ["Oh Minseok"] + (["Seo Yerin"] if day <= 5 else [])),
+                           "start_time": dt.time(19), "end_time": dt.time(20)} for day in range(1, 12)]},
+            ids["Teacher C"])
 # A one-to-one teacher priced above $100 an hour is still one-to-one.
 english = next(c["ID"] for c in db.get_all_classes() if c["Class"] == "G9 Test Eng")
 db.set_class_rate_for_month(english, dt.date(2026, 9, 1), 110.0)
@@ -2784,15 +2790,16 @@ def t_data_busy_months_and_teachers():
         got = json.loads(result.stdout.strip().splitlines()[-1])
     assert got["errors"] == [], got["errors"]
     busy = got["busy"]
-    assert len(busy) == 1 and "September" in busy[0] and "10 teaching hours" in busy[0] \
+    assert len(busy) == 1 and "September" in busy[0] and "21 teaching hours" in busy[0] \
         and "July" in busy[0].split("Quietest")[1] and busy[0].endswith("2 hours."), busy
     assert got["heading"], got
     assert got["dots"] == [["Teacher A", 4.0, 3, "Group classes"],
-                           ["Teacher B", 6.0, 1, "Mostly one student"]], got["dots"]
+                           ["Teacher B", 6.0, 1, "Mostly one student"],
+                           ["Teacher C", 11.0, 2, "Mostly one student"]], got["dots"]
     if got["ahead"][0] == 2026:
         assert len(got["busy_ahead"]) == 1 and "Quietest: :gray-badge[July]" in got["busy_ahead"][0], got
     return ("busiest September, quietest July, a booked month ahead never quietest; "
-            "a one-to-one teacher at $110 an hour still one-to-one")
+            "a one-to-one teacher at $110 an hour still one-to-one; 1.45 a lesson isn't a group")
 
 
 _WHOLE_CLASS_SCRIPT = r"""
