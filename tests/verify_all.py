@@ -523,6 +523,9 @@ def t_read_functions_all_run():
         "get_delete_choices": lambda: db.get_delete_choices(year, month),
         "get_delete_choices (all months)": db.get_delete_choices,
         "get_invoice_lookup": db.get_invoice_lookup,
+        "get_classrooms": db.get_classrooms,
+        "get_month_room_shortages": lambda: db.get_month_room_shortages(year, month),
+        "most_lessons_at_once": lambda: db.most_lessons_at_once(first, dt.time(10), dt.time(12)),
         "find_bookings_elsewhere": lambda: db.find_bookings_elsewhere(
             [s["ID"] for s in db.get_all_students()[:25]], [first], tid),
         "describe_master_delete": lambda: db.describe_master_delete(
@@ -2620,6 +2623,101 @@ print(json.dumps(result))
 """
 
 
+_CLASSROOMS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+for name in ("Teacher A", "Teacher B", "Teacher C"):
+    db.create_teacher(name)
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, start, end, person, status="Attending", cell=None):
+    return {"date": dt.date(2026, 9, day), "class_name": subject, "start_time": dt.time(*start),
+            "end_time": dt.time(*end), "warnings": [], "cell": cell,
+            "attendance": [{"student_name": person, "status": status}]}
+
+# Sat 5 Sep: A 10-12, B 11-13, C 11:00-11:30 (3 at once from 11:00) and C again 12-13
+# (back to back with A, so 2 at once). Sat 12 Sep: the same times, but B's student is
+# off and C's class is online: B needs no room, C still does.
+sb.backfill({"sessions": [lesson(5, "G10 Test Math", (10,), (12,), "Nam Jihoon"),
+                          lesson(12, "G10 Test Math", (10,), (12,), "Nam Jihoon")]}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(5, "G9 Test Eng", (11,), (13,), "Seo Yerin"),
+                          lesson(12, "G9 Test Eng", (11,), (13,), "Seo Yerin", "Cancelled")]}, ids["Teacher B"])
+sb.backfill({"sessions": [lesson(5, "G9 Test Art", (11,), (11, 30), "Oh Minseok"),
+                          lesson(5, "G9 Test Art", (12,), (13,), "Oh Minseok"),
+                          lesson(12, "G9 Test Art", (11,), (11, 30), "Oh Minseok", "Online")]}, ids["Teacher C"])
+
+result = {"default": db.get_classrooms()}
+db.set_classrooms(2)
+month = db.get_month_room_shortages(2026, 9)
+result["month"] = [[str(s["Date"]), f"{s['Start']:%H:%M}", f"{s['End']:%H:%M}", s["Most"],
+                    sorted(l["Class"] for l in s["Lessons"])] for s in month]
+result["at_once"] = [db.most_lessons_at_once(dt.date(2026, 9, 5), dt.time(11), dt.time(12)),
+                     db.most_lessons_at_once(dt.date(2026, 9, 5), dt.time(13), dt.time(14)),
+                     db.most_lessons_at_once(dt.date(2026, 9, 12), dt.time(10), dt.time(12))]
+
+# Teacher B uploads a sheet: 12 Sep now has their student back, and 19 Sep is new with nobody else on.
+upload = {"sessions": [lesson(5, "G9 Test Eng", (11,), (13,), "Seo Yerin", cell="Sep26!B5"),
+                       lesson(12, "G9 Test Eng", (11,), (13,), "Seo Yerin", cell="Sep26!B12"),
+                       lesson(19, "G9 Test Eng", (11,), (13,), "Seo Yerin", cell="Sep26!B19")]}
+over = []
+plan = sb.plan_import(upload, ids["Teacher B"], dates=[dt.date(2026, 9, d) for d in (5, 12, 19)], over_rooms=over)
+result["upload"] = [[str(s["Date"]), f"{s['Start']:%H:%M}", s["Most"], [l["cell"] for l in s["Lessons"] if l.get("cell")]]
+                    for s in over]
+result["same_without"] = plan == sb.plan_import(upload, ids["Teacher B"], dates=[dt.date(2026, 9, d) for d in (5, 12, 19)])
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Schedule"
+at.session_state["month"] = (2026, 9)
+at.run()
+result["screen"] = [m.value for m in at.markdown if "classes at once" in m.value]
+result["number_box"] = [n.value for n in at.number_input if n.label == "Classrooms"]
+db.set_classrooms(3)
+result["after_raise"] = len(db.get_month_room_shortages(2026, 9))
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_classrooms_limit():
+    """More classes at once than there are classrooms is flagged, and the number can be changed.
+
+    The academy has 13 rooms and will add more. A cancelled class, or one with
+    every student off, needs no room; an online one still does; back-to-back
+    classes don't overlap. Schedule lists the month's times over the limit,
+    and an upload names its cells; raising the number clears them.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "rooms.db").replace("\\", "/")
+        result = run(["-c", _CLASSROOMS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["default"] == 13, got
+    assert got["month"] == [["2026-09-05", "11:00", "11:30", 3, ["G10 Test Math", "G9 Test Art", "G9 Test Eng"]]], got["month"]
+    assert got["at_once"] == [3, 0, 2], got["at_once"]
+    assert got["upload"] == [["2026-09-05", "11:00", 3, ["Sep26!B5"]], ["2026-09-12", "11:00", 3, ["Sep26!B12"]]], got["upload"]
+    assert got["same_without"], got
+    screen = got["screen"]
+    assert len(screen) == 1 and "Sat 05 Sep" in screen[0] and "3 classes at once" in screen[0] \
+        and "Teacher C" in screen[0], screen
+    assert got["number_box"] == [2], got["number_box"]
+    assert got["after_raise"] == 0, got
+    return "13 by default; one time over 2 rooms found, cancelled and back-to-back left out; upload names its cells"
+
+
 def t_data_busy_months_and_teachers():
     """Data names the busiest and quietest months and plots each teacher's hours against students.
 
@@ -3742,6 +3840,7 @@ for name, fn in [
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
     ("Delete records: students with no classes", t_delete_classless_students),
     ("Data: busy months and each teacher's hours and students", t_data_busy_months_and_teachers),
+    ("classrooms: more classes at once than rooms", t_classrooms_limit),
     ("Students: show more", t_student_show_more),
     ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),
     ("a used credit is listed when the student is back", t_used_credit_listed),

@@ -1004,7 +1004,8 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 student_matches: dict[str, int] | None = None,
                 dates=None, today: dt.date | None = None,
                 not_added: list[dict] | None = None,
-                double_booked: list[dict] | None = None) -> dict[tuple[int, int], Counter]:
+                double_booked: list[dict] | None = None,
+                over_rooms: list[dict] | None = None) -> dict[tuple[int, int], Counter]:
     """Work out what an upload would change, month by month, without saving anything.
 
     Follows backfill step by step (same names, same students, same lessons
@@ -1016,6 +1017,9 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
     and the reason, so the screen can point at its cell in the workbook.
     A list passed as `double_booked` is filled with each student the upload
     puts in a lesson while they are in another teacher's lesson at that time.
+    A list passed as `over_rooms` is filled with each time, among this
+    teacher's lessons after the upload, when more lessons run at once across
+    the academy than there are classrooms (db.find_room_shortages).
     """
     today = today or dt.date.today()
     preview = use_subject_spellings(preview, teacher_id)
@@ -1044,12 +1048,28 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
         if attending:
             staying.append((session, attending))
 
+    # This teacher's lessons as they will be after the upload, for the classroom check:
+    # the workbook's own, and the ones already saved that it leaves alone.
+    in_rooms: list[dict] = []
+    kept: dict[tuple, dict] = {}
+
+    def uses_room(session) -> None:
+        """Note an upload lesson that will be on the calendar, unless every student is off it."""
+        statuses = [(entry.get("status") or "").casefold() for entry in session["attendance"]]
+        if not statuses or any(status != "cancelled" for status in statuses):
+            in_rooms.append({"Date": session["date"], "Start": session["start_time"], "End": session["end_time"],
+                             "Class": session["class_name"], "Teacher": teacher["Name"] if teacher else "",
+                             "cell": session.get("cell"), "Mine": True})
+
     if teacher is None:
         for session in sessions:
             counts[_month_of(session["date"])]["new"] += 1
             stays(session, name_to_id)
+            uses_room(session)
         if double_booked is not None:
             double_booked.extend(_double_bookings(staying, None))
+        if over_rooms is not None:
+            over_rooms.extend(_room_shortages(in_rooms, None))
         return counts
 
     same_name, rosters, taught = _same_name_rules(teacher_id, students_on_file)
@@ -1071,6 +1091,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             month["removed_invoiced"] += lesson["Invoiced"]
         elif lesson["Status"] != "Cancelled":
             on_calendar[day].append((lesson["Start"], lesson["End"], lesson["ID"]))
+            kept[(class_id, day, start)] = lesson
 
     def clashes(session, excluded=None):
         # A lesson this upload adds has no id yet (None), but still takes up its time.
@@ -1105,6 +1126,7 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
                 on_calendar[session["date"]].append((session["start_time"], session["end_time"], None))
                 month["new"] += 1
                 stays(session, names_here)
+                uses_room(session)
                 continue
             status = _lesson_status(session["date"], today, current)
             rows = _attendance_rows(session, names_here)
@@ -1121,12 +1143,39 @@ def plan_import(preview: dict[str, Any], teacher_id: int | None,
             else:
                 month["changed"] += 1
                 month["changed_invoiced"] += current["Invoiced"]
-            # A lesson cancelled in the app stays cancelled, so nobody is really booked into it.
+            # The workbook's version replaces the saved one. A lesson cancelled in the app
+            # stays cancelled, so nobody is really booked into it and it needs no room.
+            kept.pop((class_id, session["date"], session["start_time"]), None)
             if status != "Cancelled":
                 stays(session, names_here)
+                uses_room(session)
     if double_booked is not None:
         double_booked.extend(_double_bookings(staying, teacher_id))
+    if over_rooms is not None:
+        for lesson in kept.values():
+            rows = lesson.get("Attendance") or []
+            if not rows or not all(row.get("is_cancelled") for row in rows):
+                in_rooms.append({"Date": db.as_date(lesson["Date"]), "Start": db.as_time(lesson["Start"]),
+                                 "End": db.as_time(lesson["End"]), "Class": lesson["Class"],
+                                 "Teacher": teacher["Name"], "cell": None, "Mine": True})
+        over_rooms.extend(_room_shortages(in_rooms, teacher_id))
     return counts
+
+
+def _room_shortages(mine: list[dict], teacher_id: int | None) -> list[dict]:
+    """Return the times when this teacher's lessons and everyone else's need more rooms than there are.
+
+    `mine` are the teacher's lessons after the upload. Other teachers' lessons
+    on those days are read in one query. Only times one of this teacher's
+    lessons is part of are kept: the others aren't this upload's doing.
+    """
+    if not mine:
+        return []
+    days = {lesson["Date"] for lesson in mine}
+    others = [lesson for lesson in db.get_lessons_using_rooms(min(days), max(days), other_than_teacher=teacher_id)
+              if lesson["Date"] in days]
+    return [stretch for stretch in db.find_room_shortages(others + mine, db.get_classrooms())
+            if any(lesson.get("Mine") for lesson in stretch["Lessons"])]
 
 
 def _double_bookings(staying: list[tuple[dict, list[int]]], teacher_id: int | None) -> list[dict]:

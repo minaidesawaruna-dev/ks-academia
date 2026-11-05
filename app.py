@@ -653,27 +653,31 @@ def _warning_panel(preview: dict) -> None:
                     st.markdown(f"\u26a0\ufe0f {item['message']}")
 
 
-def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> list[dict]:
+def _import_changes(preview, decisions, teacher_id, name_overrides, student_matches) -> tuple[list, list]:
     """Show what saving will change on the calendar, month by month, before anything is written.
 
     Re-uploading a corrected workbook is routine; this lets the admin check
     it changes what they expect and nothing else. It works on a copy of the
     upload, because answering the name questions changes it. Returns the
-    double bookings it found, so the message after saving can mention them.
+    double bookings and the times over the classroom count it found, so the
+    message after saving can mention them.
     """
     planned = {**preview, "sessions": copy.deepcopy(preview["sessions"])}
     planned["sessions"] = schedule_backfill.apply_review_decisions(planned, decisions)
     not_added: list[dict] = []
     double_booked: list[dict] = []
+    over_rooms: list[dict] = []
     plan = schedule_backfill.plan_import(
         planned, teacher_id, name_overrides=name_overrides,
         student_matches=student_matches, dates=planned.get("dates_shown"), not_added=not_added,
-        double_booked=double_booked,
+        double_booked=double_booked, over_rooms=over_rooms,
     )
     if not plan:
-        return []
+        return [], []
     if double_booked:
         _double_booked_warning(double_booked)
+    if over_rooms:
+        _over_rooms_warning(over_rooms, "Saved anyway; move a class on Schedule.")
     st.markdown("**What this changes**")
     st.dataframe(
         _coloured([
@@ -707,7 +711,26 @@ def _import_changes(preview, decisions, teacher_id, name_overrides, student_matc
         st.caption(" ".join(notes))
     if not_added:
         _not_added_panel(not_added)
-    return double_booked
+    return double_booked, over_rooms
+
+
+def _over_rooms_warning(found: list[dict], advice: str) -> None:
+    """Warn about times when more classes run at once than there are classrooms, a line each.
+
+    An upload's own lessons show their Excel cell. Like a double booking it
+    never blocks: the admin moves a class on Schedule.
+    """
+    rooms = db.get_classrooms()
+    lines = []
+    for item in found[:8]:
+        span = f"{item['Date']:%a %d %b} {db.as_time(item['Start']):%H:%M}–{db.as_time(item['End']):%H:%M}"
+        cells = [lesson["cell"] for lesson in item["Lessons"] if lesson.get("cell")]
+        lines.append(f"{_when(span)} · **{item['Most']} classes at once**"
+                     + (f" · this sheet: {_cell_list(cells)}" if cells else ""))
+    if len(found) > 8:
+        lines.append(f"…and {len(found) - 8} more, listed on Schedule for that month")
+    st.warning(f"More classes than the {rooms} classrooms ({len(found)} time{'s' if len(found) != 1 else ''}). "
+               f"{advice}  \n" + "  \n".join(lines))
 
 
 def _double_booked_warning(found: list[dict]) -> None:
@@ -1048,7 +1071,7 @@ def _import_upload_panel() -> None:
         for original, chosen in settled.items():
             name_overrides[original] = renamed_to.get(chosen, chosen)
 
-    double_booked = _import_changes(preview, decisions, teacher_id, name_overrides, student_matches)
+    double_booked, over_rooms = _import_changes(preview, decisions, teacher_id, name_overrides, student_matches)
 
     if st.button("Commit import", type="primary", key="import_commit"):
         if not teacher_name:
@@ -1126,7 +1149,12 @@ def _import_upload_panel() -> None:
                     f" {len(double_booked)} double booking(s) with another teacher's class: "
                     "move one of each pair on Schedule."
                 )
-            _flash(message, "warning" if double_booked else "success")
+            if over_rooms:
+                message += (
+                    f" {len(over_rooms)} time(s) need more than the {db.get_classrooms()} classrooms: "
+                    "listed on Schedule for that month."
+                )
+            _flash(message, "warning" if double_booked or over_rooms else "success")
             # Also shown where the preview was, which is where the admin who just clicked
             # is looking, until the next workbook is read.
             st.session_state["import_done"] = f"{_teacher(teacher_name)} — {message}"
@@ -2207,6 +2235,14 @@ def _add_lesson(teacher_id: int, year: int, month: int, lessons: list) -> None:
             if booked:
                 st.warning("Booked into another class at this time:  \n"
                            + _clash_lines(booked, dated=bool(extra)))
+        if times_set and start < end:
+            rooms = db.get_classrooms()
+            full = [day for day in (when + dt.timedelta(weeks=week) for week in range(extra + 1))
+                    if db.most_lessons_at_once(day, start, end) >= rooms]
+            if full:
+                st.warning(f"All {rooms} classrooms are in use at that time on "
+                           + _chips("when", [f"{day:%a %d %b}" for day in full], most=6)
+                           + ". It can still be added; move a class on Schedule if no room is free.")
 
         if st.button("Add class", type="primary", key="add_lesson_go",
                      disabled=not times_set,
@@ -2674,6 +2710,39 @@ def _lesson_editor(lesson_id: int, teacher_id: int, month_lessons: list) -> None
                 st.warning(_explain(str(outcome)))
 
 
+def _classrooms_button(column) -> None:
+    """Show how many classrooms the academy has, with a box to change it when rooms are added."""
+    rooms = db.get_classrooms()
+    with column.popover(f"{rooms} classrooms", icon=":material/meeting_room:",
+                        help="The most classes that can run at once. Change it when the academy adds rooms."):
+        with st.form("classrooms_form", border=False):
+            count = st.number_input("Classrooms", min_value=1, max_value=500, value=rooms, step=1)
+            if st.form_submit_button("Save", type="primary", width="stretch"):
+                db.set_classrooms(count)
+                _flash(f"Classrooms set to {int(count)}.")
+                _rerun()
+
+
+def _month_room_shortages(year: int, month: int) -> None:
+    """Show the times this month when more classes run at once than there are classrooms, all teachers."""
+    rooms = db.get_classrooms()
+    found = db.get_month_room_shortages(year, month, rooms)
+    if not found:
+        return
+    with st.expander(
+        f"{len(found)} time{'s' if len(found) != 1 else ''} in {calendar.month_name[month]} "
+        f"need{'' if len(found) != 1 else 's'} more than {rooms} classrooms",
+        icon=":material/warning:",
+    ):
+        for item in found:
+            span = f"{item['Date']:%a %d %b} · {item['Start']:%H:%M}–{item['End']:%H:%M}"
+            classes = [f"{_subject(lesson['Class'])} with {_teacher(lesson['Teacher'])}"
+                       for lesson in item["Lessons"][:10]]
+            more = len(item["Lessons"]) - 10
+            st.markdown(f"{_when(span)} · **{item['Most']} classes at once**: " + ", ".join(classes)
+                        + (f" and {more} more" if more > 0 else ""))
+
+
 def schedule_tab() -> None:
     """Draw the Schedule screen: the month grid, then the editor for the class clicked."""
     teachers = [item for item in db.get_all_teachers() if item["Active"]]
@@ -2686,10 +2755,12 @@ def schedule_tab() -> None:
         "Teacher", [item["Name"] for item in teachers], key="tt_teacher"
     )
     teacher_id = next(item["ID"] for item in teachers if item["Name"] == teacher_name)
+    _classrooms_button(top[1])
 
     _anchor("grid-top")
     year, month = _month_navigator()
     _month_clashes(year, month)
+    _month_room_shortages(year, month)
     summary = db.get_month_schedule(teacher_id, year, month)
     # One query for the whole month's rosters, not three per class. The grid only
     # needs each card's student names and conditions, which is what this returns.

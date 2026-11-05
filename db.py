@@ -2195,6 +2195,129 @@ def get_month_student_clashes(year, month) -> list[dict]:
     return found
 
 
+CLASSROOMS_SETTING = "classrooms"
+DEFAULT_CLASSROOMS = 13
+
+
+def get_classrooms() -> int:
+    """Return how many classrooms the academy has: the most classes that can run at once."""
+    with SessionLocal() as session:
+        saved = session.get(Setting, CLASSROOMS_SETTING)
+        return int(saved.value) if saved else DEFAULT_CLASSROOMS
+
+
+def set_classrooms(count) -> int:
+    """Save how many classrooms the academy has, e.g. after it opens more. Returns the number."""
+    count = int(count)
+    if count < 1:
+        raise ValueError("There must be at least one classroom.")
+    with SessionLocal() as session:
+        saved = session.get(Setting, CLASSROOMS_SETTING)
+        if saved is None:
+            session.add(Setting(key=CLASSROOMS_SETTING, value=str(count)))
+        else:
+            saved.value = str(count)
+        session.commit()
+    return count
+
+
+def get_lessons_using_rooms(first_day, last_day, other_than_teacher=None) -> list[dict]:
+    """Return every lesson between two dates that needs a classroom, across all teachers.
+
+    A cancelled lesson doesn't, and nor does one whose students are all
+    marked cancelled. A lesson with every student online still does: the
+    teacher may teach it from a classroom. `other_than_teacher` leaves out
+    that teacher's lessons, for an upload about to rewrite them.
+    """
+    with SessionLocal() as session:
+        query = (
+            select(ClassSession.id, ClassSession.session_date, ClassSession.start_time, ClassSession.end_time,
+                   AcademyClass.name, Teacher.name)
+            .join(AcademyClass, ClassSession.class_id == AcademyClass.id)
+            .outerjoin(Teacher, ClassSession.teacher_id == Teacher.id)
+            .where(ClassSession.status != "Cancelled",
+                   ClassSession.session_date.between(first_day, last_day))
+        )
+        if other_than_teacher is not None:
+            query = query.where(ClassSession.teacher_id != other_than_teacher)
+        rows = session.execute(query).all()
+        # Counted in a second query grouped by one column only, which every database accepts.
+        places, off = defaultdict(int), defaultdict(int)
+        for chunk in _chunks([row[0] for row in rows]):
+            for lesson_id, cancelled in session.execute(
+                select(SessionAttendance.session_id, SessionAttendance.is_cancelled)
+                .where(SessionAttendance.session_id.in_(chunk))
+            ):
+                places[lesson_id] += 1
+                off[lesson_id] += bool(cancelled)
+    return [
+        {"ID": lesson_id, "Date": as_date(day), "Start": as_time(start), "End": as_time(end),
+         "Class": subject, "Teacher": teacher or ""}
+        for lesson_id, day, start, end, subject, teacher in rows
+        if not (places[lesson_id] and off[lesson_id] == places[lesson_id])
+    ]
+
+
+def find_room_shortages(lessons, rooms) -> list[dict]:
+    """Return each stretch of a day when more lessons run at once than there are classrooms.
+
+    `lessons` are dicts with Date, Start and End (as get_lessons_using_rooms
+    gives them; an upload's own lessons can be added in the same shape).
+    A lesson ending at 12:00 and one starting at 12:00 don't overlap. Each
+    stretch is {"Date", "Start", "End", "Most": the most lessons at once
+    in it, "Lessons": the lessons running in it, by start time}.
+    """
+    by_day = defaultdict(list)
+    for lesson in lessons:
+        if as_time(lesson["Start"]) < as_time(lesson["End"]):
+            by_day[as_date(lesson["Date"])].append(lesson)
+    found = []
+    for day, day_lessons in sorted(by_day.items()):
+        if len(day_lessons) <= rooms:
+            continue
+        times = sorted({as_time(lesson["Start"]) for lesson in day_lessons}
+                       | {as_time(lesson["End"]) for lesson in day_lessons})
+        stretch = None
+        for begin, finish in zip(times, times[1:]):
+            running = [lesson for lesson in day_lessons
+                       if as_time(lesson["Start"]) < finish and as_time(lesson["End"]) > begin]
+            if len(running) <= rooms:
+                stretch = None
+                continue
+            if stretch is None:
+                stretch = {"Date": day, "Start": begin, "End": finish, "Most": 0, "Lessons": []}
+                found.append(stretch)
+            stretch["End"] = finish
+            stretch["Most"] = max(stretch["Most"], len(running))
+            for lesson in running:
+                if not any(lesson is seen for seen in stretch["Lessons"]):
+                    stretch["Lessons"].append(lesson)
+    for stretch in found:
+        stretch["Lessons"].sort(key=lambda lesson: (as_time(lesson["Start"]), str(lesson.get("Class", ""))))
+    return found
+
+
+def get_month_room_shortages(year, month, rooms=None) -> list[dict]:
+    """Return the times this month when more classes run at once than there are classrooms."""
+    first_day = date(year, month, 1)
+    last_day = date(year, month, monthrange(year, month)[1])
+    return find_room_shortages(get_lessons_using_rooms(first_day, last_day),
+                               get_classrooms() if rooms is None else rooms)
+
+
+def most_lessons_at_once(day, start, end) -> int:
+    """Return the most lessons already running at one moment between `start` and `end` on `day`.
+
+    Adding a class then needs one classroom more than this.
+    """
+    running = [lesson for lesson in get_lessons_using_rooms(day, day)
+               if lesson["Start"] < end and lesson["End"] > start]
+    edges = sorted({start, end} | {moment for lesson in running for moment in (lesson["Start"], lesson["End"])
+                                   if start < moment < end})
+    return max((sum(1 for lesson in running if lesson["Start"] < finish and lesson["End"] > begin)
+                for begin, finish in zip(edges, edges[1:])), default=0)
+
+
 def set_student_note(student_id, note):
     """Save a free-text note on a student."""
 
