@@ -4331,15 +4331,19 @@ _COMPARE_MAX = 8
 def _compare_picker(key: str, names: list[str], ranked: list[str]) -> list[str]:
     """Pick up to eight teachers to chart side by side, starting with the top of `ranked`.
 
-    Picks made for another year or month can name a teacher not in this
-    list, which the widget refuses, so only the ones it can show are kept.
-    Streamlit also forgets a widget's value on any run where it isn't drawn
-    (a year with nothing recorded), so a copy is kept to restore it.
+    Until teachers are picked by hand, the picks follow the top of `ranked`,
+    so another month or year starts with its own top teachers. (They used
+    to stay as first chosen: early in a month only two teachers had taught,
+    and those two stayed on every month after.) Picks made by hand stay,
+    less any teacher not in this list, which the widget refuses. Streamlit
+    also forgets a widget's value on any run where it isn't drawn (a year
+    with nothing recorded), so a copy is kept to restore it.
     """
+    top = ranked[:_COMPARE_MAX]
     kept = st.session_state.get(key, st.session_state.get(f"_{key}_kept"))
-    st.session_state[key] = (
-        [name for name in kept if name in names] if kept is not None else ranked[:_COMPARE_MAX]
-    )
+    by_hand = kept is not None and kept != st.session_state.get(f"_{key}_top")
+    st.session_state[key] = [name for name in kept if name in names] if by_hand else top
+    st.session_state[f"_{key}_top"] = top
     picked = st.multiselect(
         "Compare teachers",
         options=names,
@@ -4465,8 +4469,11 @@ def _teaching_view() -> None:
     teachers["Month name"] = teachers["Month"].map(lambda m: calendar.month_abbr[m])
     measure = st.radio("Compare by", list(_TEACHING_MEASURES), horizontal=True, key="teach_measure")
     this_month = teachers[teachers["Month"] == month].sort_values(measure, ascending=False)
-    ranked = list(this_month["Teacher"]) or list(
-        teachers.groupby("Teacher")[measure].sum().sort_values(ascending=False).index)
+    # This month's teachers first, then the rest of the year's, so a month only a few
+    # teachers have taught in yet still starts with a full set to compare.
+    over_year = teachers.groupby("Teacher")[measure].sum().sort_values(ascending=False).index
+    taught_now = set(this_month["Teacher"])
+    ranked = list(this_month["Teacher"]) + [name for name in over_year if name not in taught_now]
     names = sorted(teachers["Teacher"].unique(), key=str.casefold)
     picked = _compare_picker("teach_compare", names, ranked)
     if picked:

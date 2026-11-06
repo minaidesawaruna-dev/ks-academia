@@ -2767,6 +2767,74 @@ print(json.dumps(result))
 """
 
 
+_COMPARE_PICKS_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+for name in ("Teacher A", "Teacher B", "Teacher C"):
+    db.create_teacher(name)
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(month, day, subject, people):
+    return {"date": dt.date(2026, month, day), "class_name": subject, "start_time": dt.time(16),
+            "end_time": dt.time(18), "warnings": [],
+            "attendance": [{"student_name": name, "status": "Attending"} for name in people]}
+
+# September: B has 3 students, C 2, A 1. October so far: only A has taught.
+sb.backfill({"sessions": [lesson(9, 7, "G10 Test Math", ["Nam Jihoon"]),
+                          lesson(10, 5, "G10 Test Math", ["Nam Jihoon"])]}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(9, 8, "G9 Test Eng", ["Seo Yerin", "Oh Minseok", "Hayun Kim"])]}, ids["Teacher B"])
+sb.backfill({"sessions": [lesson(9, 9, "G8 Test Bio", ["Seo Yerin", "Oh Minseok"])]}, ids["Teacher C"])
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Data"
+at.session_state["data_month_year"] = 2026
+at.session_state["data_month_month"] = 10
+at.run()
+result = {"october": list(at.multiselect(key="teach_compare").value)}
+at.session_state["data_month_month"] = 9
+at.run()
+result["september"] = list(at.multiselect(key="teach_compare").value)
+at.multiselect(key="teach_compare").set_value(["Teacher C"]).run()
+at.session_state["data_month_month"] = 10
+at.run()
+result["by_hand"] = list(at.multiselect(key="teach_compare").value)
+result["errors"] = [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_data_compare_follows_month():
+    """Compare teachers starts with each month's own top teachers until picked by hand.
+
+    On the live app, early in November only two teachers had taught, and
+    those two stayed picked on every other month. A month few teachers have
+    taught in yet is filled up from the rest of the year.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "compare.db").replace("\\", "/")
+        result = run(["-c", _COMPARE_PICKS_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["october"] == ["Teacher A", "Teacher B", "Teacher C"], got
+    assert got["september"] == ["Teacher B", "Teacher C", "Teacher A"], got
+    assert got["by_hand"] == ["Teacher C"], got
+    return "a month with one teacher so far fills up from the year; the next month follows; a hand pick stays"
+
+
 _CLASSES_EACH_DAY_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 import pyarrow as pa
@@ -4133,6 +4201,7 @@ for name, fn in [
     ("Delete records: students with no classes", t_delete_classless_students),
     ("Data: busy months and each teacher's hours and students", t_data_busy_months_and_teachers),
     ("Data: classes each day of the month, for cleaning days", t_data_classes_each_day),
+    ("Data: compare teachers follows the month", t_data_compare_follows_month),
     ("classrooms: more classes at once than rooms", t_classrooms_limit),
     ("Students: show more", t_student_show_more),
     ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),
