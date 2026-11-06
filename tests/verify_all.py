@@ -648,6 +648,7 @@ def t_read_functions_all_run():
         "get_month_room_shortages": lambda: db.get_month_room_shortages(year, month),
         "most_lessons_at_once": lambda: db.most_lessons_at_once([first], dt.time(10), dt.time(12)),
         "get_lessons_using_rooms": lambda: db.get_lessons_using_rooms(first, first, other_than_teacher=tid),
+        "get_classes_each_day": lambda: db.get_classes_each_day(year, month),
         "describe_master_delete": lambda: db.describe_master_delete(
             [t["ID"] for t in db.get_all_teachers()], [s["ID"] for s in db.get_all_students()]),
     }
@@ -2766,6 +2767,116 @@ print(json.dumps(result))
 """
 
 
+_CLASSES_EACH_DAY_SCRIPT = r"""
+import datetime as dt, json, db, schedule_backfill as sb
+import pyarrow as pa
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+for name in ("Teacher A", "Teacher B"):
+    db.create_teacher(name)
+ids = {t["Name"]: t["ID"] for t in db.get_all_teachers()}
+
+def lesson(day, subject, start, end, people, status="Attending", year=2026, month=9):
+    return {"date": dt.date(year, month, day), "class_name": subject, "start_time": dt.time(start),
+            "end_time": dt.time(end), "warnings": [],
+            "attendance": [{"student_name": person, "status": status} for person in people]}
+
+# Sat 5 Sep: A twice, B once, and Teacher D from a past schedule (not on the Schedule).
+# Mon 7: B's class cancelled as a whole. Wed 9: B's only student cancelled. Sat 12: A once.
+sb.backfill({"sessions": [lesson(5, "G10 Test Math", 10, 12, ["Nam Jihoon"]),
+                          lesson(5, "G10 Test Math", 14, 16, ["Nam Jihoon"]),
+                          lesson(12, "G10 Test Math", 10, 12, ["Nam Jihoon"])]}, ids["Teacher A"])
+sb.backfill({"sessions": [lesson(5, "G9 Test Eng", 11, 13, ["Seo Yerin", "Oh Minseok"]),
+                          lesson(7, "G9 Test Eng", 11, 13, ["Seo Yerin"]),
+                          lesson(9, "G9 Test Eng", 11, 13, ["Seo Yerin"], status="Cancelled")]}, ids["Teacher B"])
+whole = next(row for row in db.get_month_schedule(ids["Teacher B"], 2026, 9) if row["Date"] == dt.date(2026, 9, 7))
+detail = db.get_schedule_session(whole["ID"])
+db.update_schedule_session(whole["ID"], detail["Date"], detail["Start"], detail["End"], "Cancelled", "",
+                           detail["Attendance"])
+# Teacher D's past schedule: one class of two (one written in another spelling of a student
+# on file), and one where everyone was off. Teacher A's past schedule is already on the Schedule.
+db.save_lesson_history("Teacher D", [lesson(5, "G8 Test Bio", 16, 18, ["Hayun Kim", "nam  JIHOON"]),
+                                     lesson(13, "G8 Test Bio", 16, 18, ["Hayun Kim"], status="Cancelled")])
+db.save_lesson_history("Teacher A", [lesson(12, "G10 Test Math", 16, 18, ["Nam Jihoon"])])
+# A month ahead with nothing taught yet that year, only booked.
+ahead = dt.date.today().year + 1
+sb.backfill({"sessions": [lesson(9, "G10 Test Math", 10, 12, ["Nam Jihoon"], year=ahead, month=1)]},
+            ids["Teacher A"])
+
+page = '''
+import sys, types
+stub = types.ModuleType("auth")
+stub.require_login = lambda: None
+stub.logout_button = lambda authenticator: None
+sys.modules["auth"] = stub
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+
+def look(at):
+    days = []
+    for chart in at.get("vega_lite_chart"):
+        for data in chart.proto.datasets:
+            frame = pa.ipc.open_stream(data.data.data).read_pandas()
+            if {"Day", "Classes", "Times"} <= set(frame.columns):
+                days += [[row.Day, int(row.Classes), int(row.Students), int(row.Teachers), row.Times]
+                         for row in frame.itertuples()]
+    return {"days": days,
+            "heading": [m.value for m in at.markdown if m.value.startswith("#### Classes each day")],
+            "busiest": [m.value for m in at.markdown if m.value.startswith("Busiest: ")],
+            "none": [c.value for c in at.caption if c.value.startswith("No classes in")],
+            "errors": [e.value for e in at.exception]}
+
+at = AppTest.from_string(page, default_timeout=120)
+at.query_params["screen"] = "Data"
+at.session_state["data_month_year"] = 2026
+at.session_state["data_month_month"] = 9
+at.run()
+result = {"september": look(at)}
+at.session_state["data_month_year"] = ahead
+at.session_state["data_month_month"] = 1
+at.run()
+result["ahead"] = look(at)
+at.session_state["data_month_month"] = 2
+at.run()
+result["empty"] = look(at)
+result["ahead_year"] = ahead
+print(json.dumps(result))
+"""
+
+
+def t_data_classes_each_day():
+    """Data shows each day of the month with classes, and how many, across every teacher.
+
+    For planning cleaning: busy days leave rooms messier. Classes count as
+    they do for classrooms (cancelled ones don't), past schedules fill in
+    teachers not on the Schedule, and a booked month ahead shows too.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "days.db").replace("\\", "/")
+        result = run(["-c", _CLASSES_EACH_DAY_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    september, ahead, empty = got["september"], got["ahead"], got["empty"]
+    for seen in (september, ahead, empty):
+        assert seen["errors"] == [], seen["errors"]
+    assert september["days"] == [["Sat 5", 4, 4, 3, "10:00–18:00"], ["Sat 12", 1, 1, 1, "10:00–12:00"]], september
+    assert september["heading"] == ["#### Classes each day — September 2026"], september
+    busiest = september["busiest"]
+    assert len(busiest) == 1 and busiest[0].startswith("Busiest: 4 classes on ") and "Sat 05 Sep" in busiest[0] \
+        and "Sat 12 Sep" not in busiest[0], busiest
+    first = ahead["days"][0][0] if ahead["days"] else ""
+    assert len(ahead["days"]) == 1 and ahead["days"][0][1] == 1 and first.endswith(" 9"), ahead
+    assert len(ahead["busiest"]) == 1 and ahead["busiest"][0].startswith("Busiest: 1 class on "), ahead
+    assert ahead["heading"] == [f"#### Classes each day — January {got['ahead_year']}"], ahead
+    assert empty["days"] == [] and empty["busiest"] == [] and len(empty["none"]) == 1, empty
+    return ("Sat 5: 4 classes from three teachers, one from a past schedule; cancelled classes left out; "
+            "a booked month ahead shows; a month with none says so")
+
+
 _CLASSROOMS_SCRIPT = r"""
 import datetime as dt, json, db, schedule_backfill as sb
 from streamlit.testing.v1 import AppTest
@@ -4021,6 +4132,7 @@ for name, fn in [
     ("Delete records: a month's delete says who stays", t_delete_says_what_stays),
     ("Delete records: students with no classes", t_delete_classless_students),
     ("Data: busy months and each teacher's hours and students", t_data_busy_months_and_teachers),
+    ("Data: classes each day of the month, for cleaning days", t_data_classes_each_day),
     ("classrooms: more classes at once than rooms", t_classrooms_limit),
     ("Students: show more", t_student_show_more),
     ("a re-upload keeps what only the app knows", t_reupload_keeps_app_changes),

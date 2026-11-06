@@ -2314,6 +2314,71 @@ def most_lessons_at_once(days, start, end) -> dict:
     return most
 
 
+def get_classes_each_day(year, month) -> list[dict]:
+    """Return each day of a month that has a class, and how many classes, for every teacher.
+
+    A class counts the way it does for classrooms (get_lessons_using_rooms):
+    held or booked, and not cancelled or with every student cancelled. A
+    teacher whose month isn't on the Schedule is counted from Past schedules,
+    as on the Teaching view, so months before the app show too. Days with
+    no class are left out. Each day is {"Date", "Classes", "Students"
+    (each counted once), "Teachers", "Start" of the first class, "End" of
+    the last}, in date order.
+    """
+    first_day = date(year, month, 1)
+    last_day = date(year, month, monthrange(year, month)[1])
+    days = defaultdict(lambda: {"Classes": 0, "Students": set(), "Teachers": set(), "Times": []})
+
+    def add(day, teacher, start, end, students):
+        """Count one class on its day."""
+        entry = days[as_date(day)]
+        entry["Classes"] += 1
+        entry["Students"].update(students)
+        entry["Teachers"].add(teacher.casefold())
+        entry["Times"] += [as_time(start), as_time(end)]
+
+    for lesson in get_lessons_using_rooms(first_day, last_day):
+        add(lesson["Date"], lesson["Teacher"], lesson["Start"], lesson["End"],
+            [("id", student) for student in lesson["Students"]])
+    with SessionLocal() as session:
+        on_schedule = {name.casefold() for (name,) in session.execute(
+            select(Teacher.name).distinct()
+            .join(ClassSession, ClassSession.teacher_id == Teacher.id)
+            .where(ClassSession.status != "Cancelled",
+                   ClassSession.session_date.between(first_day, last_day))
+        )}
+        history = session.execute(
+            select(LessonHistory.teacher_name, LessonHistory.lesson_date, LessonHistory.start_time,
+                   LessonHistory.end_time, LessonHistory.student_name, LessonHistory.status)
+            .where(LessonHistory.lesson_date.between(first_day, last_day))
+        ).all()
+        # A past schedule's spelling of a student on file is that student, so nobody counts twice.
+        on_file = {}
+        if history:
+            on_file = {_alias_key(name): student_id
+                       for name, student_id in session.execute(select(Student.full_name, Student.id))}
+            on_file.update({_alias_key(alias): student_id for alias, student_id in session.execute(
+                select(StudentAlias.alias, StudentAlias.student_id))})
+    # Past schedules have one row per student; a class is a teacher, a day and a start time.
+    past = {}
+    for teacher, day, start, end, student, status in history:
+        if teacher.casefold() in on_schedule:
+            continue
+        lesson = past.setdefault((teacher.casefold(), as_date(day), as_time(start)),
+                                 {"Teacher": teacher, "End": as_time(end), "Students": []})
+        if status != "Cancelled":
+            name = _alias_key(student)
+            lesson["Students"].append(("id", on_file[name]) if name in on_file else ("name", name))
+    for (_, day, start), lesson in past.items():
+        if lesson["Students"]:
+            add(day, lesson["Teacher"], start, lesson["End"], lesson["Students"])
+    return [
+        {"Date": day, "Classes": entry["Classes"], "Students": len(entry["Students"]),
+         "Teachers": len(entry["Teachers"]), "Start": min(entry["Times"]), "End": max(entry["Times"])}
+        for day, entry in sorted(days.items())
+    ]
+
+
 def set_student_note(student_id, note):
     """Save a free-text note on a student."""
 

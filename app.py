@@ -4380,6 +4380,8 @@ def _teaching_view() -> None:
     months = [row for row in activity["by_month"] if row["Year"] == year and row["Month"] <= month]
     if not months:
         st.info(f"No lessons on record in {year} up to the end of {_when(label)}.")
+        # A month ahead can still have classes booked.
+        _classes_each_day(year, month)
         return
 
     # The chosen month against the one before, unless the month isn't over yet:
@@ -4455,6 +4457,7 @@ def _teaching_view() -> None:
            + ". " if starts else "")
         + (f"Not on record yet: {_chips('teacher', later)}." if later else "")
     )
+    _classes_each_day(year, month)
 
     teachers = pd.DataFrame(
         [row for row in activity["by_teacher"] if row["Year"] == year and row["Month"] <= month]
@@ -4502,6 +4505,44 @@ def _teaching_view() -> None:
             width="stretch",
             hide_index=True,
         )
+
+
+def _classes_each_day(year: int, month: int) -> None:
+    """Chart how many classes each day of the month has, across every teacher.
+
+    Busy days leave the classrooms messier, so this shows which days need
+    cleaning after. Booked classes count as well as held ones, and days with
+    no class are left out.
+    """
+    label = f"{calendar.month_name[month]} {year}"
+    days = db.get_classes_each_day(year, month)
+    st.markdown(f"#### Classes each day — {label}")
+    if not days:
+        st.caption(f"No classes in {_when(label)}.")
+        return
+    frame = pd.DataFrame(days)
+    frame["Day"] = [f"{day:%a} {day.day}" for day in frame["Date"]]
+    frame["Date text"] = [f"{day:%a %d %b %Y}" for day in frame["Date"]]
+    frame["Times"] = [f"{start:%H:%M}–{end:%H:%M}" for start, end in zip(frame["Start"], frame["End"])]
+    st.altair_chart(
+        alt.Chart(frame.drop(columns=["Date", "Start", "End"]))
+        .mark_bar(color="#2a78d6")
+        .encode(
+            # "Sat 7" written as "Sat" above "7", so a month of days fits side by side.
+            x=alt.X("Day:N", sort=list(frame["Day"]), title=None,
+                    axis=alt.Axis(labelAngle=0, labelExpr="split(datum.label, ' ')")),
+            y=alt.Y("Classes:Q", title="Classes", axis=alt.Axis(tickMinStep=1)),
+            tooltip=[alt.Tooltip("Date text:N", title="Day"), "Classes:Q", "Students:Q", "Teachers:Q",
+                     alt.Tooltip("Times:N", title="First to last class")],
+        )
+        .properties(height=240),
+        width="stretch",
+    )
+    # Every day tied for the most, so an equally busy day isn't left off.
+    most = max(day["Classes"] for day in days)
+    busiest = [day["Date"].strftime("%a %d %b") for day in days if day["Classes"] == most]
+    st.markdown(f"Busiest: {_plural(most, 'class', 'classes')} on {_chips('when', busiest)}.")
+    st.caption("Every class held or booked, all teachers. Cancelled classes aren't counted.")
 
 
 def _per_hour(invoiced: float, hours: float) -> str:
