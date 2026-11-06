@@ -1074,12 +1074,12 @@ def t_online_day_label():
 
 
 def t_written_sheet_reads_back():
-    """A month written by the Create schedule screen reads back exactly as planned.
+    """A month exported from the Schedule screen reads back exactly as planned.
 
     Covers times at a quarter past, noon and late evening; two classes in the
     same half hour; a class with nobody listed yet; statuses in the column
-    next to it; and every day of the month shown, so an upload covers the
-    whole month.
+    next to it. Only the days with a class are shown, with the time column
+    again before each new week, so an upload leaves the other days alone.
     """
     import schedule_writer as sw
 
@@ -1108,9 +1108,17 @@ def t_written_sheet_reads_back():
                   for p in planned)
     assert got == want, [g for g in got if g not in want] + [w for w in want if w not in got]
     assert not preview["warnings"], preview["warnings"]
-    assert len(preview["dates_shown"]) == 30, len(preview["dates_shown"])
+    assert preview["dates_shown"] == [D(2), D(4), D(7), D(8), D(12), D(30)], preview["dates_shown"]
+    from openpyxl import load_workbook
+    first_row = [cell.value for cell in load_workbook(io.BytesIO(data)).active[1]]
+    header = [value for value in first_row if value]
+    assert header == ["2(MON)", "4(WED)", "7(SAT)", "8(SUN)", "12(THU)", "30(MON)"], header
+    # The time column is A, then again before the 12th and the 30th, each a new week.
+    second_row = [cell.value for cell in load_workbook(io.BytesIO(data)).active[2]]
+    axes = [index for index, value in enumerate(second_row, start=1) if isinstance(value, dt.time)]
+    assert axes == [1, 10, 13], axes
     assert sw.time_label(T(11, 15), T(13, 15)) == "11.15am-1.15pm"
-    return "8 lessons back exactly, statuses included, no warnings, all 30 days shown"
+    return "8 lessons back exactly, statuses included, no warnings, only the 6 days with a class shown"
 
 
 def t_readback_catches_names():

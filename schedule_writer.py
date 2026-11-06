@@ -5,10 +5,11 @@ the Teachers screen can read it back with no changes:
 
 * One worksheet, named after the month (for example "Nov"), so it can be
   copied into the teacher's yearly file next to the other months.
-* Row 1 has a day label such as "3(TUE)" over two columns for each day.
-  The class goes in the first column; the second is left for the teacher
-  to write Online, Recording or Cancelled and the names.
-* Column A is the half-hour time axis, repeated before every Monday. It
+* Row 1 has a day label such as "3(TUE)" over two columns for each day
+  with a class; days with none are left out. The class goes in the first
+  column; the second is left for the teacher to write Online, Recording or
+  Cancelled and the names.
+* Column A is the half-hour time axis, repeated before each new week. It
   runs from the month's first lesson to the end of its last.
 * Each class is a coloured block down its time rows:
 
@@ -119,16 +120,23 @@ def write_month(lessons: Iterable[dict[str, Any]], year: int, month: int) -> byt
         placed.append((lesson, top, bottom))
     slots = max([MIN_SLOTS, (last - first) // SLOT_MINUTES] + [bottom + 1 for _, _, bottom in placed])
 
-    # Columns: the time axis, then two columns per day, with the axis repeated before each Monday.
+    # Columns: the time axis, then two columns for each day with a class, with the axis
+    # repeated before each new week. Days with no class are left out, so the sheet isn't
+    # mostly empty columns; an upload of it then leaves those days alone. A month with
+    # no class at all shows every day.
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = month_sheet_name(month)
     axis_columns, day_column = [1], {}
     column = 2
-    for day in range(1, days_in_month + 1):
-        if dt.date(year, month, day).weekday() == 0 and day != 1:
+    week = None
+    for day in sorted({lesson["date"].day for lesson in lessons}) or range(1, days_in_month + 1):
+        when = dt.date(year, month, day)
+        monday = when - dt.timedelta(days=when.weekday())
+        if week is not None and monday != week:
             axis_columns.append(column)
             column += 1
+        week = monday
         day_column[day] = column
         column += 2
 
