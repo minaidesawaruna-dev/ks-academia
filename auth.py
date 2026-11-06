@@ -65,8 +65,12 @@ def _read_cookie_from_browser(model: Any) -> Callable[[], Any]:
         except Exception:  # noqa: BLE001 - no request context, e.g. in a test
             token = None
         if not token:
+            # The cookies the browser component already sent, read straight from its dict.
+            # Its get() also draws a style element each time it's called, and it's only
+            # called on the run that signs someone in, so the page above every screen
+            # changed on the next click and Streamlit redrew open sections closed.
             try:
-                token = model.cookie_manager.get(model.cookie_name)
+                token = (getattr(model.cookie_manager, "cookies", None) or {}).get(model.cookie_name)
             except Exception:  # noqa: BLE001 - component not ready or absent
                 token = None
         if not token:
@@ -148,6 +152,11 @@ def require_login() -> stauth.Authenticate:
         auto_hash=False,
     )
 
+    # The library's cookie component is an empty iframe drawn on every run. Hide the gap
+    # it leaves, on every run, so the page is laid out the same from click to click.
+    st.markdown('<style>.element-container:has(iframe[height="0"]) { display: none; }</style>',
+                unsafe_allow_html=True)
+
     # Swap in the cookie reader above, so "stay signed in" works on Streamlit Cloud.
     # If the library is laid out differently, sign-in still works; staying signed in doesn't.
     try:
@@ -168,11 +177,19 @@ def require_login() -> stauth.Authenticate:
 
     status = st.session_state.get("authentication_status")
     if status is False:
+        st.session_state.pop("_signed_in_page_drawn", None)
         st.error("That username and password do not match.")
         st.stop()
     if status is None:
+        st.session_state.pop("_signed_in_page_drawn", None)
         st.info("Please sign in to continue.")
         st.stop()
+    # The run that signs someone in has also drawn the sign-in form, or the library's
+    # cookie writer, above the page. Start that page again once, so it's laid out the
+    # way every later click lays it out and nothing that's open closes on the first click.
+    if not st.session_state.get("_signed_in_page_drawn"):
+        st.session_state["_signed_in_page_drawn"] = True
+        st.rerun()
 
     return authenticator
 

@@ -427,8 +427,14 @@ def t_login_cookie_read_from_browser():
                         other, algorithm="HS256")
 
     def model_with(value):
-        """Return a stand-in for the sign-in object whose cookie holds `value`."""
-        manager = types.SimpleNamespace(get=lambda name: value if name == "c" else None)
+        """Return a stand-in for the sign-in object whose cookie holds `value`.
+
+        Its get() fails if called: the real one draws an element on each call,
+        which moved the page around, so the cookie must come from its dict.
+        """
+        def no_get(name):
+            raise AssertionError("cookie_manager.get() draws an element; read .cookies instead")
+        manager = types.SimpleNamespace(cookies={"c": value}, get=no_get)
         return types.SimpleNamespace(cookie_name="c", cookie_key=key,
                                      cookie_manager=manager)
 
@@ -439,6 +445,121 @@ def t_login_cookie_read_from_browser():
     assert auth._read_cookie_from_browser(model_with(None))() is None, "no cookie but signed in"
     assert auth._read_cookie_from_browser(model_with("not a token"))() is None, "garbage accepted"
     return "cookie read via the browser component; stale, forged and absent cookies refused"
+
+
+_SIGNIN_LAYOUT_SCRIPT = r"""
+import json, db
+from streamlit.testing.v1 import AppTest
+
+db.initialise_database()
+db.create_teacher("Teacher A")
+
+page = '''
+import time, jwt, streamlit as st
+import extra_streamlit_components as stx
+
+KEY = "verification-only-key-" + "x" * 32
+
+class BrowserCookies:
+    # Stands in for the library's cookie component as it behaves on Streamlit Cloud:
+    # an element drawn on every run, the browser's cookies in .cookies, and a get()
+    # that draws one more element each time it's called.
+    def __init__(self, key="init"):
+        st.markdown("cookie component")
+        token = jwt.encode({"username": "tester", "name": "Tester",
+                            "exp_date": time.time() + 3600}, KEY, algorithm="HS256")
+        self.cookies = {"ks_academia_auth": token}
+    def get(self, name):
+        st.markdown("<style>/* drawn by get() */</style>", unsafe_allow_html=True)
+        return self.cookies.get(name)
+    def set(self, *args, **kwargs):
+        pass
+    def delete(self, *args, **kwargs):
+        pass
+
+stx.RealCookieManager = getattr(stx, "RealCookieManager", stx.CookieManager)
+stx.CookieManager = BrowserCookies
+# Streamlit Cloud strips cookies from the request; the test tool would offer a placeholder.
+st.context = type("CloudRequest", (), {"cookies": {}, "headers": {}})()
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(page, default_timeout=120)
+at.secrets["auth"] = {"cookie_name": "ks_academia_auth", "cookie_key": "verification-only-key-" + "x" * 32,
+                      "credentials": {"usernames": {"tester": {"name": "Tester", "password": "not-used"}}}}
+at.query_params["screen"] = "Teachers"
+
+def where_upload_is():
+    # The upload section's place among the page's top-level elements.
+    return [index for index, node in at.main.children.items()
+            if getattr(node, "type", "") == "expander" and node.label == "Upload an Excel schedule"]
+
+at.run()
+result = {"signed_in": at.session_state["authentication_status"], "first": where_upload_is()}
+at.radio(key="import_teacher_mode").set_value("New teacher").run()
+result["after_click"] = where_upload_is()
+at.radio(key="import_teacher_mode").set_value("Existing teacher").run()
+result["after_second_click"] = where_upload_is()
+result["errors"] = [e.value for e in at.exception]
+
+# Signing in with the form: a made-up user whose hash is made here, never stored.
+import bcrypt
+form_page = '''
+import streamlit as st
+import extra_streamlit_components as stx
+stx.CookieManager = stx.RealCookieManager  # no cookie this time: the form is shown
+st.context = type("CloudRequest", (), {"cookies": {}, "headers": {}})()
+exec(compile(open("app.py", encoding="utf-8").read(), "app.py", "exec"), {"__name__": "__main__", "__file__": "app.py"})
+'''
+at = AppTest.from_string(form_page, default_timeout=120)
+at.secrets["auth"] = {"cookie_name": "ks_academia_auth", "cookie_key": "verification-only-key-" + "x" * 32,
+                      "credentials": {"usernames": {"tester": {"name": "Tester", "password": bcrypt.hashpw(
+                          b"made-up-test-password", bcrypt.gensalt()).decode()}}}}
+at.query_params["screen"] = "Teachers"
+at.run()
+sign_in = lambda: next(b for b in at.button if "Sign in" in str(b.label)).click().run()
+at.text_input[0].set_value("tester")
+at.text_input[1].set_value("wrong-password")
+sign_in()
+result["wrong_password"] = [e.value for e in at.error]
+at.text_input[0].set_value("tester")
+at.text_input[1].set_value("made-up-test-password")
+sign_in()
+result["form_signed_in"] = at.session_state["authentication_status"]
+result["form_left"] = [t.label for t in at.text_input if t.label in ("Username", "Password")]
+result["form_first"] = where_upload_is()
+at.radio(key="import_teacher_mode").set_value("New teacher").run()
+result["form_after_click"] = where_upload_is()
+result["errors"] += [e.value for e in at.exception]
+print(json.dumps(result))
+"""
+
+
+def t_signin_keeps_page_layout():
+    """Signing in from the cookie doesn't shift the page, so open sections stay open.
+
+    On Streamlit Cloud the cookie is read through the library's browser
+    component, whose get() draws an element. It was only called on the run
+    that signs someone in, so on the next click every element below moved
+    up one place and Streamlit redrew the Teachers upload section closed,
+    with a jump. The upload section must stay in the same place from the
+    first run on.
+    """
+    import json
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as folder:
+        url = "sqlite:///" + os.path.join(folder, "signin.db").replace("\\", "/")
+        result = run(["-c", _SIGNIN_LAYOUT_SCRIPT], {"DATABASE_URL": url})
+        assert result.returncode == 0, result.stderr[-1500:]
+        got = json.loads(result.stdout.strip().splitlines()[-1])
+    assert got["errors"] == [], got["errors"]
+    assert got["signed_in"] is True, got
+    assert len(got["first"]) == 1 and got["first"] == got["after_click"] == got["after_second_click"], got
+    assert got["wrong_password"] == ["That username and password do not match."], got
+    assert got["form_signed_in"] is True and got["form_left"] == [], got
+    assert got["form_first"] == got["form_after_click"] == got["first"], got
+    return (f"signed in from the cookie or the form; the upload section stays at place {got['first'][0]} "
+            "click after click; a wrong password is refused")
 
 
 def t_no_credentials_in_repo():
@@ -3875,6 +3996,7 @@ for name, fn in [
     ("login gate runs before any data", t_login_gate_runs_first),
     ("login fails closed if misconfigured", t_login_fails_closed),
     ("login cookie read via the browser", t_login_cookie_read_from_browser),
+    ("signing in keeps the page layout", t_signin_keeps_page_layout),
     ("no credentials committed to the repo", t_no_credentials_in_repo),
     ("every read query runs on this backend", t_read_functions_all_run),
     ("batched invoices match single", t_batch_matches_single),
